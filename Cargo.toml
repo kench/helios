@@ -5,14 +5,17 @@ edition = "2024"
 publish = false
 
 [dependencies]
+cryptoki = "0.10.1"
 getrandom = "0.4.3"
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+secrecy = "0.8.0"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
 x509-parser = "0.18.1"
 
 [dev-dependencies]
-rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "x509-parser"] }
+tempfile = "3.27.0"
 
 # Lints from HLD section 12 (Rust Style Guide plus Google's Rust style guide).
 # CI runs `cargo clippy --all-targets --all-features -- -D warnings`.
