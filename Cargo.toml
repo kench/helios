@@ -1,0 +1,27 @@
+[package]
+name = "helios"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+# Lints from HLD section 12 (Rust Style Guide plus Google's Rust style guide).
+# CI runs `cargo clippy --all-targets --all-features -- -D warnings`.
+[lints.rust]
+# Allowed only in the small `sys` module, with `// SAFETY:` comments.
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+borrowed_box = "warn"
+len_without_is_empty = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "warn"
+new_without_default = "warn"
+ptr_arg = "warn"
+should_implement_trait = "warn"
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "deny"
+wildcard_imports = "warn"
+wrong_self_convention = "warn"
