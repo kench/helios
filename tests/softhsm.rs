@@ -448,4 +448,148 @@ mod suite {
             })
         );
     }
+
+    /// A TLS server on localhost that requires a client certificate from `client_ca_pem` and
+    /// replies with the subject CN it saw. Returns its port and its own CA certificate.
+    async fn mtls_server(client_ca_pem: &str) -> (u16, String) {
+        use std::sync::Arc;
+
+        use helios::identity::tls::{crypto_provider, root_store_from_pem};
+        use rustls::ServerConfig;
+        use rustls::server::WebPkiClientVerifier;
+        use rustls_pki_types::PrivateKeyDer;
+        use tokio::io::AsyncWriteExt;
+
+        let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Helios test server CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_pem = ca_params.self_signed(&ca_key).unwrap().pem();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let server_cert = CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .signed_by(&server_key, &issuer)
+            .unwrap();
+        let verifier = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(root_store_from_pem(client_ca_pem.as_bytes()).unwrap()),
+            crypto_provider(),
+        )
+        .build()
+        .unwrap();
+        let config = ServerConfig::builder_with_provider(crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                PrivateKeyDer::try_from(server_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let peer = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+            let (_, cert) = x509_parser::parse_x509_certificate(&peer).unwrap();
+            let cn = cert
+                .subject()
+                .iter_common_name()
+                .next()
+                .unwrap()
+                .as_str()
+                .unwrap();
+            tls.write_all(format!("hello {cn}").as_bytes())
+                .await
+                .unwrap();
+            tls.shutdown().await.unwrap();
+        });
+        (port, ca_pem)
+    }
+
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn mutual_tls_handshake_with_the_softhsm_key() {
+        use std::sync::Arc;
+
+        use helios::identity::signer::{DEFAULT_SIGN_TIMEOUT, SignerHandle};
+        use helios::identity::tls::root_store_from_pem;
+        use helios::identity::tls::{Alpn, Resolver, certified_key, client_config};
+        use rustls_pki_types::{CertificateDer, ServerName};
+        use tokio::io::AsyncReadExt;
+
+        if !in_suite() {
+            return;
+        }
+        // A device CA that issues the client certificate for the key in the token.
+        let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Helios test device CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let device_ca_pem = ca_params.self_signed(&ca_key).unwrap().pem();
+        let device_ca = Issuer::new(ca_params, ca_key);
+        create_token("mtls");
+        let spki = generate_key("mtls", "device-key", 1, true);
+        let mut params = CertificateParams::default();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "t-01JD5VY2K7M9Q4R6T8V0X2Z4B6");
+        let public_key = SubjectPublicKeyInfo::from_der(&spki).unwrap();
+        let cert_der = params
+            .signed_by(&public_key, &device_ca)
+            .unwrap()
+            .der()
+            .to_vec();
+        store_certificate("mtls", 1, &cert_der);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let reply = runtime.block_on(async {
+            let (port, server_ca_pem) = mtls_server(&device_ca_pem).await;
+            let signer =
+                SignerHandle::spawn(Box::new(backend("mtls")), None, DEFAULT_SIGN_TIMEOUT).unwrap();
+            let (key, chain) = signer
+                .run(|token| {
+                    token.open()?;
+                    token.login(&pin(USER_PIN))?;
+                    let key = token.find_key("device-key")?;
+                    let cert = token.read_certificate(&key)?;
+                    Ok::<_, TokenError>((key, cert))
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let chain = vec![CertificateDer::from(
+                chain.expect("certificate on the token"),
+            )];
+            let resolver = Arc::new(Resolver::new());
+            resolver.set(Some(certified_key(chain, signer.client(), key)));
+            let roots = root_store_from_pem(server_ca_pem.as_bytes()).unwrap();
+            let config = client_config(roots, resolver, Alpn::None).unwrap();
+
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            let mut tls = tokio_rustls::TlsConnector::from(config)
+                .connect(name, tcp)
+                .await
+                .unwrap();
+            let mut reply = String::new();
+            tls.read_to_string(&mut reply).await.unwrap();
+            signer.shutdown();
+            reply
+        });
+
+        assert_eq!(reply, "hello t-01JD5VY2K7M9Q4R6T8V0X2Z4B6");
+    }
 }

@@ -7,6 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::{Signature, SigningKey};
@@ -51,6 +52,7 @@ struct State {
     generation: u64,
     calls: Vec<Op>,
     failures: HashMap<Op, VecDeque<TokenError>>,
+    sign_delay: Duration,
 }
 
 /// A mock token. Clones share the same state.
@@ -79,6 +81,7 @@ impl MockToken {
             generation: 0,
             calls: Vec::new(),
             failures: HashMap::new(),
+            sign_delay: Duration::ZERO,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -99,6 +102,12 @@ impl MockToken {
     /// Sets the PIN flags that [`TokenBackend::pin_status`] reports.
     pub(crate) fn set_pin_status(&self, status: PinStatus) {
         self.state().pin_status = status;
+    }
+
+    /// Makes `sign_digest` sleep for `delay` first, like a slow or hung token. The lock isn't
+    /// held while sleeping.
+    pub(crate) fn set_sign_delay(&self, delay: Duration) {
+        self.state().sign_delay = delay;
     }
 
     /// Makes the next call of `op` fail with `error`. Several failures queue up in order.
@@ -243,6 +252,10 @@ impl TokenBackend for MockToken {
     }
 
     fn sign_digest(&mut self, key: &KeyRef, digest: &Digest) -> Result<RawSignature, TokenError> {
+        let delay = self.state().sign_delay;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         let mut state = self.state();
         state.enter(Op::SignDigest)?;
         let key = state.key(key)?;
