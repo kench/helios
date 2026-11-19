@@ -87,6 +87,9 @@ jobs:
   test:
     name: Test and coverage
     runs-on: ubuntu-latest
+    env:
+      # tests/softhsm.rs fails instead of skipping if SoftHSM2 is missing.
+      HELIOS_REQUIRE_SOFTHSM2: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -117,6 +120,12 @@ jobs:
       - name: Install cargo-llvm-cov
         if: steps.llvm-cov-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+
+      # The SoftHSM2 integration tests use /usr/lib/softhsm/libsofthsm2.so.
+      - name: Install SoftHSM2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends softhsm2
 
       - name: Test
         run: cargo test --locked --all-targets --all-features

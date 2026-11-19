@@ -2,4 +2,8 @@
 //! from them (LLD 1, section 4).
 
 pub mod cert;
+pub mod cryptoki;
 pub mod der;
+#[cfg(test)]
+pub(crate) mod mock;
+pub mod token;

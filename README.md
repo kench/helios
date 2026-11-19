@@ -10,7 +10,13 @@ commit message rules and the coverage target are in HLD section 12.
 The stable toolchain is pinned in `rust-toolchain.toml`. Nightly is used only for rustfmt,
 because `rustfmt.toml` uses unstable options.
 
+The SoftHSM2 integration tests (`tests/softhsm.rs`) need the SoftHSM2 PKCS#11 module. They use
+`/usr/lib/softhsm/libsofthsm2.so` from Debian's `softhsm2` package, or the path in
+`HELIOS_SOFTHSM2_MODULE`. Without the module they're skipped, unless `HELIOS_REQUIRE_SOFTHSM2` is
+set, as in CI. Each run uses its own temporary token directory.
+
 ```sh
+sudo apt install softhsm2
 rustup toolchain install nightly --profile minimal --component rustfmt
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov --locked --version 0.9.1
@@ -30,6 +36,7 @@ cargo llvm-cov --locked --workspace --all-features --fail-under-lines 90
   `.github/scripts/check-conventional-commit.sh`.
 - **Format:** `cargo +nightly fmt --check`.
 - **Clippy:** `-D warnings`, with the lints from `Cargo.toml`.
-- **Test and coverage:** `cargo test`, then `cargo llvm-cov` with at least 90% line coverage.
+- **Test and coverage:** installs SoftHSM2, then runs `cargo test` and `cargo llvm-cov` with at least
+  90% line coverage.
   The lcov and HTML reports are uploaded as the `coverage` artifact. Any file excluded from
   coverage must be listed in the workflow with `--ignore-filename-regex`.
