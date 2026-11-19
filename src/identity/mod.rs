@@ -6,4 +6,6 @@ pub mod cryptoki;
 pub mod der;
 #[cfg(test)]
 pub(crate) mod mock;
+pub mod signer;
+pub mod tls;
 pub mod token;
