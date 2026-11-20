@@ -200,6 +200,10 @@ pub fn crypto_provider() -> Arc<CryptoProvider> {
 /// A client config that verifies servers against `roots` and presents whatever identity
 /// `resolver` currently holds.
 ///
+/// Session resumption is turned off. A resumed TLS 1.3 session skips the client signature,
+/// so a lost or replaced token would go unnoticed and the device could keep reconnecting
+/// without the key. One signature per connection costs little.
+///
 /// # Errors
 ///
 /// [`TlsError::Config`] if rustls rejects the protocol versions for the provider.
@@ -214,6 +218,7 @@ pub fn client_config(
         .with_root_certificates(roots)
         .with_client_cert_resolver(resolver);
     config.alpn_protocols = alpn.protocols();
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(Arc::new(config))
 }
 
@@ -222,83 +227,13 @@ mod tests {
     use std::time::Duration;
 
     use p256::ecdsa::SigningKey as P256SigningKey;
-    use p256::pkcs8::EncodePublicKey;
-    use rcgen::{CertificateParams, DnType, Issuer, KeyPair, SubjectPublicKeyInfo};
-    use rustls::ServerConfig;
-    use rustls::server::WebPkiClientVerifier;
-    use rustls_pki_types::{PrivateKeyDer, ServerName};
     use secrecy::SecretString;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     use super::*;
     use crate::identity::mock::{MockKey, MockToken, Op};
     use crate::identity::signer::{DEFAULT_SIGN_TIMEOUT, SignerHandle};
+    use crate::identity::testing::{self, Ca, THING_NAME, ca, server};
     use crate::identity::token::TokenError;
-
-    struct Ca {
-        issuer: Issuer<'static, KeyPair>,
-        pem: String,
-    }
-
-    fn ca(name: &str) -> Ca {
-        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut params = CertificateParams::default();
-        params.distinguished_name.push(DnType::CommonName, name);
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let pem = params.self_signed(&key).unwrap().pem();
-        Ca {
-            issuer: Issuer::new(params, key),
-            pem,
-        }
-    }
-
-    /// A TLS server that requires a client certificate from `client_ca` and replies with the
-    /// subject CN it saw.
-    async fn server(client_ca: &Ca) -> (u16, Ca) {
-        let server_ca = ca("Helios test server CA");
-        let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let server_cert = CertificateParams::new(vec!["localhost".to_owned()])
-            .unwrap()
-            .signed_by(&server_key, &server_ca.issuer)
-            .unwrap();
-        let verifier = WebPkiClientVerifier::builder_with_provider(
-            Arc::new(root_store_from_pem(client_ca.pem.as_bytes()).unwrap()),
-            crypto_provider(),
-        )
-        .build()
-        .unwrap();
-        let config = ServerConfig::builder_with_provider(crypto_provider())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(
-                vec![server_cert.der().clone()],
-                PrivateKeyDer::try_from(server_key.serialize_der()).unwrap(),
-            )
-            .unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(config));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((tcp, _)) = listener.accept().await {
-                let acceptor = acceptor.clone();
-                tokio::spawn(async move {
-                    let Ok(mut tls) = acceptor.accept(tcp).await else {
-                        return;
-                    };
-                    let peer = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
-                    let (_, cert) = x509_parser::parse_x509_certificate(&peer).unwrap();
-                    let cn = cert.subject().iter_common_name().next().unwrap();
-                    let reply = format!("hello {}", cn.as_str().unwrap());
-                    let _ = tls.write_all(reply.as_bytes()).await;
-                    let _ = tls.shutdown().await;
-                });
-            }
-        });
-        (port, server_ca)
-    }
 
     struct Device {
         token: MockToken,
@@ -311,24 +246,14 @@ mod tests {
     /// with the resolver holding the certified key.
     async fn device(client_ca: &Ca, timeout: Duration) -> Device {
         let signing_key = P256SigningKey::from_slice(&[9; 32]).unwrap();
-        let spki = signing_key.verifying_key().to_public_key_der().unwrap();
-        let mut params = CertificateParams::default();
-        params
-            .distinguished_name
-            .push(DnType::CommonName, "t-01JD5VY2K7M9Q4R6T8V0X2Z4B6");
-        let cert = params
-            .signed_by(
-                &SubjectPublicKeyInfo::from_der(spki.as_bytes()).unwrap(),
-                &client_ca.issuer,
-            )
-            .unwrap();
+        let cert = testing::device_certificate(client_ca, &signing_key, THING_NAME);
         let token = MockToken::new("1234");
         token.add_key(MockKey {
             label: "device-key".into(),
             id: vec![1],
             signing_key,
             private: true,
-            certificate: Some(cert.der().to_vec()),
+            certificate: Some(cert.to_vec()),
         });
         let (lost_tx, lost) = tokio::sync::mpsc::unbounded_channel();
         let signer = SignerHandle::spawn(Box::new(token.clone()), Some(lost_tx), timeout).unwrap();
@@ -342,11 +267,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let resolver = Arc::new(Resolver::new());
-        resolver.set(Some(certified_key(
-            vec![cert.der().clone()],
-            signer.client(),
-            key,
-        )));
+        resolver.set(Some(certified_key(vec![cert], signer.client(), key)));
         Device {
             token,
             signer,
@@ -362,12 +283,7 @@ mod tests {
     ) -> std::io::Result<String> {
         let roots = root_store_from_pem(server_ca.pem.as_bytes()).unwrap();
         let config = client_config(roots, resolver, Alpn::None).unwrap();
-        let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
-        let name = ServerName::try_from("localhost").unwrap();
-        let mut tls = TlsConnector::from(config).connect(name, tcp).await?;
-        let mut reply = String::new();
-        tls.read_to_string(&mut reply).await?;
-        Ok(reply)
+        testing::connect(port, config).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -380,9 +296,31 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(reply, "hello t-01JD5VY2K7M9Q4R6T8V0X2Z4B6");
+        assert_eq!(reply, format!("hello {THING_NAME}"));
         assert!(device.token.calls().contains(&Op::SignDigest));
         device.signer.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_connection_signs_with_the_token() {
+        let client_ca = ca("Helios test device CA");
+        let (port, server_ca) = server(&client_ca).await;
+        let device = device(&client_ca, DEFAULT_SIGN_TIMEOUT).await;
+        let roots = root_store_from_pem(server_ca.pem.as_bytes()).unwrap();
+        let config = client_config(roots, device.resolver.clone(), Alpn::None).unwrap();
+
+        for _ in 0..2 {
+            let reply = testing::connect(port, config.clone()).await.unwrap();
+            assert_eq!(reply, format!("hello {THING_NAME}"));
+        }
+
+        // No session resumption: the second connection proves possession of the key again.
+        let signatures = device
+            .token
+            .calls()
+            .into_iter()
+            .filter(|op| *op == Op::SignDigest);
+        assert_eq!(signatures.count(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

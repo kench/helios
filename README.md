@@ -15,6 +15,9 @@ The SoftHSM2 integration tests (`tests/softhsm.rs`) need the SoftHSM2 PKCS#11 mo
 `HELIOS_SOFTHSM2_MODULE`. Without the module they're skipped, unless `HELIOS_REQUIRE_SOFTHSM2` is
 set, as in CI. Each run uses its own temporary token directory.
 
+`build.rs` embeds the build time, which the identity manager treats as the earliest plausible
+clock reading when it checks certificate dates. Set `SOURCE_DATE_EPOCH` for reproducible builds.
+
 ```sh
 sudo apt install softhsm2
 rustup toolchain install nightly --profile minimal --component rustfmt
