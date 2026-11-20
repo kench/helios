@@ -178,6 +178,8 @@ pub(crate) struct Recorded {
     pub(crate) path: String,
     pub(crate) headers: hyper::HeaderMap,
     pub(crate) body: Vec<u8>,
+    /// The subject CN of the client certificate, if the service required one.
+    pub(crate) client_cn: Option<String>,
 }
 
 impl Recorded {
@@ -208,6 +210,16 @@ impl MockService {
 
     /// A service whose certificate names `host`.
     pub(crate) async fn start_as(host: &str) -> Self {
+        Self::start_with(host, None).await
+    }
+
+    /// A service for `localhost` that requires a client certificate from `client_ca`, like the
+    /// AWS IoT credentials provider.
+    pub(crate) async fn start_mtls(client_ca: &Ca) -> Self {
+        Self::start_with("localhost", Some(client_ca)).await
+    }
+
+    async fn start_with(host: &str, client_ca: Option<&Ca>) -> Self {
         use http_body_util::{BodyExt, Full};
         use hyper::body::Bytes;
 
@@ -217,10 +229,21 @@ impl MockService {
             .unwrap()
             .signed_by(&key, &ca.issuer)
             .unwrap();
-        let config = ServerConfig::builder_with_provider(crypto_provider())
+        let builder = ServerConfig::builder_with_provider(crypto_provider())
             .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
+            .unwrap();
+        let builder = match client_ca {
+            Some(client_ca) => builder.with_client_cert_verifier(
+                WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(root_store_from_pem(client_ca.pem.as_bytes()).unwrap()),
+                    crypto_provider(),
+                )
+                .build()
+                .unwrap(),
+            ),
+            None => builder.with_no_client_auth(),
+        };
+        let config = builder
             .with_single_cert(
                 vec![cert.der().clone()],
                 PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
@@ -239,9 +262,15 @@ impl MockService {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
+                    let client_cn = tls.get_ref().1.peer_certificates().map(|chain| {
+                        let (_, cert) = x509_parser::parse_x509_certificate(&chain[0]).unwrap();
+                        let cn = cert.subject().iter_common_name().next().unwrap();
+                        cn.as_str().unwrap().to_owned()
+                    });
                     let service = hyper::service::service_fn(
                         move |request: hyper::Request<hyper::body::Incoming>| {
                             let state = state.clone();
+                            let client_cn = client_cn.clone();
                             async move {
                                 let (parts, body) = request.into_parts();
                                 let body = body
@@ -256,6 +285,7 @@ impl MockService {
                                         path: parts.uri.to_string(),
                                         headers: parts.headers,
                                         body,
+                                        client_cn,
                                     });
                                     state.responses.pop_front()
                                 }
@@ -330,4 +360,49 @@ impl crate::identity::bootstrap::adapters::PermanentAddresses for NoPermanentAdd
     ) -> std::io::Result<Option<crate::identity::bootstrap::adapters::MacAddress>> {
         Ok(None)
     }
+}
+
+/// A running identity manager with a mock token whose certificate comes from `ca`, trusting
+/// servers under `roots`, waited on until it is ready. Cancel the token to stop it.
+pub(crate) async fn ready_identity(
+    ca: &Ca,
+    roots: rustls::RootCertStore,
+) -> (
+    crate::identity::manager::IdentityHandle,
+    crate::identity::mock::MockToken,
+    tokio_util::sync::CancellationToken,
+) {
+    use crate::identity::manager::{IdentityManager, IdentityState, ManagerConfig, PinSetting};
+    use crate::identity::mock::{MockKey, MockToken};
+    use crate::identity::pin::FixedPin;
+
+    let key = SigningKey::from_slice(&[7; 32]).unwrap();
+    let token = MockToken::new("1234");
+    token.add_key(MockKey {
+        label: "device-key".into(),
+        id: vec![1],
+        signing_key: key.clone(),
+        private: true,
+        certificate: Some(device_certificate(ca, &key, THING_NAME).to_vec()),
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (handle, _task) = IdentityManager::start(
+        ManagerConfig::new(THING_NAME, "device-key"),
+        Box::new(token.clone()),
+        PinSetting::Local(Arc::new(FixedPin::new(secrecy::SecretString::new(
+            "1234".into(),
+        )))),
+        roots,
+        cancel.clone(),
+    )
+    .unwrap();
+    let mut state = handle.watch();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        state.wait_for(|state| matches!(state, IdentityState::Ready(_))),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (handle, token, cancel)
 }

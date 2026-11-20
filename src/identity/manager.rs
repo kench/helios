@@ -26,6 +26,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::backoff::Backoff;
 use crate::build_info;
 use crate::identity::bootstrap::adapters::{Interfaces, PermanentAddresses};
 use crate::identity::bootstrap::api::AwsSettings;
@@ -868,49 +869,6 @@ fn token_failure(error: TokenError) -> Failure {
         TokenError::PinInvalid => Failure::Fatal(FatalReason::PinInvalid),
         error if error.is_fatal() => Failure::Fatal(FatalReason::Token(error)),
         error => Failure::unavailable(error.to_string()),
-    }
-}
-
-/// Exponential backoff with jitter: each delay is between half and all of the current step,
-/// and the step doubles up to the maximum.
-#[derive(Debug)]
-struct Backoff {
-    initial: Duration,
-    max: Duration,
-    step: Duration,
-}
-
-impl Backoff {
-    fn new(initial: Duration, max: Duration) -> Self {
-        Self {
-            initial,
-            max,
-            step: initial,
-        }
-    }
-
-    fn next_delay(&mut self) -> Duration {
-        let step = self.step;
-        self.step = (self.step * 2).min(self.max);
-        jitter(step, random_fraction())
-    }
-
-    fn reset(&mut self) {
-        self.step = self.initial;
-    }
-}
-
-/// Between half and all of `step`, by `fraction` (0 to 1).
-fn jitter(step: Duration, fraction: f64) -> Duration {
-    step.mul_f64(0.5 + 0.5 * fraction.clamp(0.0, 1.0))
-}
-
-fn random_fraction() -> f64 {
-    let mut bytes = [0u8; 4];
-    // Without randomness the delay is just the full step.
-    match getrandom::fill(&mut bytes) {
-        Ok(()) => f64::from(u32::from_le_bytes(bytes)) / f64::from(u32::MAX),
-        Err(_) => 1.0,
     }
 }
 

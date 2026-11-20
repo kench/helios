@@ -11,17 +11,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
-use hyper::header::{ACCEPT, CONTENT_TYPE, HOST, HeaderMap, RETRY_AFTER, USER_AGENT};
+use hyper::header::{ACCEPT, CONTENT_TYPE, HeaderMap, RETRY_AFTER};
 use hyper::{Method, Request, StatusCode, Uri};
-use hyper_util::rt::TokioIo;
 use rustls::{ClientConfig, RootCertStore};
-use rustls_pki_types::ServerName;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
+
+use crate::https::{self, Endpoint, HttpsError, Limits};
 
 use crate::identity::bootstrap::api::{
     AnswerChallengeRequest, BootstrapRequest, BootstrapResult, DeviceIdentity, InvalidMember,
@@ -112,6 +109,19 @@ pub enum Retry {
     ChallengeRejected,
 }
 
+impl From<HttpsError> for BootstrapError {
+    fn from(error: HttpsError) -> Self {
+        match error {
+            HttpsError::Connect(error) => Self::Connect(error),
+            HttpsError::Tls(error) => Self::Tls(error),
+            HttpsError::Http(error) => Self::Http(error),
+            HttpsError::Timeout(timeout) => Self::Timeout(timeout),
+            HttpsError::TooLarge(_) => Self::TooLarge,
+            HttpsError::Request(error) => Self::Malformed(format!("request: {error}")),
+        }
+    }
+}
+
 impl BootstrapError {
     /// The `restJson1` error name, if the service returned one.
     #[must_use]
@@ -151,11 +161,8 @@ impl BootstrapError {
 /// A client for one bootstrap service.
 #[derive(Debug, Clone)]
 pub struct BootstrapClient {
-    host: String,
-    port: u16,
-    authority: String,
+    endpoint: Endpoint,
     base_path: String,
-    server_name: ServerName<'static>,
     tls: Arc<ClientConfig>,
     timeout: Duration,
 }
@@ -178,15 +185,11 @@ impl BootstrapClient {
         let authority = uri
             .authority()
             .ok_or_else(|| UrlError::Invalid(url.to_owned()))?;
-        let host = authority.host().to_owned();
-        let server_name =
-            ServerName::try_from(host.clone()).map_err(|_| UrlError::Host(url.to_owned()))?;
+        let endpoint = Endpoint::new(authority.host(), authority.port_u16().unwrap_or(443))
+            .map_err(|_| UrlError::Host(url.to_owned()))?;
         Ok(Self {
-            port: authority.port_u16().unwrap_or(443),
-            authority: authority.as_str().to_owned(),
-            host,
+            endpoint,
             base_path: uri.path().trim_end_matches('/').to_owned(),
-            server_name,
             tls: tls::server_auth_config(roots, Alpn::Http1)?,
             timeout,
         })
@@ -230,59 +233,35 @@ impl BootstrapClient {
     ) -> Result<T, BootstrapError> {
         let body = serde_json::to_vec(body)
             .map_err(|error| BootstrapError::Malformed(format!("request: {error}")))?;
-        tokio::time::timeout(self.timeout, self.exchange(path, body))
-            .await
-            .map_err(|_| BootstrapError::Timeout(self.timeout))?
-    }
-
-    async fn exchange<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        body: Vec<u8>,
-    ) -> Result<T, BootstrapError> {
-        let tcp = TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .map_err(BootstrapError::Connect)?;
-        let tls = TlsConnector::from(self.tls.clone())
-            .connect(self.server_name.clone(), tcp)
-            .await
-            .map_err(BootstrapError::Tls)?;
-        let (mut sender, connection) =
-            hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
-        let connection = tokio::spawn(connection);
-
         let request = Request::builder()
             .method(Method::POST)
             .uri(format!("{}{path}", self.base_path))
-            .header(HOST, &self.authority)
             .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "application/json")
-            .header(USER_AGENT, concat!("helios/", env!("CARGO_PKG_VERSION")))
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|error| BootstrapError::Malformed(format!("request: {error}")))?;
-        let response = sender.send_request(request).await?;
-        let (parts, body) = response.into_parts();
-        let body = Limited::new(body, MAX_RESPONSE_LEN)
-            .collect()
-            .await
-            .map_err(|error| match error.downcast::<hyper::Error>() {
-                Ok(error) => BootstrapError::Http(*error),
-                Err(_) => BootstrapError::TooLarge,
-            })?
-            .to_bytes();
-        connection.abort();
-
-        if parts.status.is_redirection() {
-            return Err(BootstrapError::Redirect(parts.status));
+            .header(ACCEPT, "application/json");
+        let limits = Limits {
+            connect_timeout: self.timeout,
+            total_timeout: self.timeout,
+            max_body: MAX_RESPONSE_LEN,
+        };
+        let response = https::send(
+            &self.endpoint,
+            self.tls.clone(),
+            request,
+            Bytes::from(body),
+            limits,
+        )
+        .await?;
+        if response.status.is_redirection() {
+            return Err(BootstrapError::Redirect(response.status));
         }
-        if !parts.status.is_success() {
+        if !response.status.is_success() {
             return Err(BootstrapError::Service {
-                status: parts.status,
-                error_type: error_type(&parts.headers),
-                retry_after: retry_after(&parts.headers),
+                status: response.status,
+                error_type: error_type(&response.headers),
+                retry_after: retry_after(&response.headers),
             });
         }
-        serde_json::from_slice(&body).map_err(|error| {
+        serde_json::from_slice(&response.body).map_err(|error| {
             // serde_json's message can quote the offending value, which might be the PIN.
             BootstrapError::Malformed(format!(
                 "{:?} error at line {} column {}",
