@@ -592,4 +592,57 @@ mod suite {
 
         assert_eq!(reply, "hello t-01JD5VY2K7M9Q4R6T8V0X2Z4B6");
     }
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn the_identity_manager_opens_the_softhsm_token() {
+        use std::sync::Arc;
+
+        use helios::identity::manager::{
+            IdentityManager, IdentityState, ManagerConfig, ManagerExit,
+        };
+        use helios::identity::pin::FixedPin;
+        use rustls::RootCertStore;
+        use tokio_util::sync::CancellationToken;
+
+        if !in_suite() {
+            return;
+        }
+        let cert = provisioned_token("managed");
+        let fingerprint = DeviceCertificate::from_der(&cert)
+            .unwrap()
+            .fingerprint_hex();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cancel = CancellationToken::new();
+            let (handle, task) = IdentityManager::start(
+                ManagerConfig::new("t-01JD5VY2K7M9Q4R6T8V0X2Z4B6", "device-key"),
+                Box::new(backend("managed")),
+                Arc::new(FixedPin::new(pin(USER_PIN))),
+                RootCertStore::empty(),
+                cancel.clone(),
+            )
+            .unwrap();
+
+            let mut state = handle.watch();
+            let state = state
+                .wait_for(|state| !matches!(state, IdentityState::Starting))
+                .await
+                .unwrap()
+                .clone();
+            let IdentityState::Ready(identity) = state else {
+                panic!("expected ready, got {state:?}");
+            };
+            // Proof of possession passed with a signature from SoftHSM2.
+            assert_eq!(identity.cert.fingerprint, fingerprint);
+            assert_eq!(identity.token.label, "managed");
+            assert!(identity.warnings.is_empty(), "{:?}", identity.warnings);
+
+            cancel.cancel();
+            assert_eq!(task.await.unwrap(), ManagerExit::Cancelled);
+        });
+    }
 }

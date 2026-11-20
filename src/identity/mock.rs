@@ -52,6 +52,7 @@ struct State {
     generation: u64,
     calls: Vec<Op>,
     failures: HashMap<Op, VecDeque<TokenError>>,
+    panics: Vec<Op>,
     sign_delay: Duration,
 }
 
@@ -81,6 +82,7 @@ impl MockToken {
             generation: 0,
             calls: Vec::new(),
             failures: HashMap::new(),
+            panics: Vec::new(),
             sign_delay: Duration::ZERO,
         };
         Self {
@@ -108,6 +110,16 @@ impl MockToken {
     /// held while sleeping.
     pub(crate) fn set_sign_delay(&self, delay: Duration) {
         self.state().sign_delay = delay;
+    }
+
+    /// Replaces all keys, like re-provisioning the token or plugging in a different one.
+    pub(crate) fn replace_keys(&self, keys: Vec<MockKey>) {
+        self.state().keys = keys;
+    }
+
+    /// Makes the next call of `op` panic, like a crashing PKCS#11 module.
+    pub(crate) fn panic_next(&self, op: Op) {
+        self.state().panics.push(op);
     }
 
     /// Makes the next call of `op` fail with `error`. Several failures queue up in order.
@@ -139,6 +151,10 @@ impl State {
     /// Records the call and returns an injected failure, if one is queued.
     fn enter(&mut self, op: Op) -> Result<(), TokenError> {
         self.calls.push(op);
+        if let Some(index) = self.panics.iter().position(|panic| *panic == op) {
+            self.panics.remove(index);
+            panic!("mock token: {op:?} panicked on purpose");
+        }
         if let Some(error) = self.failures.get_mut(&op).and_then(VecDeque::pop_front) {
             return Err(error);
         }

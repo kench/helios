@@ -4,4 +4,5 @@
 //! through Device Shadow and runs the device modules. See the Helios High-Level Design for
 //! the overall design and LLD 1 for the identity components.
 
+pub mod build_info;
 pub mod identity;

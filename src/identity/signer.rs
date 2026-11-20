@@ -94,6 +94,22 @@ impl SignerHandle {
         R: Send + 'static,
         F: FnOnce(&mut dyn TokenBackend) -> R + Send + 'static,
     {
+        self.submit(job)?.await.map_err(|_| SignerStopped)
+    }
+
+    /// Queues `job` on the signer thread and returns a receiver for its result, without
+    /// waiting. The identity manager uses this to keep waiting for an open that is slow, rather
+    /// than queueing another one behind it. The job still runs if the receiver is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`SignerStopped`] if the thread has stopped. The receiver fails the same way if the
+    /// thread stops before replying.
+    pub fn submit<R, F>(&self, job: F) -> Result<oneshot::Receiver<R>, SignerStopped>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut dyn TokenBackend) -> R + Send + 'static,
+    {
         let (reply, result) = oneshot::channel();
         let job: Job = Box::new(move |backend| {
             // The caller may have stopped waiting. There is nothing to do then.
@@ -103,7 +119,7 @@ impl SignerHandle {
             .requests
             .send(Request::Run(job))
             .map_err(|_| SignerStopped)?;
-        result.await.map_err(|_| SignerStopped)
+        Ok(result)
     }
 
     /// Closes the token and waits for the thread to stop.

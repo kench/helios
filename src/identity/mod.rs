@@ -4,8 +4,12 @@
 pub mod cert;
 pub mod cryptoki;
 pub mod der;
+pub mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
+pub mod pin;
 pub mod signer;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod tls;
 pub mod token;
