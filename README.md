@@ -47,6 +47,8 @@ cargo llvm-cov --locked --workspace --all-features --fail-under-lines 90
 helios provision show
 helios provision challenge-key --out challenge-key.pub.pem   # prints the key's SHA-256 fingerprint
 helios provision challenge-key --replace                     # asks before deleting the old key
+helios provision verify --thing-name t-01JD5VY2K7M9Q4R6T8V0X2Z4B6   # the startup checks
+helios provision verify --bootstrap                          # with the service's PIN and identity
 ```
 
 `--module` and `--token-label` default to `/usr/lib/softhsm/libsofthsm2.so` and `helios`. Exit

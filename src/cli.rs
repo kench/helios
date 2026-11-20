@@ -77,7 +77,43 @@ enum ProvisionCommand {
     },
     /// List the token's objects and certificates. Prints no secrets.
     Show,
+    /// Run the startup checks, and sign a test message with the challenge key without logging
+    /// in.
+    Verify(VerifyArgs),
 }
+
+#[derive(Debug, clap::Args)]
+struct VerifyArgs {
+    /// The thing name. Required unless --bootstrap, which gets it from the service.
+    #[arg(long)]
+    thing_name: Option<String>,
+    /// The device key label (default device-key; with --bootstrap, from the service).
+    #[arg(long)]
+    key_label: Option<String>,
+    /// The challenge key label. A missing challenge key is reported, not an error.
+    #[arg(long, default_value = DEFAULT_CHALLENGE_LABEL)]
+    challenge_label: String,
+    /// How long to wait for the identity to be ready, in seconds.
+    #[arg(long, default_value_t = 30)]
+    timeout: u64,
+    /// Also look the device up in the bootstrap service and log in with its PIN.
+    #[arg(long)]
+    bootstrap: bool,
+    /// The bootstrap service URL.
+    #[arg(long, default_value = DEFAULT_BOOTSTRAP_URL)]
+    bootstrap_url: String,
+    /// The CA bundle the bootstrap service's certificate is checked against.
+    #[arg(long, default_value = DEFAULT_BOOTSTRAP_CA)]
+    bootstrap_ca: PathBuf,
+    /// The network interfaces to report: "auto" or a comma-separated list.
+    #[arg(long, default_value = "auto")]
+    interfaces: String,
+}
+
+/// The decided bootstrap service URL (Bootstrap API, section 7).
+const DEFAULT_BOOTSTRAP_URL: &str = "https://device-management.services.kenley.tv/v1";
+/// The Amazon root CA bundle (LLD 1, section 3).
+const DEFAULT_BOOTSTRAP_CA: &str = "/etc/helios/amazon-root-cas.pem";
 
 /// A `CKA_ID`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,6 +317,9 @@ pub fn run(args: impl IntoIterator<Item = OsString>, console: &mut dyn Console) 
 }
 
 fn provision(args: &ProvisionArgs, console: &mut dyn Console) -> Result<(), Failure> {
+    if let ProvisionCommand::Verify(verify_args) = &args.command {
+        return verify(args, verify_args, console);
+    }
     let token = ProvisionToken::open(&args.module, &args.token_label)?;
     let pin = read_pin(args.pin_file.as_deref(), console)?;
     token.login(&pin)?;
@@ -294,7 +333,131 @@ fn provision(args: &ProvisionArgs, console: &mut dyn Console) -> Result<(), Fail
             yes,
         } => challenge_key(&token, label, &id.0, out, *replace, *yes, console),
         ProvisionCommand::Show => show(&token, console),
+        ProvisionCommand::Verify(_) => unreachable!("handled above"),
     }
+}
+
+fn verify(
+    args: &ProvisionArgs,
+    verify_args: &VerifyArgs,
+    console: &mut dyn Console,
+) -> Result<(), Failure> {
+    use crate::identity::cryptoki::CryptokiToken;
+    use crate::identity::manager::{ManagerConfig, PinSetting};
+    use crate::identity::pin::FixedPin;
+    use crate::provision::verify::{
+        ChallengeCheck, Verified, check_challenge_key, describe, verify_identity,
+    };
+
+    // The challenge key first: each check has the module to itself.
+    match check_challenge_key(
+        &args.module,
+        &args.token_label,
+        &verify_args.challenge_label,
+    )? {
+        ChallengeCheck::Signed { fingerprint } => writeln!(
+            console.out(),
+            "challenge key {:?}: signs without login (public key SHA-256 {fingerprint})",
+            verify_args.challenge_label
+        )?,
+        ChallengeCheck::Missing => writeln!(
+            console.out(),
+            "challenge key {:?}: not on the token (optional; needed for bootstrap challenges)",
+            verify_args.challenge_label
+        )?,
+    }
+
+    let mut config = ManagerConfig::for_bootstrap();
+    config.token_label = Some(args.token_label.clone());
+    config.key_label = verify_args.key_label.clone();
+    config.thing_name = verify_args.thing_name.clone();
+    let pin = if verify_args.bootstrap {
+        PinSetting::Bootstrap(Box::new(bootstrap_setup(verify_args)?))
+    } else {
+        if config.thing_name.is_none() {
+            return Err(Failure::config(
+                "--thing-name is required without --bootstrap",
+            ));
+        }
+        config
+            .key_label
+            .get_or_insert_with(|| "device-key".to_owned());
+        let pin = read_pin(args.pin_file.as_deref(), console)?;
+        PinSetting::Local(std::sync::Arc::new(FixedPin::new(pin)))
+    };
+    let backend = Box::new(CryptokiToken::new(&args.module, &args.token_label));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let timeout = std::time::Duration::from_secs(verify_args.timeout);
+    let verified = runtime
+        .block_on(verify_identity(config, backend, pin, timeout))
+        .map_err(|error| Failure::config(error.to_string()))?;
+    match verified {
+        Verified::Ready(identity) => {
+            writeln!(console.out(), "identity: ready")?;
+            for line in describe(&identity) {
+                writeln!(console.out(), "  {line}")?;
+            }
+            Ok(())
+        }
+        Verified::Fatal(reason) => Err(Failure::config(format!("identity: {reason}"))),
+        Verified::TimedOut(state) => {
+            let detail = match &state {
+                crate::identity::manager::IdentityState::Unavailable { reason, .. } => {
+                    format!(": {reason}")
+                }
+                crate::identity::manager::IdentityState::Bootstrapping {
+                    attempts,
+                    last_error,
+                } => format!(
+                    " after {attempts} lookups: {}",
+                    last_error.as_deref().unwrap_or("waiting for the service")
+                ),
+                _ => String::new(),
+            };
+            Err(Failure::error(format!(
+                "identity still {} after {} s{detail}",
+                state.name(),
+                verify_args.timeout
+            )))
+        }
+    }
+}
+
+/// The bootstrap settings from the command line, with the device's own adapters and model.
+fn bootstrap_setup(args: &VerifyArgs) -> Result<crate::identity::manager::BootstrapSetup, Failure> {
+    use crate::identity::bootstrap::adapters::{Interfaces, Rtnetlink};
+    use crate::identity::bootstrap::client::{BootstrapClient, DEFAULT_TIMEOUT};
+    use crate::identity::bootstrap::{DEVICE_TREE_MODEL, hardware_model};
+    use crate::identity::manager::{BootstrapSetup, BootstrapTiming};
+
+    let pem = std::fs::read(&args.bootstrap_ca)
+        .map_err(|error| Failure::config(format!("{}: {error}", args.bootstrap_ca.display())))?;
+    let roots = crate::identity::tls::root_store_from_pem(&pem)
+        .map_err(|error| Failure::config(format!("{}: {error}", args.bootstrap_ca.display())))?;
+    let client = BootstrapClient::new(&args.bootstrap_url, roots, DEFAULT_TIMEOUT)
+        .map_err(|error| Failure::config(error.to_string()))?;
+    let interfaces = match args.interfaces.as_str() {
+        "auto" => Interfaces::Auto,
+        list => Interfaces::Named(
+            list.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        ),
+    };
+    Ok(BootstrapSetup {
+        client,
+        interfaces,
+        sysfs: PathBuf::from("/sys"),
+        permanent_addresses: std::sync::Arc::new(Rtnetlink),
+        hardware_model: hardware_model(Path::new(DEVICE_TREE_MODEL)),
+        challenge_key_label: Some(args.challenge_label.clone()),
+        aws: None,
+        timing: BootstrapTiming::default(),
+    })
 }
 
 fn read_pin(pin_file: Option<&Path>, console: &mut dyn Console) -> Result<SecretString, Failure> {
@@ -668,5 +831,61 @@ mod tests {
         let line =
             read_line_from(terminal.as_fd(), &mut input, &mut prompt, "Sure? ", true).unwrap();
         assert_eq!(line, "yes");
+    }
+
+    #[test]
+    fn verify_needs_a_thing_name_or_bootstrap_settings() {
+        let mut console = ScriptedConsole::default();
+        assert_eq!(
+            run_with(
+                &["provision", "--module", "/nonexistent/lib.so", "verify"],
+                &mut console
+            ),
+            EXIT_CONFIG
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let ca = directory.path().join("ca.pem");
+        std::fs::write(&ca, crate::identity::testing::ca("roots").pem).unwrap();
+        let args = |url: &str, ca: &Path, interfaces: &str| VerifyArgs {
+            thing_name: None,
+            key_label: None,
+            challenge_label: "challenge-key".into(),
+            timeout: 1,
+            bootstrap: true,
+            bootstrap_url: url.into(),
+            bootstrap_ca: ca.to_owned(),
+            interfaces: interfaces.into(),
+        };
+        let setup = bootstrap_setup(&args("https://localhost/v1", &ca, "eth0, wlan0,")).unwrap();
+        assert_eq!(
+            setup.interfaces,
+            crate::identity::bootstrap::adapters::Interfaces::Named(vec![
+                "eth0".into(),
+                "wlan0".into()
+            ])
+        );
+        assert_eq!(setup.challenge_key_label.as_deref(), Some("challenge-key"));
+        let setup = bootstrap_setup(&args("https://localhost/v1", &ca, "auto")).unwrap();
+        assert_eq!(
+            setup.interfaces,
+            crate::identity::bootstrap::adapters::Interfaces::Auto
+        );
+
+        for (url, ca_path) in [
+            ("http://localhost/v1", ca.clone()),
+            ("https://localhost/v1", directory.path().join("missing.pem")),
+            ("https://localhost/v1", directory.path().to_owned()),
+        ] {
+            let failure = bootstrap_setup(&args(url, &ca_path, "auto")).unwrap_err();
+            assert!(failure.config, "{url} {}", ca_path.display());
+        }
+        let not_pem = directory.path().join("not.pem");
+        std::fs::write(&not_pem, "nothing").unwrap();
+        assert!(
+            bootstrap_setup(&args("https://localhost/v1", &not_pem, "auto"))
+                .unwrap_err()
+                .config
+        );
     }
 }

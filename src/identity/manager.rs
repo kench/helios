@@ -160,6 +160,20 @@ pub struct BootstrapSetup {
     pub timing: BootstrapTiming,
 }
 
+impl std::fmt::Debug for BootstrapSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapSetup")
+            .field("client", &self.client)
+            .field("interfaces", &self.interfaces)
+            .field("sysfs", &self.sysfs)
+            .field("hardware_model", &self.hardware_model)
+            .field("challenge_key_label", &self.challenge_key_label)
+            .field("aws", &self.aws)
+            .field("timing", &self.timing)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Bootstrap retry timing (LLD 1, section 4.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootstrapTiming {
