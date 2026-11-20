@@ -134,3 +134,170 @@ pub(crate) async fn connect(port: u16, config: Arc<ClientConfig>) -> std::io::Re
     tls.read_to_string(&mut reply).await?;
     Ok(reply)
 }
+
+/// A canned response from the [`MockService`].
+#[derive(Debug, Clone)]
+pub(crate) struct MockResponse {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) delay: Duration,
+}
+
+impl MockResponse {
+    /// A JSON response.
+    pub(crate) fn json(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: body.as_bytes().to_vec(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// A `restJson1` error named `error_type`.
+    pub(crate) fn error(status: u16, error_type: &str) -> Self {
+        Self::json(status, r#"{"message":"mock error"}"#).header("x-amzn-errortype", error_type)
+    }
+
+    pub(crate) fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub(crate) fn delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+}
+
+/// A request the [`MockService`] received.
+#[derive(Debug, Clone)]
+pub(crate) struct Recorded {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) headers: hyper::HeaderMap,
+    pub(crate) body: Vec<u8>,
+}
+
+impl Recorded {
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap()
+    }
+}
+
+#[derive(Default)]
+struct MockState {
+    responses: std::collections::VecDeque<MockResponse>,
+    requests: Vec<Recorded>,
+}
+
+/// A local HTTPS mock of the bootstrap service. Responds with queued [`MockResponse`]s in
+/// order, then `500 InternalError`, and records every request.
+pub(crate) struct MockService {
+    pub(crate) port: u16,
+    pub(crate) ca: Ca,
+    state: Arc<std::sync::Mutex<MockState>>,
+}
+
+impl MockService {
+    /// A service with a certificate for `localhost`.
+    pub(crate) async fn start() -> Self {
+        Self::start_as("localhost").await
+    }
+
+    /// A service whose certificate names `host`.
+    pub(crate) async fn start_as(host: &str) -> Self {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Bytes;
+
+        let ca = ca("Helios test bootstrap CA");
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = CertificateParams::new(vec![host.to_owned()])
+            .unwrap()
+            .signed_by(&key, &ca.issuer)
+            .unwrap();
+        let config = ServerConfig::builder_with_provider(crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(std::sync::Mutex::new(MockState::default()));
+        let shared = state.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let state = shared.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let service = hyper::service::service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            let state = state.clone();
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let body = body
+                                    .collect()
+                                    .await
+                                    .map(|b| b.to_bytes().to_vec())
+                                    .unwrap_or_default();
+                                let response = {
+                                    let mut state = state.lock().unwrap();
+                                    state.requests.push(Recorded {
+                                        method: parts.method.to_string(),
+                                        path: parts.uri.to_string(),
+                                        headers: parts.headers,
+                                        body,
+                                    });
+                                    state.responses.pop_front()
+                                }
+                                .unwrap_or_else(|| MockResponse::error(500, "InternalError"));
+                                tokio::time::sleep(response.delay).await;
+                                let mut builder =
+                                    hyper::Response::builder().status(response.status);
+                                for (name, value) in &response.headers {
+                                    builder = builder.header(name, value);
+                                }
+                                Ok::<_, std::convert::Infallible>(
+                                    builder.body(Full::new(Bytes::from(response.body))).unwrap(),
+                                )
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        Self { port, ca, state }
+    }
+
+    /// Queues a response.
+    pub(crate) fn respond(&self, response: MockResponse) {
+        self.state.lock().unwrap().responses.push_back(response);
+    }
+
+    /// The requests received so far.
+    pub(crate) fn requests(&self) -> Vec<Recorded> {
+        self.state.lock().unwrap().requests.clone()
+    }
+
+    /// The service's base URL.
+    pub(crate) fn url(&self) -> String {
+        format!("https://localhost:{}/v1", self.port)
+    }
+
+    /// Roots that trust the service's certificate.
+    pub(crate) fn roots(&self) -> rustls::RootCertStore {
+        root_store_from_pem(self.ca.pem.as_bytes()).unwrap()
+    }
+}

@@ -222,6 +222,22 @@ pub fn client_config(
     Ok(Arc::new(config))
 }
 
+/// A client config that verifies servers against `roots` and presents no client certificate,
+/// for the bootstrap service (the device has no usable identity yet).
+///
+/// # Errors
+///
+/// [`TlsError::Config`] if rustls rejects the protocol versions for the provider.
+pub fn server_auth_config(roots: RootCertStore, alpn: Alpn) -> Result<Arc<ClientConfig>, TlsError> {
+    let mut config = ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(TlsError::Config)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.protocols();
+    Ok(Arc::new(config))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

@@ -7,6 +7,10 @@ commit message rules and the coverage target are in HLD section 12.
 
 ## Development
 
+The API contract ([`helios-contract`](https://github.com/kench/helios-contract)) is a git submodule
+in `contract/`, pinned to a tagged release. The bootstrap tests read its challenge test vectors and
+protocol-test bodies, so clone with `--recurse-submodules`, or run `git submodule update --init`.
+
 The stable toolchain is pinned in `rust-toolchain.toml`. Nightly is used only for rustfmt,
 because `rustfmt.toml` uses unstable options.
 
