@@ -595,12 +595,12 @@ mod suite {
     #[test]
     #[ignore = "run by softhsm_suite"]
     fn the_identity_manager_opens_the_softhsm_token() {
-        use std::sync::Arc;
-
         use helios::identity::manager::{
             IdentityManager, IdentityState, ManagerConfig, ManagerExit,
         };
-        use helios::identity::pin::FixedPin;
+        use std::os::unix::fs::PermissionsExt;
+
+        use helios::identity::pin::PinSpec;
         use rustls::RootCertStore;
         use tokio_util::sync::CancellationToken;
 
@@ -608,6 +608,17 @@ mod suite {
             return;
         }
         let cert = provisioned_token("managed");
+        // The PIN comes from a private file, as with identity.pin = "file:<path>".
+        let pin_dir = tempfile::tempdir().unwrap();
+        let pin_path = pin_dir.path().join("pin");
+        std::fs::write(&pin_path, format!("{USER_PIN}\n")).unwrap();
+        std::fs::set_permissions(&pin_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let pin_source = format!("file:{}", pin_path.display())
+            .parse::<PinSpec>()
+            .unwrap()
+            .local_source(None)
+            .unwrap()
+            .unwrap();
         let fingerprint = DeviceCertificate::from_der(&cert)
             .unwrap()
             .fingerprint_hex();
@@ -621,7 +632,7 @@ mod suite {
             let (handle, task) = IdentityManager::start(
                 ManagerConfig::new("t-01JD5VY2K7M9Q4R6T8V0X2Z4B6", "device-key"),
                 Box::new(backend("managed")),
-                Arc::new(FixedPin::new(pin(USER_PIN))),
+                pin_source,
                 RootCertStore::empty(),
                 cancel.clone(),
             )
