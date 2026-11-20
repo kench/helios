@@ -37,6 +37,21 @@ cargo test --locked --all-targets --all-features
 cargo llvm-cov --locked --workspace --all-features --fail-under-lines 90
 ```
 
+## Provisioning
+
+`helios provision` sets up and inspects the device's token (LLD 1, section 4.10). Run it as the
+`helios` user with the service's `SOFTHSM2_CONF`. The user PIN is prompted for, or read from
+`--pin-file` (mode 0400 or 0600), never taken as an argument.
+
+```sh
+helios provision show
+helios provision challenge-key --out challenge-key.pub.pem   # prints the key's SHA-256 fingerprint
+helios provision challenge-key --replace                     # asks before deleting the old key
+```
+
+`--module` and `--token-label` default to `/usr/lib/softhsm/libsofthsm2.so` and `helios`. Exit
+codes: 0 on success, 1 on error, 78 for configuration errors (missing module or token, wrong PIN).
+
 ## CI
 
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`:

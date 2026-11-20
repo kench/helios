@@ -82,6 +82,7 @@ mod suite {
     use p256::ecdsa::{Signature, VerifyingKey};
     use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
     use rcgen::{CertificateParams, DnType, Issuer, KeyPair, SubjectPublicKeyInfo};
+    use rustls_pki_types::pem::PemObject;
     use secrecy::SecretString;
 
     use super::{SUITE_MARKER, module_path};
@@ -690,5 +691,408 @@ mod suite {
             cancel.cancel();
             assert_eq!(task.await.unwrap(), ManagerExit::Cancelled);
         });
+    }
+    /// A console that answers yes/no questions from a list and captures output.
+    #[derive(Default)]
+    struct TestConsole {
+        answers: Vec<bool>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    }
+
+    impl helios::cli::Console for TestConsole {
+        fn read_secret(&mut self, _: &str) -> std::io::Result<SecretString> {
+            Err(std::io::Error::other("tests use --pin-file"))
+        }
+        fn confirm(&mut self, _: &str) -> std::io::Result<bool> {
+            Ok(self.answers.pop().unwrap_or(false))
+        }
+        fn out(&mut self) -> &mut dyn std::io::Write {
+            &mut self.stdout
+        }
+        fn err(&mut self) -> &mut dyn std::io::Write {
+            &mut self.stderr
+        }
+    }
+
+    impl TestConsole {
+        fn stdout(&self) -> String {
+            String::from_utf8_lossy(&self.stdout).into_owned()
+        }
+        fn stderr(&self) -> String {
+            String::from_utf8_lossy(&self.stderr).into_owned()
+        }
+    }
+
+    /// A private PIN file in `directory`.
+    fn pin_file(directory: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join("pin");
+        std::fs::write(&path, format!("{USER_PIN}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    /// Runs `helios provision --token-label <token> --pin-file <pin> <args>`.
+    fn provision(
+        token: &str,
+        pin: &std::path::Path,
+        args: &[&str],
+        console: &mut TestConsole,
+    ) -> u8 {
+        let module = module_path();
+        let mut all = vec![
+            "helios".to_owned(),
+            "provision".to_owned(),
+            "--module".to_owned(),
+            module.display().to_string(),
+            "--token-label".to_owned(),
+            token.to_owned(),
+            "--pin-file".to_owned(),
+            pin.display().to_string(),
+        ];
+        all.extend(args.iter().map(|arg| (*arg).to_owned()));
+        helios::cli::run(all.into_iter().map(std::ffi::OsString::from), console)
+    }
+
+    fn attribute_flags(session: &Session, handle: ObjectHandle) -> Vec<Attribute> {
+        session
+            .get_attributes(
+                handle,
+                &[
+                    AttributeType::Token,
+                    AttributeType::Private,
+                    AttributeType::Sensitive,
+                    AttributeType::Extractable,
+                    AttributeType::Sign,
+                    AttributeType::Verify,
+                    AttributeType::Decrypt,
+                    AttributeType::Derive,
+                    AttributeType::Unwrap,
+                    AttributeType::Encrypt,
+                    AttributeType::Wrap,
+                ],
+            )
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn provisions_a_challenge_key_from_the_template() {
+        use ::cryptoki::object::ObjectClass;
+
+        if !in_suite() {
+            return;
+        }
+        provisioned_token("provision");
+        let directory = tempfile::tempdir().unwrap();
+        let pin = pin_file(directory.path());
+        let out = directory.path().join("challenge-key.pub.pem");
+        let mut console = TestConsole::default();
+
+        let code = provision(
+            "provision",
+            &pin,
+            &["challenge-key", "--out", out.to_str().unwrap()],
+            &mut console,
+        );
+
+        assert_eq!(code, 0, "{}", console.stderr());
+        let pem = std::fs::read_to_string(&out).unwrap();
+        let spki = VerifyingKey::from_public_key_der(
+            &rustls_pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let fingerprint = helios::provision::hex(&<sha2::Sha256 as sha2::Digest>::digest(
+            spki.to_public_key_der().unwrap().as_bytes(),
+        ));
+        assert!(
+            console.stdout().contains(&fingerprint),
+            "{}",
+            console.stdout()
+        );
+
+        // The template from LLD 1, section 4.10.
+        let pkcs11 = pkcs11();
+        let session = user_session(&pkcs11, "provision");
+        let find = |class| {
+            let handles = session
+                .find_objects(&[
+                    Attribute::Class(class),
+                    Attribute::Label(b"challenge-key".to_vec()),
+                    Attribute::Id(vec![2]),
+                ])
+                .unwrap();
+            assert_eq!(handles.len(), 1);
+            handles[0]
+        };
+        let private = attribute_flags(&session, find(ObjectClass::PRIVATE_KEY));
+        for expected in [
+            Attribute::Token(true),
+            Attribute::Private(false),
+            Attribute::Sensitive(true),
+            Attribute::Extractable(false),
+            Attribute::Sign(true),
+            Attribute::Decrypt(false),
+            Attribute::Derive(false),
+            Attribute::Unwrap(false),
+        ] {
+            assert!(
+                private.contains(&expected),
+                "private key: {expected:?} in {private:?}"
+            );
+        }
+        let public = attribute_flags(&session, find(ObjectClass::PUBLIC_KEY));
+        for expected in [
+            Attribute::Token(true),
+            Attribute::Private(false),
+            Attribute::Verify(true),
+            Attribute::Encrypt(false),
+            Attribute::Wrap(false),
+        ] {
+            assert!(
+                public.contains(&expected),
+                "public key: {expected:?} in {public:?}"
+            );
+        }
+        // Close this session and the module before the backend loads it again.
+        drop(session);
+        drop(pkcs11);
+
+        // It signs without logging in, and the exported key verifies the signature.
+        let mut token = backend("provision");
+        token.open().unwrap();
+        let raw = token.sign_without_login("challenge-key", &[9; 32]).unwrap();
+        let signature = Signature::from_slice(&raw).unwrap();
+        assert!(spki.verify_prehash(&[9; 32], &signature).is_ok());
+    }
+
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn refuses_labels_and_ids_in_use_and_replaces_on_request() {
+        if !in_suite() {
+            return;
+        }
+        provisioned_token("replace");
+        let directory = tempfile::tempdir().unwrap();
+        let pin = pin_file(directory.path());
+        let out = directory.path().join("key.pem");
+        let out = out.to_str().unwrap();
+
+        // CKA_ID 01 is the device key's.
+        let mut console = TestConsole::default();
+        assert_eq!(
+            provision(
+                "replace",
+                &pin,
+                &["challenge-key", "--id", "01", "--out", out],
+                &mut console
+            ),
+            1
+        );
+        assert!(
+            console
+                .stderr()
+                .contains("private key \"device-key\" (CKA_ID 01, private)"),
+            "{}",
+            console.stderr()
+        );
+
+        let mut console = TestConsole::default();
+        assert_eq!(
+            provision(
+                "replace",
+                &pin,
+                &["challenge-key", "--out", out],
+                &mut console
+            ),
+            0
+        );
+        let first = std::fs::read_to_string(out).unwrap();
+
+        // Again: the label is taken, and so is the output file.
+        let mut console = TestConsole::default();
+        assert_eq!(
+            provision(
+                "replace",
+                &pin,
+                &["challenge-key", "--out", out],
+                &mut console
+            ),
+            1
+        );
+        assert!(
+            console.stderr().contains("use --replace"),
+            "{}",
+            console.stderr()
+        );
+        let other = directory.path().join("other.pem");
+        let mut console = TestConsole::default();
+        assert_eq!(
+            provision(
+                "replace",
+                &pin,
+                &["challenge-key", "--out", other.to_str().unwrap()],
+                &mut console
+            ),
+            1
+        );
+        assert!(
+            console.stderr().contains("already has"),
+            "{}",
+            console.stderr()
+        );
+
+        // --replace asks first. "No" leaves it alone.
+        let mut console = TestConsole::default();
+        assert_eq!(
+            provision(
+                "replace",
+                &pin,
+                &["challenge-key", "--replace", "--out", out],
+                &mut console
+            ),
+            1
+        );
+        assert!(console.stderr().contains("not replaced"));
+        assert_eq!(std::fs::read_to_string(out).unwrap(), first);
+
+        let mut console = TestConsole {
+            answers: vec![true],
+            ..TestConsole::default()
+        };
+        assert_eq!(
+            provision(
+                "replace",
+                &pin,
+                &["challenge-key", "--replace", "--out", out],
+                &mut console
+            ),
+            0,
+            "{}",
+            console.stderr()
+        );
+        assert!(
+            console.stdout().contains("deleted 2 objects"),
+            "{}",
+            console.stdout()
+        );
+        let second = std::fs::read_to_string(out).unwrap();
+        assert_ne!(second, first);
+
+        let mut console = TestConsole::default();
+        assert_eq!(
+            provision(
+                "replace",
+                &pin,
+                &["challenge-key", "--replace", "--yes", "--out", out],
+                &mut console
+            ),
+            0
+        );
+        assert_ne!(std::fs::read_to_string(out).unwrap(), second);
+    }
+
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn shows_the_token_without_secrets() {
+        if !in_suite() {
+            return;
+        }
+        let cert = provisioned_token("show");
+        generate_key("show", "challenge-key", 2, false);
+        let directory = tempfile::tempdir().unwrap();
+        let pin = pin_file(directory.path());
+        let mut console = TestConsole::default();
+
+        assert_eq!(
+            provision("show", &pin, &["show"], &mut console),
+            0,
+            "{}",
+            console.stderr()
+        );
+
+        let output = console.stdout();
+        let fingerprint = DeviceCertificate::from_der(&cert)
+            .unwrap()
+            .fingerprint_hex();
+        for expected in [
+            "token \"show\"",
+            "private key \"device-key\" (CKA_ID 01, private)",
+            "private key \"challenge-key\" (CKA_ID 02, public)",
+            "certificate \"device-key\" (CKA_ID 01): subject CN t-01JD5VY2K7M9Q4R6T8V0X2Z4B6",
+            fingerprint.as_str(),
+        ] {
+            assert!(
+                output.contains(expected),
+                "{expected:?} missing from:\n{output}"
+            );
+        }
+        assert!(!output.contains(USER_PIN));
+    }
+
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn a_wrong_pin_or_missing_token_is_a_configuration_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !in_suite() {
+            return;
+        }
+        provisioned_token("bad-pin");
+        let directory = tempfile::tempdir().unwrap();
+        let wrong = directory.path().join("wrong");
+        std::fs::write(&wrong, "000000").unwrap();
+        std::fs::set_permissions(&wrong, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut console = TestConsole::default();
+        assert_eq!(provision("bad-pin", &wrong, &["show"], &mut console), 78);
+        assert!(
+            console.stderr().contains("PIN is incorrect"),
+            "{}",
+            console.stderr()
+        );
+        let mut console = TestConsole::default();
+        assert_eq!(
+            provision("no-such-token", &wrong, &["show"], &mut console),
+            78
+        );
+    }
+
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn the_binary_runs_provision_commands() {
+        if !in_suite() {
+            return;
+        }
+        provisioned_token("binary");
+        let directory = tempfile::tempdir().unwrap();
+        let pin = pin_file(directory.path());
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_helios"))
+            .args(["provision", "--module"])
+            .arg(module_path())
+            .args(["--token-label", "binary", "--pin-file"])
+            .arg(&pin)
+            .arg("show")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("device-key"));
+        // Without --pin-file and without a terminal, it can't ask for the PIN.
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_helios"))
+            .args(["provision", "--module"])
+            .arg(module_path())
+            .args(["--token-label", "binary", "show"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(78));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--pin-file"));
     }
 }

@@ -247,7 +247,7 @@ impl TokenBackend for CryptokiToken {
 }
 
 /// Maps a `cryptoki` error to a [`TokenError`], following the table in LLD 1, section 4.2.
-fn map_error(error: CryptokiError) -> TokenError {
+pub(crate) fn map_error(error: CryptokiError) -> TokenError {
     match error {
         CryptokiError::Pkcs11(rv, function) => map_rv(rv, &format!("{function}: {rv}")),
         CryptokiError::LibraryLoading(error) => TokenError::ModuleLoad(error.to_string()),
