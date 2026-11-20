@@ -88,6 +88,10 @@ pub trait TokenBackend: Send + 'static {
     /// Closes all sessions and unloads the module. Key references from before are invalid
     /// afterwards.
     fn close(&mut self);
+
+    /// Changes the label of the token to open, for when the bootstrap service supplies it.
+    /// Closes the token if the label changes.
+    fn set_token_label(&mut self, label: &str);
 }
 
 /// What was opened, for logs and the `helios` shadow. Holds no secrets.

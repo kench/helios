@@ -301,3 +301,33 @@ impl MockService {
         root_store_from_pem(self.ca.pem.as_bytes()).unwrap()
     }
 }
+
+/// A fake `/sys` with built-in Ethernet adapters named `name` with permanent MAC `mac`.
+pub(crate) fn fake_sysfs(adapters: &[(&str, &str)]) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let net = root.path().join("class/net");
+    std::fs::create_dir_all(&net).unwrap();
+    for (name, mac) in adapters {
+        let device = root.path().join("devices/platform").join(name);
+        let interface = device.join("net").join(name);
+        std::fs::create_dir_all(&interface).unwrap();
+        std::os::unix::fs::symlink(&device, interface.join("device")).unwrap();
+        std::fs::write(interface.join("type"), "1\n").unwrap();
+        std::fs::write(interface.join("addr_assign_type"), "0\n").unwrap();
+        std::fs::write(interface.join("address"), format!("{mac}\n")).unwrap();
+        std::os::unix::fs::symlink(&interface, net.join(name)).unwrap();
+    }
+    root
+}
+
+/// A kernel that reports no permanent addresses, so the sysfs fallback is used.
+pub(crate) struct NoPermanentAddresses;
+
+impl crate::identity::bootstrap::adapters::PermanentAddresses for NoPermanentAddresses {
+    fn permanent_address(
+        &self,
+        _: &str,
+    ) -> std::io::Result<Option<crate::identity::bootstrap::adapters::MacAddress>> {
+        Ok(None)
+    }
+}

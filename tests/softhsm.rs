@@ -631,7 +631,7 @@ mod suite {
     #[ignore = "run by softhsm_suite"]
     fn the_identity_manager_opens_the_softhsm_token() {
         use helios::identity::manager::{
-            IdentityManager, IdentityState, ManagerConfig, ManagerExit,
+            IdentityManager, IdentityState, ManagerConfig, ManagerExit, PinSetting,
         };
         use std::os::unix::fs::PermissionsExt;
 
@@ -667,7 +667,7 @@ mod suite {
             let (handle, task) = IdentityManager::start(
                 ManagerConfig::new("t-01JD5VY2K7M9Q4R6T8V0X2Z4B6", "device-key"),
                 Box::new(backend("managed")),
-                pin_source,
+                PinSetting::Local(pin_source),
                 RootCertStore::empty(),
                 cancel.clone(),
             )

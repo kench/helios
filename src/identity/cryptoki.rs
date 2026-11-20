@@ -237,6 +237,13 @@ impl TokenBackend for CryptokiToken {
     fn close(&mut self) {
         self.open = None;
     }
+
+    fn set_token_label(&mut self, label: &str) {
+        if self.token_label != label {
+            self.close();
+            label.clone_into(&mut self.token_label);
+        }
+    }
 }
 
 /// Maps a `cryptoki` error to a [`TokenError`], following the table in LLD 1, section 4.2.
@@ -360,6 +367,16 @@ mod tests {
             Err(TokenError::NotOpen)
         );
         token.close();
+    }
+
+    #[test]
+    fn changing_the_token_label_takes_effect_on_the_next_open() {
+        let mut token = CryptokiToken::new("/nonexistent/libpkcs11-missing.so", "helios");
+
+        token.set_token_label("helios");
+        assert_eq!(token.token_label, "helios");
+        token.set_token_label("other");
+        assert_eq!(token.token_label, "other");
     }
 
     #[test]

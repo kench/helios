@@ -6,11 +6,16 @@
 //! [`IdentityState`] on a watch channel. The MQTT and credential managers connect only while
 //! the state is [`IdentityState::Ready`].
 //!
+//! With `pin = "bootstrap"`, the manager first gets the PIN and device identity from the
+//! bootstrap service (see [`PinSetting::Bootstrap`] and the `bootstrap` submodule) and
+//! publishes [`IdentityState::Bootstrapping`] while it retries.
+//!
 //! A lost token (a signature that fails or times out) clears the resolver, closes the token
 //! and retries with backoff until the token is back. PIN, key and certificate problems that
 //! retrying can't fix end the manager with [`ManagerExit::Fatal`], and Helios exits with
 //! code 78 so systemd doesn't restart it and spend another PIN try.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,6 +27,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::build_info;
+use crate::identity::bootstrap::adapters::{Interfaces, PermanentAddresses};
+use crate::identity::bootstrap::api::AwsSettings;
+use crate::identity::bootstrap::client::BootstrapClient;
 use crate::identity::cert::{self, CertError, DeviceCertificate, Validity};
 use crate::identity::pin::{PinError, PinSource};
 use crate::identity::signer::{DEFAULT_SIGN_TIMEOUT, SignerHandle};
@@ -69,10 +77,15 @@ impl Default for Recovery {
 /// response).
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
-    /// The AWS IoT thing name. The certificate's subject CN should match it.
-    pub thing_name: String,
-    /// `CKA_LABEL` of the device key.
-    pub key_label: String,
+    /// The AWS IoT thing name. The certificate's subject CN should match it. Required with a
+    /// local PIN; with bootstrap, the service supplies it and a local value must match.
+    pub thing_name: Option<String>,
+    /// `CKA_LABEL` of the device key. Required with a local PIN, as for `thing_name`.
+    pub key_label: Option<String>,
+    /// The token label. With a local PIN the backend is created with it. With bootstrap, the
+    /// service supplies it and a local value must match. A local value is needed to answer
+    /// bootstrap challenges, which come before the service names the token.
+    pub token_label: Option<String>,
     /// Where the certificate comes from.
     pub certificate: CertificateSource,
     /// Log in even when the token says the next wrong PIN locks it.
@@ -93,8 +106,20 @@ impl ManagerConfig {
     #[must_use]
     pub fn new(thing_name: impl Into<String>, key_label: impl Into<String>) -> Self {
         Self {
-            thing_name: thing_name.into(),
-            key_label: key_label.into(),
+            thing_name: Some(thing_name.into()),
+            key_label: Some(key_label.into()),
+            ..Self::for_bootstrap()
+        }
+    }
+
+    /// Settings with nothing set locally, for when the bootstrap service supplies the thing
+    /// name and labels. Defaults as for [`new`](Self::new).
+    #[must_use]
+    pub fn for_bootstrap() -> Self {
+        Self {
+            thing_name: None,
+            key_label: None,
+            token_label: None,
             certificate: CertificateSource::Token,
             allow_final_pin_try: false,
             sign_timeout: DEFAULT_SIGN_TIMEOUT,
@@ -104,11 +129,83 @@ impl ManagerConfig {
     }
 }
 
+/// Where the PIN comes from.
+pub enum PinSetting {
+    /// A local source (`credential:` or `file:`). The thing name and key label must be set in
+    /// [`ManagerConfig`].
+    Local(Arc<dyn PinSource>),
+    /// The bootstrap service, which also supplies the thing name and labels.
+    Bootstrap(Box<BootstrapSetup>),
+}
+
+/// What the manager needs to bootstrap (`[bootstrap]` config).
+pub struct BootstrapSetup {
+    /// The service client.
+    pub client: BootstrapClient,
+    /// Which network interfaces to report.
+    pub interfaces: Interfaces,
+    /// Normally `/sys`.
+    pub sysfs: PathBuf,
+    /// Where permanent MACs come from: normally
+    /// [`Rtnetlink`](crate::identity::bootstrap::adapters::Rtnetlink).
+    pub permanent_addresses: Arc<dyn PermanentAddresses>,
+    /// From `/proc/device-tree/model`.
+    pub hardware_model: Option<String>,
+    /// The PIN-less challenge key, if the device has one.
+    pub challenge_key_label: Option<String>,
+    /// The local `[aws]` settings, if any. The service's must match them.
+    pub aws: Option<AwsSettings>,
+    /// Retry timing.
+    pub timing: BootstrapTiming,
+}
+
+/// Bootstrap retry timing (LLD 1, section 4.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapTiming {
+    /// First backoff delay after a network or service error. Doubles on each failure.
+    pub initial_backoff: Duration,
+    /// Longest backoff delay.
+    pub max_backoff: Duration,
+    /// Delay while the device record needs fixing (unknown, ambiguous or disabled).
+    pub slow_retry: Duration,
+    /// Rejected challenge signatures in a row before retries slow to `slow_retry`.
+    pub rejections_before_slow: u32,
+}
+
+impl Default for BootstrapTiming {
+    fn default() -> Self {
+        Self {
+            initial_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(60),
+            slow_retry: Duration::from_secs(5 * 60),
+            rejections_before_slow: 3,
+        }
+    }
+}
+
+/// The manager couldn't start.
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+    /// A setting required with a local PIN source is missing.
+    #[error("{0} must be set when the PIN is not from the bootstrap service")]
+    Missing(&'static str),
+    /// The signer thread couldn't start.
+    #[error("could not start the signer thread: {0}")]
+    Spawn(#[from] std::io::Error),
+}
+
 /// The identity's state, published on a watch channel.
 #[derive(Debug, Clone)]
 pub enum IdentityState {
     /// Opening the token for the first time.
     Starting,
+    /// Asking the bootstrap service for the PIN and identity. Retrying.
+    Bootstrapping {
+        /// Lookups so far, including the current one.
+        attempts: u32,
+        /// Why the previous lookup failed.
+        last_error: Option<String>,
+    },
     /// The token is open and the certificate checked. TLS connections can be made.
     Ready(Arc<Identity>),
     /// The token is missing or lost, or the certificate isn't valid yet or has expired.
@@ -141,6 +238,7 @@ impl IdentityState {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Starting => "starting",
+            Self::Bootstrapping { .. } => "bootstrapping",
             Self::Ready(_) => "ready",
             Self::Unavailable { .. } => "unavailable",
             Self::Fatal { .. } => "fatal",
@@ -179,6 +277,10 @@ pub struct CertInfo {
 pub struct DeviceInfo {
     /// The AWS IoT thing name.
     pub thing_name: String,
+    /// The bootstrap service's ID for the device, if it bootstrapped.
+    pub device_id: Option<String>,
+    /// AWS settings from the bootstrap service, merged with local ones.
+    pub aws: Option<AwsSettings>,
 }
 
 /// A problem that doesn't stop the identity being used. Each one is logged as a warning.
@@ -247,6 +349,20 @@ pub enum FatalReason {
     /// The operating system's random number generator failed.
     #[error("random number generator failed: {0}")]
     Random(String),
+    /// The built-in network adapters couldn't be found for bootstrap.
+    #[error("bootstrap: {0}")]
+    Adapters(String),
+    /// The bootstrap service and the local config disagree: the device or its service record
+    /// is set up wrong.
+    #[error("bootstrap service says {field} is {service:?}, but the local config has {local:?}")]
+    IdentityMismatch {
+        /// The setting, such as `thing_name`.
+        field: &'static str,
+        /// The local value.
+        local: String,
+        /// The service's value.
+        service: String,
+    },
 }
 
 /// Why the manager stopped.
@@ -310,7 +426,8 @@ impl IdentityManager {
     ///
     /// # Errors
     ///
-    /// Fails if the operating system can't start the signer thread.
+    /// [`StartError::Missing`] if a local PIN source is used without a thing name or key
+    /// label, and [`StartError::Spawn`] if the operating system can't start the signer thread.
     ///
     /// # Panics
     ///
@@ -318,10 +435,31 @@ impl IdentityManager {
     pub fn start(
         config: ManagerConfig,
         backend: Box<dyn TokenBackend>,
-        pin: Arc<dyn PinSource>,
+        pin: PinSetting,
         roots: RootCertStore,
         cancel: CancellationToken,
-    ) -> std::io::Result<(IdentityHandle, JoinHandle<ManagerExit>)> {
+    ) -> Result<(IdentityHandle, JoinHandle<ManagerExit>), StartError> {
+        let (pin, bootstrap, thing_name, key_label) = match pin {
+            PinSetting::Local(pin) => (
+                pin,
+                None,
+                config
+                    .thing_name
+                    .clone()
+                    .ok_or(StartError::Missing("device.thing_name"))?,
+                config
+                    .key_label
+                    .clone()
+                    .ok_or(StartError::Missing("identity.key_label"))?,
+            ),
+            // Filled in from the service's answer before the first open.
+            PinSetting::Bootstrap(setup) => (
+                Arc::new(NotYetFetched) as Arc<dyn PinSource>,
+                Some(setup),
+                String::new(),
+                String::new(),
+            ),
+        };
         let (lost_tx, lost) = mpsc::unbounded_channel();
         let signer = SignerHandle::spawn(backend, Some(lost_tx), config.sign_timeout)?;
         let (state_tx, state) = watch::channel(IdentityState::Starting);
@@ -329,6 +467,13 @@ impl IdentityManager {
         let poke = Arc::new(Notify::new());
         let backoff = Backoff::new(config.recovery.initial_backoff, config.recovery.max_backoff);
         let manager = Manager {
+            device: DeviceInfo {
+                thing_name,
+                device_id: None,
+                aws: None,
+            },
+            key_label,
+            bootstrap,
             config,
             signer,
             lost,
@@ -398,6 +543,12 @@ type OpenResult = Result<Opened, Failure>;
 
 struct Manager {
     config: ManagerConfig,
+    /// The device settings, from local config or the bootstrap service.
+    device: DeviceInfo,
+    /// The device key label, from local config or the bootstrap service.
+    key_label: String,
+    /// Bootstrap still to do before the first open.
+    bootstrap: Option<Box<BootstrapSetup>>,
     signer: SignerHandle,
     lost: mpsc::UnboundedReceiver<TokenError>,
     state: watch::Sender<IdentityState>,
@@ -420,6 +571,19 @@ enum Attempt {
 
 impl Manager {
     async fn run(mut self) -> ManagerExit {
+        if let Some(setup) = self.bootstrap.take() {
+            if let Err(exit) = self.bootstrap(*setup).await {
+                return self.exit(exit);
+            }
+        } else if let Some(label) = self.config.token_label.clone()
+            && self
+                .signer
+                .run(move |backend| backend.set_token_label(&label))
+                .await
+                .is_err()
+        {
+            return self.exit(ManagerExit::SignerStopped);
+        }
         loop {
             let delay = match self.attempt().await {
                 Attempt::Exit(exit) => return self.exit(exit),
@@ -501,7 +665,7 @@ impl Manager {
             Attempt::Failed(Failure::Fatal(FatalReason::Random(error.to_string())))
         })?;
         let request = OpenRequest {
-            key_label: self.config.key_label.clone(),
+            key_label: self.key_label.clone(),
             certificate_from_token: self.config.certificate == CertificateSource::Token,
             allow_final_pin_try: self.config.allow_final_pin_try,
             pin: self.pin.clone(),
@@ -521,7 +685,7 @@ impl Manager {
         };
         let Some(leaf) = chain.first() else {
             return Err(Failure::Fatal(FatalReason::CertificateMissing {
-                key_label: self.config.key_label.clone(),
+                key_label: self.key_label.clone(),
             }));
         };
         let certificate = DeviceCertificate::from_der(leaf)
@@ -550,10 +714,10 @@ impl Manager {
                 });
             }
         }
-        if !certificate.subject_cn_matches(&self.config.thing_name) {
+        if !certificate.subject_cn_matches(&self.device.thing_name) {
             warnings.push(Warning::SubjectMismatch {
                 subject_cn: certificate.subject_cn().map(str::to_owned),
-                thing_name: self.config.thing_name.clone(),
+                thing_name: self.device.thing_name.clone(),
             });
         }
         let fingerprint = certificate.fingerprint();
@@ -574,9 +738,7 @@ impl Manager {
                 fingerprint: certificate.fingerprint_hex(),
             },
             token: opened.summary,
-            device: DeviceInfo {
-                thing_name: self.config.thing_name.clone(),
-            },
+            device: self.device.clone(),
             warnings,
         })
     }
@@ -756,5 +918,21 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The PIN source until the bootstrap service has answered. Never read: the first open waits
+/// for bootstrap.
+struct NotYetFetched;
+
+impl PinSource for NotYetFetched {
+    fn read(&self) -> Result<secrecy::SecretString, PinError> {
+        Err(PinError::new(
+            "the bootstrap service has not supplied the PIN yet",
+        ))
+    }
+}
+
+mod bootstrap;
+
+#[cfg(test)]
+mod bootstrap_tests;
 #[cfg(test)]
 mod tests;

@@ -44,6 +44,8 @@ pub(crate) struct MockKey {
 #[derive(Debug)]
 struct State {
     summary: TokenSummary,
+    /// The label to open, set with `set_token_label`. Opening fails unless it is the token's.
+    token_label: String,
     pin: String,
     pin_status: PinStatus,
     keys: Vec<MockKey>,
@@ -74,6 +76,7 @@ impl MockToken {
             serial: "0001".to_owned(),
         };
         let state = State {
+            token_label: summary.label.clone(),
             summary,
             pin: pin.to_owned(),
             pin_status: PinStatus::default(),
@@ -212,6 +215,11 @@ impl TokenBackend for MockToken {
     fn open(&mut self) -> Result<TokenSummary, TokenError> {
         let mut state = self.state();
         state.enter(Op::Open)?;
+        if state.token_label != state.summary.label {
+            return Err(TokenError::NotPresent {
+                label: state.token_label.clone(),
+            });
+        }
         state.open = true;
         state.logged_in = false;
         state.generation += 1;
@@ -296,6 +304,15 @@ impl TokenBackend for MockToken {
         let mut state = self.state();
         state.open = false;
         state.logged_in = false;
+    }
+
+    fn set_token_label(&mut self, label: &str) {
+        let mut state = self.state();
+        if state.token_label != label {
+            state.open = false;
+            state.logged_in = false;
+            label.clone_into(&mut state.token_label);
+        }
     }
 }
 
