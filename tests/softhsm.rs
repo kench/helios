@@ -449,6 +449,41 @@ mod suite {
         );
     }
 
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn answers_a_bootstrap_challenge_with_the_softhsm_challenge_key() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use helios::identity::bootstrap::adapters::{Adapter, AdapterKind};
+        use helios::identity::bootstrap::challenge;
+
+        if !in_suite() {
+            return;
+        }
+        create_token("answer");
+        generate_key("answer", "device-key", 1, true);
+        let spki = generate_key("answer", "challenge-key", 2, false);
+        let adapters = [Adapter {
+            interface_name: "eth0".into(),
+            kind: AdapterKind::Ethernet,
+            mac: "2c:cf:67:00:00:01".parse().unwrap(),
+        }];
+        let message = challenge::message(
+            "c-01JD5W3Q8T6M2K4X9B0N7C1D2E",
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            &adapters,
+        );
+        let digest = challenge::digest(&message);
+
+        let signature = challenge::sign(&mut backend("answer"), "challenge-key", &digest).unwrap();
+
+        // What the service does: verify the DER signature with the registered public key.
+        let der = BASE64.decode(signature).unwrap();
+        let signature = Signature::from_der(&der).unwrap();
+        let verifying_key = VerifyingKey::from_public_key_der(&spki).unwrap();
+        assert!(verifying_key.verify_prehash(&digest, &signature).is_ok());
+    }
+
     /// A TLS server on localhost that requires a client certificate from `client_ca_pem` and
     /// replies with the subject CN it saw. Returns its port and its own CA certificate.
     async fn mtls_server(client_ca_pem: &str) -> (u16, String) {

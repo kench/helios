@@ -15,6 +15,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use serde::{Serialize, Serializer};
+
 /// The bootstrap API accepts at most this many adapters.
 pub const MAX_ADAPTERS: usize = 8;
 
@@ -52,6 +54,12 @@ impl fmt::Display for MacAddress {
     }
 }
 
+impl Serialize for MacAddress {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 impl fmt::Debug for MacAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "MacAddress({self})")
@@ -85,7 +93,8 @@ impl FromStr for MacAddress {
 }
 
 /// What kind of adapter it is, as the bootstrap API names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AdapterKind {
     /// Wired Ethernet.
     Ethernet,
@@ -105,7 +114,8 @@ impl AdapterKind {
 }
 
 /// A built-in network adapter with its permanent MAC address.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Adapter {
     /// The interface name, such as `eth0`.
     pub interface_name: String,

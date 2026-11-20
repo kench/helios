@@ -54,6 +54,7 @@ struct State {
     failures: HashMap<Op, VecDeque<TokenError>>,
     panics: Vec<Op>,
     sign_delay: Duration,
+    raw_signature_override: Option<RawSignature>,
 }
 
 /// A mock token. Clones share the same state.
@@ -84,6 +85,7 @@ impl MockToken {
             failures: HashMap::new(),
             panics: Vec::new(),
             sign_delay: Duration::ZERO,
+            raw_signature_override: None,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -110,6 +112,12 @@ impl MockToken {
     /// held while sleeping.
     pub(crate) fn set_sign_delay(&self, delay: Duration) {
         self.state().sign_delay = delay;
+    }
+
+    /// Makes `sign_without_login` return `raw` instead of a real signature, like a module that
+    /// returns garbage.
+    pub(crate) fn set_raw_signature_override(&self, raw: Option<RawSignature>) {
+        self.state().raw_signature_override = raw;
     }
 
     /// Replaces all keys, like re-provisioning the token or plugging in a different one.
@@ -229,6 +237,9 @@ impl TokenBackend for MockToken {
             return Err(TokenError::KeyNotFound {
                 label: label.to_owned(),
             });
+        }
+        if let Some(raw) = state.raw_signature_override {
+            return Ok(raw);
         }
         sign(key, digest)
     }
