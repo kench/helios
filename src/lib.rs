@@ -5,4 +5,5 @@
 //! the overall design and LLD 1 for the identity components.
 
 pub mod build_info;
+pub mod hardening;
 pub mod identity;

@@ -1,0 +1,25 @@
+# Helios systemd unit: the identity settings from LLD 1, section 4.5.
+# The full unit (sandboxing, watchdog, ordering) is defined in LLD 6.
+
+[Unit]
+Description=Helios on-device agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=helios
+ExecStart=/usr/bin/helios
+Restart=on-failure
+# Exit code 78 (EX_CONFIG) means a wrong or locked PIN, or a certificate that doesn't match the
+# key. Restarting would spend another PIN try, so don't.
+RestartPreventExitStatus=78
+# Keep secrets in memory out of core dumps. Helios also calls prctl(PR_SET_DUMPABLE, 0).
+LimitCORE=0
+# Needed by the SoftHSM2 PKCS#11 module. Helios only checks it is set.
+Environment=SOFTHSM2_CONF=/etc/helios/softhsm2.conf
+# Development only: with identity.pin = "credential:helios-pin". Devices use
+# identity.pin = "bootstrap" and don't need this. Requires systemd 247 or later.
+#LoadCredential=helios-pin:/etc/helios/credentials/pin
+
+[Install]
+WantedBy=multi-user.target

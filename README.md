@@ -18,6 +18,9 @@ set, as in CI. Each run uses its own temporary token directory.
 `build.rs` embeds the build time, which the identity manager treats as the earliest plausible
 clock reading when it checks certificate dates. Set `SOURCE_DATE_EPOCH` for reproducible builds.
 
+`dist/systemd/helios.service` has the identity-related unit settings (LLD 1, section 4.5). The
+full unit is defined in LLD 6.
+
 ```sh
 sudo apt install softhsm2
 rustup toolchain install nightly --profile minimal --component rustfmt
