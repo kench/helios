@@ -161,7 +161,7 @@ pub enum AdapterError {
 }
 
 /// Where permanent MAC addresses come from. The real one asks the kernel over rtnetlink.
-pub trait PermanentAddresses {
+pub trait PermanentAddresses: Send + Sync {
     /// `interface`'s permanent MAC, or `None` if the kernel or driver doesn't report one.
     ///
     /// # Errors

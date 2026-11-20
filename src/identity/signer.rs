@@ -375,6 +375,7 @@ mod tests {
             panic!("the PKCS#11 module crashed on purpose")
         }
         fn close(&mut self) {}
+        fn set_token_label(&mut self, _: &str) {}
     }
 
     #[test]

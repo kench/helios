@@ -13,11 +13,11 @@ use crate::identity::testing::{self, Ca, THING_NAME, ca, days, server};
 use crate::identity::tls::root_store_from_pem;
 use crate::identity::token::PinStatus;
 
-const PIN: &str = "1234";
+pub(super) const PIN: &str = "1234";
 const WAIT: Duration = Duration::from_secs(10);
 
 /// Retries quickly, so tests don't wait.
-fn fast() -> Recovery {
+pub(super) fn fast() -> Recovery {
     Recovery {
         initial_backoff: Duration::from_millis(10),
         max_backoff: Duration::from_millis(50),
@@ -27,7 +27,7 @@ fn fast() -> Recovery {
 }
 
 /// Never retries on its own, so only `poke()` triggers a retry.
-fn poke_only() -> Recovery {
+pub(super) fn poke_only() -> Recovery {
     Recovery {
         initial_backoff: Duration::from_secs(3600),
         max_backoff: Duration::from_secs(3600),
@@ -35,17 +35,17 @@ fn poke_only() -> Recovery {
     }
 }
 
-fn config(recovery: Recovery) -> ManagerConfig {
+pub(super) fn config(recovery: Recovery) -> ManagerConfig {
     let mut config = ManagerConfig::new(THING_NAME, "device-key");
     config.recovery = recovery;
     config
 }
 
-fn signing_key(seed: u8) -> SigningKey {
+pub(super) fn signing_key(seed: u8) -> SigningKey {
     SigningKey::from_slice(&[seed; 32]).unwrap()
 }
 
-fn device_key(key: &SigningKey, certificate: Option<CertificateDer<'_>>) -> MockKey {
+pub(super) fn device_key(key: &SigningKey, certificate: Option<CertificateDer<'_>>) -> MockKey {
     MockKey {
         label: "device-key".into(),
         id: vec![1],
@@ -56,13 +56,13 @@ fn device_key(key: &SigningKey, certificate: Option<CertificateDer<'_>>) -> Mock
 }
 
 /// A mock token with a device key and a certificate for it from a test CA.
-struct Device {
-    ca: Ca,
-    token: MockToken,
-    key: SigningKey,
+pub(super) struct Device {
+    pub(super) ca: Ca,
+    pub(super) token: MockToken,
+    pub(super) key: SigningKey,
 }
 
-fn device() -> Device {
+pub(super) fn device() -> Device {
     let ca = ca("Helios test device CA");
     let key = signing_key(7);
     let token = MockToken::new(PIN);
@@ -73,26 +73,31 @@ fn device() -> Device {
     Device { ca, token, key }
 }
 
-struct Running {
-    handle: IdentityHandle,
-    task: JoinHandle<ManagerExit>,
-    cancel: CancellationToken,
+pub(super) struct Running {
+    pub(super) handle: IdentityHandle,
+    pub(super) task: JoinHandle<ManagerExit>,
+    pub(super) cancel: CancellationToken,
 }
 
 fn start(token: &MockToken, config: ManagerConfig) -> Running {
     start_with(token, config, pin(PIN), any_roots())
 }
 
-fn start_with(
+pub(super) fn start_with(
     token: &MockToken,
     config: ManagerConfig,
     pin: Arc<dyn PinSource>,
     roots: RootCertStore,
 ) -> Running {
     let cancel = CancellationToken::new();
-    let (handle, task) =
-        IdentityManager::start(config, Box::new(token.clone()), pin, roots, cancel.clone())
-            .unwrap();
+    let (handle, task) = IdentityManager::start(
+        config,
+        Box::new(token.clone()),
+        PinSetting::Local(pin),
+        roots,
+        cancel.clone(),
+    )
+    .unwrap();
     Running {
         handle,
         task,
@@ -100,15 +105,18 @@ fn start_with(
     }
 }
 
-fn pin(value: &str) -> Arc<dyn PinSource> {
+pub(super) fn pin(value: &str) -> Arc<dyn PinSource> {
     Arc::new(FixedPin::new(SecretString::new(value.into())))
 }
 
-fn any_roots() -> RootCertStore {
+pub(super) fn any_roots() -> RootCertStore {
     root_store_from_pem(ca("Helios test roots").pem.as_bytes()).unwrap()
 }
 
-async fn wait_for(handle: &IdentityHandle, what: impl Fn(&IdentityState) -> bool) -> IdentityState {
+pub(super) async fn wait_for(
+    handle: &IdentityHandle,
+    what: impl Fn(&IdentityState) -> bool,
+) -> IdentityState {
     let mut state = handle.watch();
     let result = tokio::time::timeout(WAIT, state.wait_for(|current| what(current))).await;
     match result {
@@ -117,7 +125,7 @@ async fn wait_for(handle: &IdentityHandle, what: impl Fn(&IdentityState) -> bool
     }
 }
 
-async fn ready(handle: &IdentityHandle) -> Arc<Identity> {
+pub(super) async fn ready(handle: &IdentityHandle) -> Arc<Identity> {
     let state = wait_for(handle, |state| {
         matches!(state, IdentityState::Ready(_) | IdentityState::Fatal { .. })
     })
@@ -128,7 +136,7 @@ async fn ready(handle: &IdentityHandle) -> Arc<Identity> {
     }
 }
 
-async fn unavailable(handle: &IdentityHandle) -> (String, Instant) {
+pub(super) async fn unavailable(handle: &IdentityHandle) -> (String, Instant) {
     match wait_for(handle, |state| {
         matches!(state, IdentityState::Unavailable { .. })
     })
@@ -139,7 +147,7 @@ async fn unavailable(handle: &IdentityHandle) -> (String, Instant) {
     }
 }
 
-async fn fatal(running: Running) -> FatalReason {
+pub(super) async fn fatal(running: Running) -> FatalReason {
     let exit = tokio::time::timeout(WAIT, running.task)
         .await
         .expect("the manager should stop")
@@ -156,7 +164,7 @@ async fn fatal(running: Running) -> FatalReason {
 }
 
 /// Waits until `check` holds, polling.
-async fn eventually(what: &str, check: impl Fn() -> bool) {
+pub(super) async fn eventually(what: &str, check: impl Fn() -> bool) {
     let deadline = Instant::now() + WAIT;
     while !check() {
         assert!(Instant::now() < deadline, "timed out waiting until {what}");
@@ -164,12 +172,12 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
     }
 }
 
-fn count(token: &MockToken, op: Op) -> usize {
+pub(super) fn count(token: &MockToken, op: Op) -> usize {
     token.calls().iter().filter(|call| **call == op).count()
 }
 
 /// Signs through the identity's key the way rustls does, on a blocking thread.
-async fn sign_with(identity: &Identity) -> Result<Vec<u8>, rustls::Error> {
+pub(super) async fn sign_with(identity: &Identity) -> Result<Vec<u8>, rustls::Error> {
     let signer = identity
         .certified_key
         .key
@@ -605,7 +613,7 @@ async fn token_errors_retrying_cannot_fix_are_fatal() {
     );
 
     let mut other_key = config(fast());
-    other_key.key_label = "missing-key".into();
+    other_key.key_label = Some("missing-key".into());
     let running = start(&device.token, other_key);
     let reason = fatal(running).await;
     assert_eq!(
