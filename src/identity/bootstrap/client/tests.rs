@@ -289,7 +289,7 @@ async fn reports_http_errors() {
         }
     });
     let closing = BootstrapClient {
-        port,
+        endpoint: Endpoint::new("localhost", port).unwrap(),
         ..client.clone()
     };
 
@@ -314,8 +314,11 @@ fn accepts_only_https_urls_without_queries() {
         DEFAULT_TIMEOUT,
     )
     .unwrap();
-    assert_eq!(client.host, "device-management.services.kenley.tv");
-    assert_eq!(client.port, 443);
+    assert_eq!(
+        client.endpoint.host(),
+        "device-management.services.kenley.tv"
+    );
+    assert_eq!(client.endpoint.port(), 443);
     assert_eq!(client.base_path, "/v1");
     assert_eq!(client.timeout, Duration::from_secs(10));
 
