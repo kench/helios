@@ -4,6 +4,9 @@
 //! state through Device Shadow and runs the device modules. See the Helios
 //! High-Level Design for the overall design.
 
-fn main() {
-    println!("Hello, world!");
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let mut terminal = helios::cli::Terminal::default();
+    ExitCode::from(helios::cli::run(std::env::args_os(), &mut terminal))
 }
