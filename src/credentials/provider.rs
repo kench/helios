@@ -233,14 +233,20 @@ impl Inner {
     /// Fetches new credentials and caches them. The caller holds `refreshing`.
     async fn fetch(&self) -> Result<Instant, RefreshError> {
         let result = self.try_fetch().await;
+        // One update, so watchers never see new credentials next to an old error.
         self.status.send_modify(|status| match &result {
-            Ok(_) => status.last_error = None,
+            Ok((_, expires_at)) => {
+                status.expires_at = Some(*expires_at);
+                status.last_refresh = Some(SystemTime::now());
+                status.last_error = None;
+            }
             Err(error) => status.last_error = Some(error.to_string()),
         });
-        result
+        result.map(|(refresh_at, _)| refresh_at)
     }
 
-    async fn try_fetch(&self) -> Result<Instant, RefreshError> {
+    /// Fetches and caches new credentials. Returns when to refresh and when they expire.
+    async fn try_fetch(&self) -> Result<(Instant, SystemTime), RefreshError> {
         let state = self.identity.state();
         let Some(identity) = state.identity() else {
             return Err(RefreshError::IdentityNotReady(state.name()));
@@ -270,15 +276,11 @@ impl Inner {
             expires: now + fetched.lifetime,
             refresh_at,
         });
-        self.status.send_modify(|status| {
-            status.expires_at = Some(expires_at);
-            status.last_refresh = Some(SystemTime::now());
-        });
         tracing::info!(
             lifetime_s = fetched.lifetime.as_secs(),
             "AWS credentials refreshed"
         );
-        Ok(refresh_at)
+        Ok((refresh_at, expires_at))
     }
 }
 
