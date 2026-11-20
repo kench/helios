@@ -2,4 +2,5 @@
 //! certificate (LLD 1, section 5).
 
 pub mod client;
+pub mod provider;
 pub mod refresh;
