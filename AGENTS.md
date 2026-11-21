@@ -15,7 +15,8 @@ src/credentials/   AWS credentials through the AWS IoT credentials provider
 src/mqtt/          connection manager, envelopes, shadow manager, the helios shadow (LLD 2)
 src/router/        command router; CommandTransport (custom cmd/rsp topics now)
 src/clock/         clock checks (LLD 1, 4.11); kernel.rs holds the only allowed unsafe code
-src/modules/       device modules, each behind a Cargo feature (display: LLD 9)
+src/modules/       device modules behind Cargo features (display: LLD 9), the Module trait and
+                   the supervisor that restarts them (LLD 5, section 14)
 src/provision/     `helios provision` (challenge key, show, verify)
 src/service.rs     wires everything together for `helios` with no subcommand
 contract/          git submodule: helios-contract (Bootstrap API model and test vectors)
@@ -69,6 +70,9 @@ version rather than moving the tag.
 - Never log or print PINs, and never put them in process arguments.
 - Modules are Cargo features, off by default; a module's config section is ignored in builds
   without it. The scanner build needs `--features module-display`.
+- A module implements `Module` (`src/modules/mod.rs`) and runs under the supervisor, which gives
+  each run a fresh `ModuleContext` and restarts it with backoff; module state is in the `helios`
+  shadow's `modules`.
 - Licensed fonts (Roobert TW Bold) are loaded at run time from the device and are never committed
   or compiled in. Nothing from INIT's vendor software goes into this repository.
 - Don't push tags or change repository settings without the owner's OK.
