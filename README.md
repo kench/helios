@@ -62,7 +62,8 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   `duration_s`), `display.clear` and `display.status` change it, and the `display` shadow's
   desired state `{"idle": {"template": …, "fields": …}}` sets the idle screen. It writes only the
   rows that change, needs no `unsafe` code, and shows "Helios stopped" on shutdown. It needs the
-  `video` group.
+  `video` group. `bold_font` can name a font file on the device to use for bold text instead, for
+  licensed fonts that mustn't be compiled into Helios; the scanner keeps it on the USB drive.
 
 The other modules come later.
 

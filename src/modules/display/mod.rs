@@ -55,6 +55,9 @@ pub struct DisplaySettings {
     pub time_zone: TimeZone,
     /// How often to redraw while the kernel's console is still attached; zero for never.
     pub redraw_interval: Duration,
+    /// A font file for bold text in place of the built-in Noto Sans Bold, read at start. For
+    /// licensed fonts kept on the device rather than compiled in.
+    pub bold_font: Option<PathBuf>,
 }
 
 /// Where the module gets and sends things.
@@ -87,8 +90,28 @@ pub fn start(
     inputs: Inputs,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>, String> {
-    let fonts = Fonts::load()?;
-    let display = Display::new(settings, inputs, fonts);
+    let mut fonts = Fonts::load()?;
+    let bold_font = settings.bold_font.as_ref().map(|path| {
+        let loaded = std::fs::read(path)
+            .map_err(|error| format!("can't read it: {error}"))
+            .and_then(|bytes| fonts.replace_bold(bytes));
+        match loaded {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "bold font loaded");
+                json!({"path": path, "error": null})
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "bold font not loaded; using the built-in Noto Sans Bold"
+                );
+                json!({"path": path, "error": error})
+            }
+        }
+    });
+    let mut display = Display::new(settings, inputs, fonts);
+    display.bold_font = bold_font.unwrap_or(Value::Null);
     Ok(tokio::spawn(display.run(cancel)))
 }
 
@@ -120,6 +143,8 @@ struct Display {
     error: Option<String>,
     /// The last state reported, to report only changes.
     reported: Option<Map<String, Value>>,
+    /// The configured bold font and whether it loaded; null for the built-in one.
+    bold_font: Value,
 }
 
 impl Display {
@@ -137,6 +162,7 @@ impl Display {
             idle_since: SystemTime::now(),
             error: None,
             reported: None,
+            bold_font: Value::Null,
         }
     }
 
@@ -426,6 +452,7 @@ impl Display {
             "geometry": geometry,
             "console_bound": self.console_bound,
             "time_zone": self.settings.time_zone_name,
+            "bold_font": self.bold_font,
             "error": self.error,
         })
     }

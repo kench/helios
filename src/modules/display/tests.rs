@@ -53,6 +53,7 @@ fn settings(dir: &std::path::Path) -> DisplaySettings {
         time_zone_name: "UTC".to_owned(),
         time_zone: TimeZone::UTC,
         redraw_interval: Duration::from_secs(10),
+        bold_font: None,
     }
 }
 
@@ -421,4 +422,51 @@ fn formats_the_status_in_the_time_zone() {
     assert_eq!(status_info(&offline, &la, now, None).connected_since, None);
     let _ = default_route_address();
     assert!(time(now).as_str().unwrap().starts_with("2026-11-21T15:04"));
+}
+
+#[tokio::test]
+async fn loads_a_bold_font_from_a_file() {
+    let dir = temp_dir("bold");
+    create_framebuffer(&dir);
+    let font =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts/NotoSans-Regular-subset.ttf");
+    let mut harness = Harness::start_in(dir, |mut settings| {
+        settings.bold_font = Some(font.clone());
+        settings
+    });
+
+    let report = harness.report(|r| r["available"] == true).await;
+    assert_eq!(report["bold_font"]["path"], font.to_str().unwrap());
+    assert_eq!(report["bold_font"]["error"], Value::Null);
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn falls_back_to_the_built_in_bold_font() {
+    for (name, contents) in [
+        ("bold-missing", None),
+        ("bold-broken", Some(b"not a font".as_slice())),
+    ] {
+        let dir = temp_dir(name);
+        create_framebuffer(&dir);
+        let font = dir.join("Missing-Bold.otf");
+        if let Some(contents) = contents {
+            std::fs::write(&font, contents).unwrap();
+        }
+        let mut harness = Harness::start_in(dir, |mut settings| {
+            settings.bold_font = Some(font.clone());
+            settings
+        });
+
+        let report = harness.report(|r| r["available"] == true).await;
+        let error = report["bold_font"]["error"].as_str().unwrap();
+        assert!(
+            error.contains("can't read it") || error.contains("not a usable font"),
+            "{error}"
+        );
+        // The screen is still drawn, with the built-in font.
+        assert_eq!(harness.pixel(0, 0), BACKGROUND);
+        assert_eq!(report["error"], Value::Null);
+        harness.stop().await;
+    }
 }

@@ -59,3 +59,6 @@ idle_template = "status"           # status, blank or test; the display shadow's
                                    # can set another, with fields
 time_zone = "America/Los_Angeles"  # IANA name for the clock; default "UTC"
 redraw_interval_s = 10             # 0 to 3600: redraws while the kernel's console is attached
+# bold_font = "/run/helios/fonts/RoobertTW-Bold.otf"  # a font file for bold text, read at start,
+                                   # for licensed fonts kept on the device rather than compiled in;
+                                   # falls back to the built-in Noto Sans Bold if it can't be read

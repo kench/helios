@@ -93,6 +93,22 @@ impl Fonts {
         })
     }
 
+    /// Uses the font in `bytes` (TrueType or OpenType/CFF) for bold text in place of Noto Sans
+    /// Bold. For fonts that may not be bundled with Helios, such as a licensed face kept on the
+    /// device (LLD 9, section 5).
+    ///
+    /// # Errors
+    ///
+    /// If `bytes` isn't a font `fontdue` can read; the current bold font stays.
+    pub fn replace_bold(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        let font = Font::from_bytes(bytes, FontSettings::default())
+            .map_err(|error| format!("not a usable font: {error}"))?;
+        self.bold = font;
+        self.glyphs
+            .retain(|(_, weight, _), _| *weight != Weight::Bold);
+        Ok(())
+    }
+
     fn font(&self, weight: Weight) -> &Font {
         match weight {
             Weight::Regular => &self.regular,
@@ -323,6 +339,40 @@ mod tests {
                 .wrap("", width, &style(1))
                 .iter()
                 .all(String::is_empty)
+        );
+    }
+
+    #[test]
+    fn replaces_the_bold_font() {
+        let mut fonts = Fonts::load().unwrap();
+        let bold = fonts.width("Helios", 20.0, Weight::Bold);
+        let mut canvas = Canvas::new(100, 40);
+        let area = TextBox {
+            x: 0,
+            y: 0,
+            width: 100.0,
+        };
+        let mut s = style(1);
+        s.weight = Weight::Bold;
+        fonts.draw(&mut canvas, "Hi", area, &s);
+
+        // Any font file works; the regular face stands in for a licensed bold one.
+        fonts.replace_bold(REGULAR.to_vec()).unwrap();
+        assert!(fonts.width("Helios", 20.0, Weight::Bold) < bold);
+        assert_eq!(
+            fonts.width("Helios", 20.0, Weight::Bold),
+            fonts.width("Helios", 20.0, Weight::Regular)
+        );
+        // Cached bold glyphs were dropped, so drawing uses the new face.
+        let mut redrawn = Canvas::new(100, 40);
+        fonts.draw(&mut redrawn, "Hi", area, &s);
+        assert_ne!(redrawn, canvas);
+
+        let error = fonts.replace_bold(b"not a font".to_vec()).unwrap_err();
+        assert!(error.contains("not a usable font"), "{error}");
+        assert_eq!(
+            fonts.width("Helios", 20.0, Weight::Bold),
+            fonts.width("Helios", 20.0, Weight::Regular)
         );
     }
 

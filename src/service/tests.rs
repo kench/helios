@@ -438,6 +438,7 @@ async fn runs_the_display_module_and_waits_for_it_on_shutdown() {
         time_zone_name: "UTC".into(),
         time_zone: jiff::tz::TimeZone::UTC,
         redraw_interval: Duration::from_secs(10),
+        bold_font: None,
     });
     let mut platform = platform();
     platform.sysfs = dir.path().join("sys");

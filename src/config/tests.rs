@@ -651,6 +651,7 @@ fn display_module_defaults() {
     assert_eq!(display.idle, Screen::Status);
     assert_eq!(display.time_zone_name, "UTC");
     assert_eq!(display.redraw_interval, Duration::from_secs(10));
+    assert_eq!(display.bold_font, None);
     assert!(config.ignored_sections.is_empty());
 }
 
@@ -662,7 +663,8 @@ fn display_module_settings() {
         .load(&files.local(
             "\n[modules.display]\nenabled = true\nframebuffer = \"/dev/fb1\"\n\
              idle_template = \"blank\"\ntime_zone = \"America/Los_Angeles\"\n\
-             redraw_interval_s = 0\n\n[modules.barcode]\nenabled = true\n",
+             redraw_interval_s = 0\nbold_font = \"/run/helios/fonts/Bold.otf\"\n\n\
+             [modules.barcode]\nenabled = true\n",
         ))
         .unwrap();
     let display = config.display.unwrap();
@@ -670,6 +672,10 @@ fn display_module_settings() {
     assert_eq!(display.idle, Screen::Blank);
     assert_eq!(display.time_zone_name, "America/Los_Angeles");
     assert!(display.redraw_interval.is_zero());
+    assert_eq!(
+        display.bold_font,
+        Some(PathBuf::from("/run/helios/fonts/Bold.otf"))
+    );
     assert_eq!(config.ignored_sections, ["modules.barcode"]);
 }
 

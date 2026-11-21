@@ -148,6 +148,7 @@ struct DisplaySection {
     idle_template: Option<String>,
     time_zone: Option<String>,
     redraw_interval_s: Option<u64>,
+    bold_font: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,6 +359,7 @@ impl DisplaySection {
             time_zone_name,
             time_zone,
             redraw_interval: Duration::from_secs(redraw),
+            bold_font: self.bold_font,
         }))
     }
 }
