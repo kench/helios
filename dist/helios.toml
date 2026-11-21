@@ -33,3 +33,11 @@ sign_timeout_ms     = 5000
 # credentials_endpoint = "<prefix>.credentials.iot.us-west-2.amazonaws.com"
 # role_alias           = "helios-device-role-alias"
 root_ca = "/etc/helios/amazon-root-cas.pem"   # AmazonRootCA1 + AmazonRootCA3
+
+[mqtt]
+# AWS IoT Core over MQTT 3.1.1 (LLD 2, section 6). The endpoint is aws.iot_endpoint, from the
+# bootstrap service or the [aws] section above.
+port           = 8883        # or 443 (ALPN x-amzn-mqtt-ca) where 8883 is blocked
+keep_alive_s   = 60          # 30 to 1200
+queue_messages = 1000        # events kept while offline; the oldest are dropped first
+commands       = "topics"    # helios/<thing>/cmd|rsp/<module>; "aws-iot-commands" comes later
