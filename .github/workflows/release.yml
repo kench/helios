@@ -1,0 +1,141 @@
+# Publishes a Helios release to the APT repository (helios-cloud's AptRepository stack) when a
+# version tag (v<Cargo version>, for example v0.1.1) is pushed. The Debian boards (relay and
+# transcoder, arm64) install and upgrade Helios from it with unattended-upgrades.
+#
+# Needs, in this repository's settings:
+#   secrets.APT_SIGNING_KEY         armored private GPG key that signs the repository (no passphrase)
+#   vars.APT_BUCKET                 helios-cloud output AptBucketName
+#   vars.APT_DISTRIBUTION_ID        helios-cloud output AptDistributionId
+#   vars.APT_PUBLISHER_ROLE_ARN     helios-cloud output AptPublisherRoleArn
+# The publisher role trusts only this repository's v* tags (GitHub OIDC, immutable subject).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# One release at a time: publishing rewrites the repository's indices.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  TARGET: aarch64-unknown-linux-gnu
+  # The oldest glibc the boards may run (Debian 11, Ubuntu 22.04); matches the package's
+  # libc6 dependency.
+  GLIBC: "2.31"
+  ZIG_VERSION: 0.14.1
+  CARGO_ZIGBUILD_VERSION: 0.24.1
+  CARGO_DEB_VERSION: 3.6.3
+
+jobs:
+  build:
+    name: Build the arm64 package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml's version $version"
+            exit 1
+          fi
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME isn't on main"
+            exit 1
+          fi
+
+      # Installs the toolchain pinned in rust-toolchain.toml, with the arm64 target.
+      - name: Install toolchain
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+
+      - name: Install zig, cargo-zigbuild and cargo-deb
+        run: |
+          python3 -m pip install --user "ziglang==$ZIG_VERSION"
+          cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+          cargo install --locked cargo-deb --version "$CARGO_DEB_VERSION"
+
+      - name: Build
+        run: cargo zigbuild --locked --release --target "$TARGET.$GLIBC"
+
+      - name: Package
+        run: cargo deb --target "$TARGET" --no-build
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v7
+        with:
+          name: deb
+          path: target/${{ env.TARGET }}/debian/*.deb
+          if-no-files-found: error
+
+  publish:
+    name: Publish to the APT repository
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download the package
+        uses: actions/download-artifact@v7
+        with:
+          name: deb
+          path: dist-deb
+
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.APT_PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Import the signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
+          key=$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/ { print $10; exit }')
+          echo "KEY_ID=$key" >>"$GITHUB_ENV"
+
+      - name: Fetch the published packages
+        run: aws s3 sync --only-show-errors "s3://${{ vars.APT_BUCKET }}/pool" repo/pool
+
+      - name: Build and sign the repository
+        run: .github/scripts/build-apt-repo.sh repo "$KEY_ID" dist-deb/*.deb
+
+      # Packages first and InRelease last, so a device updating meanwhile sees either the old
+      # release or the complete new one.
+      - name: Upload
+        env:
+          BUCKET: ${{ vars.APT_BUCKET }}
+        run: |
+          cd repo
+          for deb in ../dist-deb/*.deb; do
+            aws s3 cp --only-show-errors "pool/main/h/helios/$(basename "$deb")" \
+              "s3://$BUCKET/pool/main/h/helios/"
+          done
+          aws s3 cp --only-show-errors --recursive dists/stable/main "s3://$BUCKET/dists/stable/main"
+          aws s3 cp --only-show-errors keys/helios-archive-keyring.asc "s3://$BUCKET/keys/"
+          for file in Release Release.gpg InRelease; do
+            aws s3 cp --only-show-errors "dists/stable/$file" "s3://$BUCKET/dists/stable/$file"
+          done
+
+      - name: Invalidate the indices
+        run: |
+          aws cloudfront create-invalidation --distribution-id "${{ vars.APT_DISTRIBUTION_ID }}" \
+            --paths '/dists/*' '/keys/*' --query Invalidation.Id --output text

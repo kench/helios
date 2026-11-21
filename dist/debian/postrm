@@ -1,0 +1,10 @@
+#!/bin/sh
+# helios postrm: forget the unit once it's removed. The helios user and /etc/helios are kept,
+# since they hold the device's identity setup.
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+exit 0

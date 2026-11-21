@@ -4,6 +4,29 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "CC0-1.0"
+description = "Helios on-device agent for AWS IoT Core"
+
+# The Debian package for the relay and transcoder boards (arm64), built by the release workflow
+# with `cargo deb --target aarch64-unknown-linux-gnu --no-build` after a zigbuild for glibc 2.31.
+[package.metadata.deb]
+maintainer = "Kenley <kench@users.noreply.github.com>"
+copyright = "Kenley"
+section = "net"
+priority = "optional"
+extended-description = """\
+The Helios on-device agent: connects the device to AWS IoT Core with a key held in a PKCS#11 \
+token, reports its state, and runs its modules. The service is installed but not enabled: \
+provision the device (config and token), then `systemctl enable --now helios`."""
+depends = "libc6 (>= 2.31), adduser, softhsm2"
+recommends = "unattended-upgrades"
+assets = [
+    ["target/release/helios", "usr/bin/", "755"],
+    ["dist/systemd/helios.service", "lib/systemd/system/", "644"],
+    ["dist/helios.toml", "usr/share/doc/helios/examples/", "644"],
+    ["dist/debian/52helios-unattended-upgrades", "etc/apt/apt.conf.d/", "644"],
+    ["README.md", "usr/share/doc/helios/", "644"],
+]
+maintainer-scripts = "dist/debian/"
 
 [dependencies]
 aws-credential-types = { version = "1.3.1", default-features = false }

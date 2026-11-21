@@ -1,0 +1,19 @@
+#!/bin/sh
+# helios postinst: the helios system user, and a restart on upgrade if Helios is running.
+# The service isn't enabled or started on install: a device needs its config and token first
+# (provisioning), and then enables helios.service itself.
+set -e
+
+if [ "$1" = configure ]; then
+    if ! getent passwd helios >/dev/null; then
+        adduser --system --group --home /nonexistent --no-create-home \
+            --gecos "Helios agent" helios
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        # Upgrades restart a running Helios; installs and stopped services are left alone.
+        systemctl try-restart helios.service || true
+    fi
+fi
+
+exit 0
