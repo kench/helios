@@ -1,9 +1,13 @@
 # helios
 
-Helios on-device agent (Rust): AWS IoT MQTT, device shadows and the bootstrap client.
+Helios on-device agent (Rust): a PKCS#11-held device identity with the bootstrap client, AWS IoT
+MQTT, device shadows, commands and device modules (the scanner's display so far). Released as a
+Debian package for the arm64 boards.
 
-Design docs (Notion): *Helios - High-Level Design* and the Helios LLDs. Coding standards,
-commit message rules and the coverage target are in HLD section 12.
+Design docs (Notion): *Helios - High-Level Design* and the Helios LLDs; current status in *Helios -
+Project Status and Handoff*, devices in *Hardware Deployment Information*. Coding standards,
+commit message rules and the coverage target are in HLD section 12. `AGENTS.md` summarizes the
+layout, checks and rules for coding agents.
 
 ## Development
 
