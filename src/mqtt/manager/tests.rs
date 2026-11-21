@@ -618,3 +618,39 @@ fn rate_limit_allows_a_burst_then_refills() {
     rate.last -= Duration::from_secs(1);
     assert!(rate.take());
 }
+
+#[tokio::test]
+async fn publishes_now_only_while_connected() {
+    let device_ca = ca("Helios test device CA");
+    let broker = Broker::start(&device_ca).await;
+    let (identity, _token, identity_cancel) =
+        ready_identity(&device_ca, broker.roots.clone()).await;
+    let (incoming_tx, _incoming) = mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    let (handle, _task) =
+        MqttManager::start(identity, options(broker.port), incoming_tx, cancel.clone());
+    // Sent before the session is up: dropped, not queued.
+    handle.publish_now("early/topic".to_owned(), b"{\"type\":\"early\"}".to_vec());
+    let mut status = handle.status();
+    tokio::time::timeout(WAIT, status.wait_for(|s| s.connected))
+        .await
+        .unwrap()
+        .unwrap();
+    let shadow = format!("$aws/things/{THING_NAME}/shadow/name/helios/update");
+
+    handle.publish_now(shadow.clone(), b"{\"type\":\"now\"}".to_vec());
+    broker
+        .until("the shadow update", |s| s.publishes.len() >= 2)
+        .await;
+
+    assert_eq!(
+        broker.published_types(),
+        vec![
+            (lifecycle_topic(), "lifecycle.online".to_owned()),
+            (shadow, "now".to_owned()),
+        ]
+    );
+    assert_eq!(status.borrow().thing.as_deref(), Some(THING_NAME));
+    cancel.cancel();
+    identity_cancel.cancel();
+}

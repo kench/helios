@@ -3,8 +3,10 @@
 use std::time::Duration;
 
 pub mod envelope;
+pub mod helios_shadow;
 pub mod manager;
 mod queue;
+pub mod shadow;
 pub mod topics;
 
 /// The `[mqtt]` settings (LLD 2, section 6).
