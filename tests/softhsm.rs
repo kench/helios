@@ -1095,4 +1095,131 @@ mod suite {
         assert_eq!(output.status.code(), Some(78));
         assert!(String::from_utf8_lossy(&output.stderr).contains("--pin-file"));
     }
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn verify_reports_the_identity_and_the_challenge_key() {
+        if !in_suite() {
+            return;
+        }
+        let cert = provisioned_token("verify");
+        let challenge = generate_key("verify", "challenge-key", 2, false);
+        let directory = tempfile::tempdir().unwrap();
+        let pin = pin_file(directory.path());
+        let mut console = TestConsole::default();
+
+        let code = provision(
+            "verify",
+            &pin,
+            &[
+                "verify",
+                "--thing-name",
+                "t-01JD5VY2K7M9Q4R6T8V0X2Z4B6",
+                "--timeout",
+                "10",
+            ],
+            &mut console,
+        );
+
+        assert_eq!(code, 0, "{}", console.stderr());
+        let output = console.stdout();
+        let challenge_fingerprint =
+            helios::provision::hex(&<sha2::Sha256 as sha2::Digest>::digest(&challenge));
+        let cert_fingerprint = DeviceCertificate::from_der(&cert)
+            .unwrap()
+            .fingerprint_hex();
+        for expected in [
+            format!(
+                "challenge key \"challenge-key\": signs without login (public key SHA-256 {challenge_fingerprint})"
+            ),
+            "identity: ready".to_owned(),
+            "thing name: t-01JD5VY2K7M9Q4R6T8V0X2Z4B6".to_owned(),
+            cert_fingerprint,
+            "proof of possession".to_owned(),
+        ] {
+            assert!(
+                output.contains(&expected),
+                "{expected:?} missing from:\n{output}"
+            );
+        }
+        assert!(!output.contains(USER_PIN));
+    }
+
+    #[test]
+    #[ignore = "run by softhsm_suite"]
+    fn verify_reports_problems() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !in_suite() {
+            return;
+        }
+        provisioned_token("verify-bad");
+        let directory = tempfile::tempdir().unwrap();
+        let pin = pin_file(directory.path());
+
+        // No challenge key: reported, but not an error.
+        let mut console = TestConsole::default();
+        let args = ["verify", "--thing-name", "t-01JD5VY2K7M9Q4R6T8V0X2Z4B6"];
+        assert_eq!(
+            provision("verify-bad", &pin, &args, &mut console),
+            0,
+            "{}",
+            console.stderr()
+        );
+        assert!(
+            console.stdout().contains("not on the token (optional"),
+            "{}",
+            console.stdout()
+        );
+
+        // A wrong PIN is fatal, as at startup.
+        let wrong = directory.path().join("wrong");
+        std::fs::write(&wrong, "000000").unwrap();
+        std::fs::set_permissions(&wrong, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut console = TestConsole::default();
+        assert_eq!(provision("verify-bad", &wrong, &args, &mut console), 78);
+        assert!(
+            console
+                .stderr()
+                .contains("identity: token PIN is incorrect"),
+            "{}",
+            console.stderr()
+        );
+
+        // With bootstrap, a configured interface that doesn't exist is fatal before any lookup.
+        let ca = directory.path().join("ca.pem");
+        let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        std::fs::write(&ca, ca_params.self_signed(&ca_key).unwrap().pem()).unwrap();
+        let mut console = TestConsole::default();
+        let bootstrap = [
+            "verify",
+            "--bootstrap",
+            "--bootstrap-url",
+            "https://localhost:1/v1",
+            "--bootstrap-ca",
+            ca.to_str().unwrap(),
+            "--interfaces",
+            "helios-none0",
+            "--timeout",
+            "5",
+        ];
+        assert_eq!(provision("verify-bad", &pin, &bootstrap, &mut console), 78);
+        assert!(
+            console
+                .stderr()
+                .contains("network interface \"helios-none0\" does not exist"),
+            "{}",
+            console.stderr()
+        );
+
+        // Without bootstrap, the thing name has to be given.
+        let mut console = TestConsole::default();
+        assert_eq!(provision("verify-bad", &pin, &["verify"], &mut console), 78);
+        assert!(
+            console.stderr().contains("--thing-name is required"),
+            "{}",
+            console.stderr()
+        );
+    }
 }

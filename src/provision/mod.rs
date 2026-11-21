@@ -4,6 +4,8 @@
 //! `cryptoki`: listing them, creating the PIN-less challenge key from the LLD's template, and
 //! exporting its public key for registering with the bootstrap service.
 
+pub mod verify;
+
 use std::fmt;
 use std::path::Path;
 
@@ -374,6 +376,31 @@ impl ProvisionToken {
             )
             .map_err(map_error)?;
         self.public_key(public)
+    }
+
+    /// The public key labelled `label`, if there is exactly one. Public keys are visible
+    /// without login.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Ambiguous`] if several public keys have the label, and token errors.
+    pub fn public_key_by_label(
+        &self,
+        label: &str,
+    ) -> Result<Option<ChallengePublicKey>, ProvisionError> {
+        let handles = self.handles(&[
+            Attribute::Class(ObjectClass::PUBLIC_KEY),
+            Attribute::Label(label.as_bytes().to_vec()),
+        ])?;
+        match handles.as_slice() {
+            [] => Ok(None),
+            [handle] => self.public_key(*handle).map(Some),
+            more => Err(TokenError::Ambiguous {
+                what: format!("public keys with label {label:?}"),
+                count: more.len(),
+            }
+            .into()),
+        }
     }
 
     /// The SubjectPublicKeyInfo of an EC public key object, from `CKA_EC_POINT`.
