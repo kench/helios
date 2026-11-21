@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::backoff::{self, Backoff};
+use crate::clock::ClockSamples;
 use crate::credentials::client::{CredentialsClient, CredentialsError, Retry};
 use crate::credentials::refresh;
 use crate::identity::manager::{IdentityHandle, IdentityState};
@@ -120,6 +121,7 @@ struct Inner {
     /// Held while a refresh runs, so concurrent callers share it.
     refreshing: tokio::sync::Mutex<()>,
     status: watch::Sender<CredentialsStatus>,
+    clock: ClockSamples,
 }
 
 /// The AWS SDK credentials provider. Cheap to clone.
@@ -148,7 +150,8 @@ impl ProvideCredentials for HeliosCredentialsProvider {
 impl HeliosCredentialsProvider {
     /// A provider for the device with `identity`, and the background task that keeps its
     /// credentials fresh until `cancel` is cancelled. `local` is the local `[aws]` config,
-    /// used unless the bootstrap service supplied AWS settings.
+    /// used unless the bootstrap service supplied AWS settings. Responses' server times go to
+    /// `clock`.
     ///
     /// # Panics
     ///
@@ -158,6 +161,7 @@ impl HeliosCredentialsProvider {
         identity: IdentityHandle,
         local: Option<LocalSettings>,
         timing: Timing,
+        clock: ClockSamples,
         cancel: CancellationToken,
     ) -> (Self, JoinHandle<()>) {
         let provider = Self {
@@ -168,6 +172,7 @@ impl HeliosCredentialsProvider {
                 cached: std::sync::Mutex::new(None),
                 refreshing: tokio::sync::Mutex::new(()),
                 status: watch::channel(CredentialsStatus::default()).0,
+                clock,
             }),
         };
         let task = tokio::spawn(refresher(provider.inner.clone(), cancel));
@@ -253,7 +258,8 @@ impl Inner {
         };
         let (endpoint, role_alias) = endpoints(identity.device.aws.as_ref(), self.local.as_ref())
             .ok_or(RefreshError::NotConfigured)?;
-        let client = CredentialsClient::new(endpoint, role_alias, &identity.device.thing_name)?;
+        let client = CredentialsClient::new(endpoint, role_alias, &identity.device.thing_name)?
+            .with_clock(self.clock.clone());
         let tls = self
             .identity
             .tls_config(Alpn::Http1)

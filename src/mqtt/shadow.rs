@@ -10,13 +10,15 @@
 //! them with [`ShadowHandle::desired`].
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::clock::ClockSamples;
+use crate::clock::offset::{Sample, Source};
 use crate::mqtt::manager::{Incoming, MqttHandle, MqttStatus};
 
 /// AWS IoT's limit on a shadow document.
@@ -99,6 +101,7 @@ impl ShadowManager {
         mqtt: MqttHandle,
         incoming: mpsc::Receiver<Incoming>,
         timing: Timing,
+        clock: ClockSamples,
         cancel: CancellationToken,
     ) -> (ShadowHandle, JoinHandle<()>) {
         let (requests_tx, requests) = mpsc::unbounded_channel();
@@ -108,6 +111,7 @@ impl ShadowManager {
             incoming,
             requests,
             timing,
+            clock,
             cancel,
             shadows: BTreeMap::new(),
         };
@@ -148,6 +152,8 @@ fn parse_topic<'a>(thing: &str, topic: &'a str) -> Option<ShadowTopic<'a>> {
 struct InFlight {
     token: String,
     sent: Instant,
+    /// When it was sent, by the device clock, for clock checks.
+    sent_at: SystemTime,
     /// The stale keys it set to `null`; once accepted, they're gone from the shadow.
     nulls: Vec<String>,
 }
@@ -172,6 +178,7 @@ struct Manager {
     incoming: mpsc::Receiver<Incoming>,
     requests: mpsc::UnboundedReceiver<Request>,
     timing: Timing,
+    clock: ClockSamples,
     cancel: CancellationToken,
     shadows: BTreeMap<String, Shadow>,
 }
@@ -275,6 +282,15 @@ impl Manager {
                 if let Some(in_flight) = shadow.in_flight.take() {
                     // Only the keys this update removed: others may have gone stale since.
                     shadow.stale.retain(|key| !in_flight.nulls.contains(key));
+                    if let Some(seconds) = document["timestamp"].as_u64() {
+                        self.clock.offer(Sample {
+                            source: Source::Shadow,
+                            sent: in_flight.sent_at,
+                            received: SystemTime::now(),
+                            round_trip: in_flight.sent.elapsed(),
+                            server: UNIX_EPOCH + Duration::from_secs(seconds),
+                        });
+                    }
                 }
             }
             ("update", "rejected") if ours => {
@@ -341,7 +357,8 @@ impl Manager {
             for key in &shadow.stale {
                 reported.insert(key.clone(), Value::Null);
             }
-            let token = crate::ulid::new(SystemTime::now());
+            let sent_at = SystemTime::now();
+            let token = crate::ulid::new(sent_at);
             let document = json!({"state": {"reported": reported}, "clientToken": token});
             let bytes = document.to_string().into_bytes();
             shadow.dirty = false;
@@ -358,6 +375,7 @@ impl Manager {
             shadow.in_flight = Some(InFlight {
                 token,
                 sent: now,
+                sent_at,
                 nulls: shadow.stale.clone(),
             });
             shadow.last_sent = Some(now);

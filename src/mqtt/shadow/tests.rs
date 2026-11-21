@@ -33,7 +33,13 @@ fn setup() -> Setup {
     let (mqtt, published, status) = MqttHandle::for_test();
     let (incoming, incoming_rx) = mpsc::channel(16);
     let cancel = CancellationToken::new();
-    let (shadows, _task) = ShadowManager::start(mqtt, incoming_rx, timing(), cancel.clone());
+    let (shadows, _task) = ShadowManager::start(
+        mqtt,
+        incoming_rx,
+        timing(),
+        crate::clock::ClockSamples::discard(),
+        cancel.clone(),
+    );
     Setup {
         shadows,
         published,
@@ -397,4 +403,52 @@ fn parses_shadow_topics() {
         None
     );
     assert_eq!(parse_topic(THING, "helios/t-1/cmd/usb"), None);
+}
+
+#[tokio::test]
+async fn offers_accepted_timestamps_to_the_clock_checks() {
+    let (mqtt, mut published, status) = MqttHandle::for_test();
+    let (incoming, incoming_rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let (clock, mut samples) = crate::clock::ClockSamples::for_test();
+    let (shadows, _task) = ShadowManager::start(mqtt, incoming_rx, timing(), clock, cancel.clone());
+    let mut setup = Setup {
+        shadows,
+        published: {
+            let (_, empty) = mpsc::unbounded_channel();
+            std::mem::replace(&mut published, empty)
+        },
+        status,
+        incoming,
+        cancel,
+    };
+    connect(&setup, 1);
+    setup.shadows.report("helios", map(json!({"n": 1})));
+    let update = next_update(&mut setup).await;
+
+    // Another update's reply, then ours without and with a timestamp.
+    reply(
+        &setup,
+        "update/accepted",
+        json!({"clientToken": "other", "timestamp": 1}),
+    )
+    .await;
+    reply(
+        &setup,
+        "update/accepted",
+        json!({"clientToken": update["clientToken"], "timestamp": 1_795_240_800}),
+    )
+    .await;
+    let sample = tokio::time::timeout(WAIT, samples.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(sample.source, crate::clock::offset::Source::Shadow);
+    assert_eq!(
+        sample.server,
+        UNIX_EPOCH + Duration::from_secs(1_795_240_800)
+    );
+    assert!(sample.received >= sample.sent);
+    assert!(samples.try_recv().is_err());
 }

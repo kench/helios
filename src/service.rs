@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::{EXIT_CONFIG, EXIT_ERROR, EXIT_OK};
+use crate::clock::{ClockMonitor, Probes};
 use crate::config::Config;
 use crate::credentials::provider::{HeliosCredentialsProvider, LocalSettings};
 use crate::identity::bootstrap::adapters::{PermanentAddresses, Rtnetlink};
@@ -73,6 +74,8 @@ pub struct Timing {
     pub shadows: crate::mqtt::shadow::Timing,
     /// The router's.
     pub router: crate::router::Timing,
+    /// The clock checks'.
+    pub clock: crate::clock::Timing,
 }
 
 /// Incoming MQTT messages wait here until the router and shadow manager read them.
@@ -179,11 +182,19 @@ impl Service {
         manager.allow_final_pin_try = config.allow_final_pin_try;
         manager.sign_timeout = config.sign_timeout;
 
+        let cancel = CancellationToken::new();
+        let (clock_samples, clock_status, clock_task) = ClockMonitor::start(
+            config.clock.clone(),
+            timing.clock,
+            Probes::default(),
+            cancel.clone(),
+        );
         let pin = match config.bootstrap {
             Some(bootstrap) => {
                 let client =
                     BootstrapClient::new(&bootstrap.url, bootstrap.roots, bootstrap.timeout)
-                        .map_err(|error| StartFailure::config(error.to_string()))?;
+                        .map_err(|error| StartFailure::config(error.to_string()))?
+                        .with_clock(clock_samples.clone());
                 PinSetting::Bootstrap(Box::new(BootstrapSetup {
                     client,
                     interfaces: bootstrap.interfaces,
@@ -205,7 +216,6 @@ impl Service {
             }
         };
 
-        let cancel = CancellationToken::new();
         let (identity, identity_task) =
             IdentityManager::start(manager, backend, pin, config.roots, cancel.clone())?;
         let local_endpoint = config.aws.as_ref().map(|aws| aws.iot_endpoint.clone());
@@ -217,6 +227,7 @@ impl Service {
             identity.clone(),
             local,
             timing.credentials,
+            clock_samples.clone(),
             cancel.clone(),
         );
         // Only custom topics for now; mqtt.commands = "aws-iot-commands" is refused by the config
@@ -238,13 +249,19 @@ impl Service {
             mqtt_cancel.clone(),
         );
         let (shadow_tx, shadow_rx) = mpsc::channel(INCOMING_CAPACITY);
-        let (shadows, shadow_task) =
-            ShadowManager::start(mqtt.clone(), shadow_rx, timing.shadows, cancel.clone());
+        let (shadows, shadow_task) = ShadowManager::start(
+            mqtt.clone(),
+            shadow_rx,
+            timing.shadows,
+            clock_samples,
+            cancel.clone(),
+        );
         let reporter = helios_shadow::start(
             Sources {
                 identity: identity.watch(),
                 credentials: credentials.status(),
                 mqtt: mqtt.status(),
+                clock: clock_status,
                 boot_id: platform.boot_id.clone(),
                 started_at: std::time::SystemTime::now(),
             },
@@ -275,7 +292,14 @@ impl Service {
             identity_task,
             credentials_task,
             mqtt_task,
-            helpers: vec![routing, shadow_task, reporter, router_task, helios_commands],
+            helpers: vec![
+                routing,
+                shadow_task,
+                reporter,
+                router_task,
+                helios_commands,
+                clock_task,
+            ],
             cancel,
             mqtt_cancel,
         })

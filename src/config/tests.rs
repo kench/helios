@@ -576,3 +576,44 @@ fn rejects_bad_mqtt_settings() {
         assert!(error.contains(expected), "{section}: {error}");
     }
 }
+
+#[test]
+fn reads_the_clock_settings() {
+    let files = Files::new();
+
+    let config = files
+        .load(&files.local("\n[clock]\nwarn_offset_s = 30\n"))
+        .unwrap();
+    let defaults = files.load(&files.local("")).unwrap();
+
+    assert_eq!(config.clock.warn_offset, Duration::from_secs(30));
+    assert_eq!(defaults.clock, crate::clock::ClockSettings::default());
+    assert_eq!(
+        defaults.clock.boot_mark.as_deref(),
+        Some(std::path::Path::new("/run/helios/boot-clock"))
+    );
+}
+
+#[test]
+fn rejects_bad_clock_settings() {
+    let files = Files::new();
+    for (section, expected) in [
+        (
+            "warn_offset_s = 0",
+            "clock.warn_offset_s must be from 1 to 239",
+        ),
+        (
+            "warn_offset_s = 240",
+            "clock.warn_offset_s must be from 1 to 239",
+        ),
+        (
+            "state_file = \"/var/lib/helios/clock\"",
+            "isn't supported yet",
+        ),
+        ("unknown = 1", "unknown"),
+    ] {
+        let error = files.error(&files.local(&format!("\n[clock]\n{section}\n")));
+
+        assert!(error.contains(expected), "{section}: {error}");
+    }
+}
