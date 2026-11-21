@@ -59,11 +59,17 @@ fn local_config(service: &MockService, pin_dir: &Path) -> Config {
         roots: service.roots(),
         aws: Some(AwsSettings {
             region: "us-west-2".into(),
-            iot_endpoint: "example-ats.iot.us-west-2.amazonaws.com".into(),
+            // MQTT tries this and gets refused straight away (see `mqtt` below).
+            iot_endpoint: "localhost".into(),
             credentials_endpoint: format!("localhost:{}", service.port),
             role_alias: "helios-device-role-alias".into(),
         }),
         bootstrap: None,
+        // A closed port: MQTT has its own tests (mqtt/manager/tests.rs).
+        mqtt: crate::mqtt::MqttSettings {
+            port: 9,
+            ..crate::mqtt::MqttSettings::default()
+        },
         ignored_sections: vec!["modules".into()],
     }
 }
@@ -74,15 +80,24 @@ fn platform() -> Platform {
         permanent_addresses: Arc::new(NoPermanentAddresses),
         device_tree_model: PathBuf::from("/nonexistent/model"),
         credentials_directory: None,
+        boot_id: None,
     }
 }
 
 fn timing() -> Timing {
     Timing {
-        initial_backoff: Duration::from_millis(10),
-        max_backoff: Duration::from_millis(50),
-        rejected_retry: Duration::from_millis(50),
-        ..Timing::default()
+        credentials: crate::credentials::provider::Timing {
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(50),
+            rejected_retry: Duration::from_millis(50),
+            ..crate::credentials::provider::Timing::default()
+        },
+        mqtt: crate::mqtt::manager::Timing {
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(50),
+            shutdown_wait: Duration::from_millis(200),
+            ..crate::mqtt::manager::Timing::default()
+        },
     }
 }
 

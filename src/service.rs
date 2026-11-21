@@ -2,8 +2,10 @@
 //! section 6).
 //!
 //! It loads `helios.toml`, starts the identity manager (with the bootstrap service or a local
-//! PIN) and the credentials refresher, and runs until SIGTERM or SIGINT, or until the identity
-//! fails. MQTT and the modules come later (LLD 2).
+//! PIN), the credentials refresher and the MQTT connection manager (LLD 2, section 6), and runs
+//! until SIGTERM or SIGINT, or until the identity fails. On shutdown, MQTT stops first, so
+//! `lifecycle.offline` goes out before the token is closed. The shadow manager, router and
+//! modules come later (LLD 2).
 //!
 //! Exit codes, as `helios.service` expects them:
 //!
@@ -17,12 +19,13 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::{EXIT_CONFIG, EXIT_ERROR, EXIT_OK};
 use crate::config::Config;
-use crate::credentials::provider::{HeliosCredentialsProvider, LocalSettings, Timing};
+use crate::credentials::provider::{HeliosCredentialsProvider, LocalSettings};
 use crate::identity::bootstrap::adapters::{PermanentAddresses, Rtnetlink};
 use crate::identity::bootstrap::client::BootstrapClient;
 use crate::identity::bootstrap::{DEVICE_TREE_MODEL, hardware_model};
@@ -33,6 +36,7 @@ use crate::identity::manager::{
 };
 use crate::identity::pin::credentials_directory_from_env;
 use crate::identity::token::TokenBackend;
+use crate::mqtt::manager::{Incoming, MqttHandle, MqttManager, Options as MqttOptions};
 use crate::provision::DEFAULT_TOKEN_LABEL;
 use crate::{hardening, logging};
 
@@ -46,7 +50,24 @@ pub struct Platform {
     pub device_tree_model: PathBuf,
     /// `$CREDENTIALS_DIRECTORY`, for `identity.pin = "credential:<name>"`.
     pub credentials_directory: Option<PathBuf>,
+    /// The kernel's boot ID, reported in `lifecycle.online`.
+    pub boot_id: Option<String>,
 }
+
+/// Where the kernel's boot ID is.
+pub const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
+
+/// Retry timing for the service's parts. Tests shorten it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Timing {
+    /// The credentials refresher's.
+    pub credentials: crate::credentials::provider::Timing,
+    /// The MQTT connection manager's.
+    pub mqtt: crate::mqtt::manager::Timing,
+}
+
+/// Incoming MQTT messages wait here until the router and shadow manager read them.
+const INCOMING_CAPACITY: usize = 64;
 
 impl Platform {
     /// The real device.
@@ -57,6 +78,9 @@ impl Platform {
             permanent_addresses: Arc::new(Rtnetlink),
             device_tree_model: PathBuf::from(DEVICE_TREE_MODEL),
             credentials_directory: credentials_directory_from_env(),
+            boot_id: std::fs::read_to_string(BOOT_ID)
+                .ok()
+                .map(|id| id.trim().to_owned()),
         }
     }
 }
@@ -99,13 +123,19 @@ impl From<StartError> for StartFailure {
 pub struct Service {
     identity: IdentityHandle,
     credentials: HeliosCredentialsProvider,
+    mqtt: MqttHandle,
     identity_task: JoinHandle<ManagerExit>,
     credentials_task: JoinHandle<()>,
+    mqtt_task: JoinHandle<()>,
+    incoming_task: JoinHandle<()>,
     cancel: CancellationToken,
+    /// Stops MQTT before everything else.
+    mqtt_cancel: CancellationToken,
 }
 
 impl Service {
-    /// Starts the identity manager with `backend` and the credentials refresher.
+    /// Starts the identity manager with `backend`, the credentials refresher and the MQTT
+    /// connection manager.
     ///
     /// # Errors
     ///
@@ -166,18 +196,41 @@ impl Service {
         let cancel = CancellationToken::new();
         let (identity, identity_task) =
             IdentityManager::start(manager, backend, pin, config.roots, cancel.clone())?;
+        let local_endpoint = config.aws.as_ref().map(|aws| aws.iot_endpoint.clone());
         let local = config.aws.map(|aws| LocalSettings {
             credentials_endpoint: aws.credentials_endpoint,
             role_alias: aws.role_alias,
         });
-        let (credentials, credentials_task) =
-            HeliosCredentialsProvider::start(identity.clone(), local, timing, cancel.clone());
+        let (credentials, credentials_task) = HeliosCredentialsProvider::start(
+            identity.clone(),
+            local,
+            timing.credentials,
+            cancel.clone(),
+        );
+        let mqtt_cancel = CancellationToken::new();
+        let (incoming_tx, incoming) = mpsc::channel(INCOMING_CAPACITY);
+        let (mqtt, mqtt_task) = MqttManager::start(
+            identity.clone(),
+            MqttOptions {
+                settings: config.mqtt,
+                local_endpoint,
+                boot_id: platform.boot_id.clone(),
+                timing: timing.mqtt,
+            },
+            incoming_tx,
+            mqtt_cancel.clone(),
+        );
+        let incoming_task = tokio::spawn(drain(incoming));
         Ok(Self {
             identity,
             credentials,
+            mqtt,
             identity_task,
             credentials_task,
+            mqtt_task,
+            incoming_task,
             cancel,
+            mqtt_cancel,
         })
     }
 
@@ -193,26 +246,43 @@ impl Service {
         &self.credentials
     }
 
+    /// The MQTT connection.
+    #[must_use]
+    pub fn mqtt(&self) -> &MqttHandle {
+        &self.mqtt
+    }
+
     /// Runs until `shutdown` completes or the identity manager stops, then stops everything
     /// and returns the exit code.
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) -> u8 {
         let Self {
             identity_task,
             credentials_task,
+            mqtt_task,
+            incoming_task,
             cancel,
+            mqtt_cancel,
             ..
         } = self;
         let mut identity_task = identity_task;
         let finished = tokio::select! {
             () = shutdown => {
                 tracing::info!("stopping");
+                // MQTT first: lifecycle.offline needs the connection, which needs the identity.
+                mqtt_cancel.cancel();
+                let _ = mqtt_task.await;
                 cancel.cancel();
                 (&mut identity_task).await
             }
-            finished = &mut identity_task => finished,
+            finished = &mut identity_task => {
+                mqtt_cancel.cancel();
+                let _ = mqtt_task.await;
+                finished
+            }
         };
         cancel.cancel();
         let _ = credentials_task.await;
+        incoming_task.abort();
         match finished {
             Ok(ManagerExit::Cancelled) => {
                 tracing::info!("stopped");
@@ -226,6 +296,13 @@ impl Service {
                 EXIT_ERROR
             }
         }
+    }
+}
+
+/// Reads incoming MQTT messages until the router and shadow manager exist to handle them.
+async fn drain(mut incoming: mpsc::Receiver<Incoming>) {
+    while let Some(message) = incoming.recv().await {
+        tracing::debug!(topic = %message.topic, bytes = message.payload.len(), "MQTT message not handled yet");
     }
 }
 

@@ -232,10 +232,10 @@ fn reports_sections_it_does_not_use() {
     let files = Files::new();
 
     let config = files
-        .load(&files.local("\n[modules.usb]\nenabled = true\n\n[mqtt]\nkeep_alive_s = 30\n"))
+        .load(&files.local("\n[modules.usb]\nenabled = true\n\n[telemetry]\ninterval_s = 30\n"))
         .unwrap();
 
-    assert_eq!(config.ignored_sections, ["modules", "mqtt"]);
+    assert_eq!(config.ignored_sections, ["modules", "telemetry"]);
 }
 
 #[test]
@@ -526,4 +526,53 @@ fn the_shipped_example_parses() {
     assert_eq!(file.identity.pin, "bootstrap");
     assert!(file.bootstrap.is_some());
     assert!(file.other.is_empty());
+}
+
+#[test]
+fn reads_the_mqtt_settings() {
+    let files = Files::new();
+    let text = files.local(
+        "\n[mqtt]\nport = 443\nkeep_alive_s = 300\nqueue_messages = 50\ncommands = \"topics\"\n",
+    );
+
+    let config = files.load(&text).unwrap();
+
+    assert_eq!(config.mqtt.port, 443);
+    assert_eq!(config.mqtt.keep_alive, Duration::from_secs(300));
+    assert_eq!(config.mqtt.queue_messages, 50);
+    assert!(config.ignored_sections.is_empty());
+}
+
+#[test]
+fn mqtt_defaults_without_a_section() {
+    let files = Files::new();
+
+    assert_eq!(
+        files.load(&files.local("")).unwrap().mqtt,
+        crate::mqtt::MqttSettings::default()
+    );
+}
+
+#[test]
+fn rejects_bad_mqtt_settings() {
+    let files = Files::new();
+    for (section, expected) in [
+        ("port = 1883", "mqtt.port must be 8883 or 443"),
+        ("keep_alive_s = 10", "mqtt.keep_alive_s must be 30 to 1200"),
+        (
+            "keep_alive_s = 1201",
+            "mqtt.keep_alive_s must be 30 to 1200",
+        ),
+        (
+            "queue_messages = 0",
+            "mqtt.queue_messages must be at least 1",
+        ),
+        ("commands = \"aws-iot-commands\"", "isn't supported yet"),
+        ("commands = \"jobs\"", "mqtt.commands must be"),
+        ("unknown = 1", "unknown"),
+    ] {
+        let error = files.error(&files.local(&format!("\n[mqtt]\n{section}\n")));
+
+        assert!(error.contains(expected), "{section}: {error}");
+    }
 }

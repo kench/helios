@@ -26,6 +26,7 @@ use crate::identity::manager::CertificateSource;
 use crate::identity::pin::PinSpec;
 use crate::identity::signer::DEFAULT_SIGN_TIMEOUT;
 use crate::identity::tls;
+use crate::mqtt::{MAX_KEEP_ALIVE, MIN_KEEP_ALIVE, MqttSettings, PORT_443, PORT_8883};
 use crate::provision::DEFAULT_MODULE;
 
 /// Where the service reads its config from unless `--config` says otherwise.
@@ -76,6 +77,8 @@ pub struct Config {
     pub aws: Option<AwsSettings>,
     /// The `[bootstrap]` settings, when the PIN comes from the bootstrap service.
     pub bootstrap: Option<BootstrapConfig>,
+    /// The `[mqtt]` settings (LLD 2, section 6).
+    pub mqtt: MqttSettings,
     /// Top-level sections this version doesn't use, in file order.
     pub ignored_sections: Vec<String>,
 }
@@ -103,6 +106,8 @@ struct File {
     device: DeviceSection,
     identity: IdentitySection,
     aws: AwsSection,
+    #[serde(default)]
+    mqtt: MqttSection,
     /// Everything else: sections for other versions or modules.
     #[serde(flatten)]
     other: toml::Table,
@@ -144,6 +149,15 @@ struct IdentitySection {
     #[serde(default)]
     allow_final_pin_try: bool,
     sign_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MqttSection {
+    port: Option<u16>,
+    keep_alive_s: Option<u64>,
+    queue_messages: Option<usize>,
+    commands: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,7 +255,55 @@ impl File {
             roots: roots("aws.root_ca", &self.aws.root_ca)?,
             aws,
             bootstrap,
+            mqtt: self.mqtt.check()?,
             ignored_sections: self.other.keys().cloned().collect(),
+        })
+    }
+}
+
+impl MqttSection {
+    fn check(self) -> Result<MqttSettings, String> {
+        let defaults = MqttSettings::default();
+        let port = self.port.unwrap_or(defaults.port);
+        if port != PORT_8883 && port != PORT_443 {
+            return Err(format!(
+                "mqtt.port must be {PORT_8883} or {PORT_443} (AWS IoT's MQTT ports), not {port}"
+            ));
+        }
+        let keep_alive = self
+            .keep_alive_s
+            .map_or(defaults.keep_alive, Duration::from_secs);
+        if !(MIN_KEEP_ALIVE..=MAX_KEEP_ALIVE).contains(&keep_alive) {
+            return Err(format!(
+                "mqtt.keep_alive_s must be {} to {} (AWS IoT's range), not {}",
+                MIN_KEEP_ALIVE.as_secs(),
+                MAX_KEEP_ALIVE.as_secs(),
+                keep_alive.as_secs()
+            ));
+        }
+        let queue_messages = self.queue_messages.unwrap_or(defaults.queue_messages);
+        if queue_messages == 0 {
+            return Err("mqtt.queue_messages must be at least 1".to_owned());
+        }
+        match self.commands.as_deref() {
+            None | Some("topics") => {}
+            Some("aws-iot-commands") => {
+                return Err(
+                    "mqtt.commands = \"aws-iot-commands\" isn't supported yet (LLD 2, section 7.3); \
+                     use \"topics\""
+                        .to_owned(),
+                );
+            }
+            Some(other) => {
+                return Err(format!(
+                    "mqtt.commands must be \"topics\" or \"aws-iot-commands\", not {other:?}"
+                ));
+            }
+        }
+        Ok(MqttSettings {
+            port,
+            keep_alive,
+            queue_messages,
         })
     }
 }

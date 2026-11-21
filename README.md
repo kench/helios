@@ -41,8 +41,11 @@ cargo llvm-cov --locked --workspace --all-features --fail-under-lines 90
 
 `helios` with no subcommand runs the service, as `helios.service` does. It reads
 `/etc/helios/helios.toml` (or `--config <path>`), runs the startup checks, starts the identity
-manager and keeps temporary AWS credentials fresh from the AWS IoT credentials provider (LLD 1,
-sections 3 to 6). MQTT and the modules come later (LLD 2).
+manager, keeps temporary AWS credentials fresh from the AWS IoT credentials provider (LLD 1,
+sections 3 to 6), and keeps an MQTT 3.1.1 connection to AWS IoT Core (LLD 2, section 6): client
+ID = thing name, the token-backed TLS identity, a clean session, `lifecycle.online` after each
+connect and `lifecycle.offline` as the Last Will and on shutdown, and a bounded offline queue for
+events. The shadow manager, command router and modules come later (LLD 2).
 
 `dist/helios.toml` is an example config. With the bootstrap service it needs only the module
 and CA paths. For development without the service, set `identity.pin = "file:<path>"` and fill
