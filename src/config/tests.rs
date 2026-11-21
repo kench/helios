@@ -235,7 +235,8 @@ fn reports_sections_it_does_not_use() {
         .load(&files.local("\n[modules.usb]\nenabled = true\n\n[telemetry]\ninterval_s = 30\n"))
         .unwrap();
 
-    assert_eq!(config.ignored_sections, ["modules", "telemetry"]);
+    assert_eq!(config.ignored_sections, ["modules.usb", "telemetry"]);
+    assert!(config.display.is_none());
 }
 
 #[test]
@@ -623,6 +624,80 @@ fn rejects_bad_clock_settings() {
     ] {
         let error = files.error(&files.local(&format!("\n[clock]\n{section}\n")));
 
+        assert!(error.contains(expected), "{section}: {error}");
+    }
+}
+
+#[test]
+fn display_module_is_off_unless_enabled() {
+    let files = Files::new();
+
+    assert!(files.load(&files.local("")).unwrap().display.is_none());
+    let disabled = files
+        .load(&files.local("\n[modules.display]\nenabled = false\ntime_zone = \"Nowhere/Else\"\n"))
+        .unwrap();
+    assert!(disabled.display.is_none());
+}
+
+#[test]
+fn display_module_defaults() {
+    let files = Files::new();
+
+    let config = files
+        .load(&files.local("\n[modules.display]\nenabled = true\n"))
+        .unwrap();
+    let display = config.display.unwrap();
+    assert_eq!(display.framebuffer, PathBuf::from("/dev/fb0"));
+    assert_eq!(display.idle, Screen::Status);
+    assert_eq!(display.time_zone_name, "UTC");
+    assert_eq!(display.redraw_interval, Duration::from_secs(10));
+    assert_eq!(display.bold_font, None);
+    assert!(config.ignored_sections.is_empty());
+}
+
+#[test]
+fn display_module_settings() {
+    let files = Files::new();
+
+    let config = files
+        .load(&files.local(
+            "\n[modules.display]\nenabled = true\nframebuffer = \"/dev/fb1\"\n\
+             idle_template = \"blank\"\ntime_zone = \"America/Los_Angeles\"\n\
+             redraw_interval_s = 0\nbold_font = \"/run/helios/fonts/Bold.otf\"\n\n\
+             [modules.barcode]\nenabled = true\n",
+        ))
+        .unwrap();
+    let display = config.display.unwrap();
+    assert_eq!(display.framebuffer, PathBuf::from("/dev/fb1"));
+    assert_eq!(display.idle, Screen::Blank);
+    assert_eq!(display.time_zone_name, "America/Los_Angeles");
+    assert!(display.redraw_interval.is_zero());
+    assert_eq!(
+        display.bold_font,
+        Some(PathBuf::from("/run/helios/fonts/Bold.otf"))
+    );
+    assert_eq!(config.ignored_sections, ["modules.barcode"]);
+}
+
+#[test]
+fn display_module_refuses_bad_settings() {
+    let files = Files::new();
+
+    for (section, expected) in [
+        ("time_zone = \"Nowhere/Else\"", "isn't a known time zone"),
+        (
+            "idle_template = \"message\"",
+            "only the shadow's desired state",
+        ),
+        ("idle_template = \"fancy\"", "no template"),
+        (
+            "redraw_interval_s = 3601",
+            "redraw_interval_s must be 0 to 3600",
+        ),
+        ("brightness = 5", "unknown field"),
+    ] {
+        let error =
+            files.error(&files.local(&format!("\n[modules.display]\nenabled = true\n{section}\n")));
         assert!(error.contains(expected), "{section}: {error}");
     }
 }

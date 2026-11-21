@@ -142,6 +142,24 @@ impl PendingCommand {
     pub fn respond(self, outcome: Outcome) {
         let _ = self.reply.send(outcome);
     }
+
+    /// A command for module tests, with the channel its answer arrives on.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        module: &str,
+        name: &str,
+        args: Value,
+    ) -> (Self, oneshot::Receiver<Outcome>) {
+        let (reply, answer) = oneshot::channel();
+        let command = Command {
+            id: format!("test-{name}"),
+            module: module.to_owned(),
+            name: name.to_owned(),
+            args,
+            deadline: None,
+        };
+        (Self { command, reply }, answer)
+    }
 }
 
 /// Registers modules with the router. Cheap to clone.

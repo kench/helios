@@ -27,6 +27,8 @@ use crate::identity::manager::CertificateSource;
 use crate::identity::pin::PinSpec;
 use crate::identity::signer::DEFAULT_SIGN_TIMEOUT;
 use crate::identity::tls;
+use crate::modules::display::DisplaySettings;
+use crate::modules::display::templates::Screen;
 use crate::mqtt::helios_shadow;
 use crate::mqtt::{MAX_KEEP_ALIVE, MIN_KEEP_ALIVE, MqttSettings, PORT_443, PORT_8883};
 use crate::provision::DEFAULT_MODULE;
@@ -42,6 +44,12 @@ pub const SOFTHSM2_CONF: &str = "SOFTHSM2_CONF";
 
 /// The bootstrap service's request timeout when `bootstrap.timeout_ms` isn't set.
 const DEFAULT_BOOTSTRAP_TIMEOUT_MS: u64 = 10_000;
+
+/// The display module's framebuffer when `modules.display.framebuffer` isn't set.
+const DEFAULT_FRAMEBUFFER: &str = "/dev/fb0";
+/// How often the display redraws while the kernel's console is attached (LLD 9, section 3).
+const DEFAULT_REDRAW_INTERVAL_S: u64 = 10;
+const MAX_REDRAW_INTERVAL_S: u64 = 3600;
 
 /// The config can't be used. The message names the file and the setting.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -83,7 +91,9 @@ pub struct Config {
     pub mqtt: MqttSettings,
     /// The `[clock]` settings (LLD 1, section 4.11).
     pub clock: ClockSettings,
-    /// Top-level sections this version doesn't use, in file order.
+    /// The `[modules.display]` settings, when it's enabled (LLD 9).
+    pub display: Option<DisplaySettings>,
+    /// Sections this version doesn't use: modules as `modules.<name>`, then top-level sections.
     pub ignored_sections: Vec<String>,
 }
 
@@ -114,9 +124,31 @@ struct File {
     mqtt: MqttSection,
     #[serde(default)]
     clock: ClockSection,
-    /// Everything else: sections for other versions or modules.
+    #[serde(default)]
+    modules: ModulesSection,
+    /// Everything else: sections for other versions.
     #[serde(flatten)]
     other: toml::Table,
+}
+
+/// `[modules.*]`: the ones this version has, and the rest, which are ignored.
+#[derive(Debug, Default, Deserialize)]
+struct ModulesSection {
+    display: Option<DisplaySection>,
+    #[serde(flatten)]
+    other: toml::Table,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplaySection {
+    #[serde(default)]
+    enabled: bool,
+    framebuffer: Option<PathBuf>,
+    idle_template: Option<String>,
+    time_zone: Option<String>,
+    redraw_interval_s: Option<u64>,
+    bold_font: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,8 +303,64 @@ impl File {
             bootstrap,
             mqtt: self.mqtt.check()?,
             clock: self.clock.check()?,
-            ignored_sections: self.other.keys().cloned().collect(),
+            display: self
+                .modules
+                .display
+                .map(DisplaySection::check)
+                .transpose()?
+                .flatten(),
+            ignored_sections: self
+                .modules
+                .other
+                .keys()
+                .map(|name| format!("modules.{name}"))
+                .chain(self.other.keys().cloned())
+                .collect(),
         })
+    }
+}
+
+impl DisplaySection {
+    /// The settings, or `None` when the module isn't enabled.
+    fn check(self) -> Result<Option<DisplaySettings>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let idle_template = self.idle_template.unwrap_or_else(|| "status".to_owned());
+        let idle = Screen::parse(&idle_template, &serde_json::Value::Null).map_err(|error| {
+            format!(
+                "modules.display.idle_template: {error} (status, blank or test; other templates \
+                 need fields, which only the shadow's desired state can set)"
+            )
+        })?;
+        let time_zone_name = self.time_zone.unwrap_or_else(|| "UTC".to_owned());
+        let time_zone = if time_zone_name == "UTC" {
+            jiff::tz::TimeZone::UTC
+        } else {
+            jiff::tz::db().get(&time_zone_name).map_err(|error| {
+                format!(
+                    "modules.display.time_zone {time_zone_name:?} isn't a known time zone \
+                     (an IANA name such as \"America/Los_Angeles\"): {error}"
+                )
+            })?
+        };
+        let redraw = self.redraw_interval_s.unwrap_or(DEFAULT_REDRAW_INTERVAL_S);
+        if redraw > MAX_REDRAW_INTERVAL_S {
+            return Err(format!(
+                "modules.display.redraw_interval_s must be 0 to {MAX_REDRAW_INTERVAL_S}, not \
+                 {redraw}"
+            ));
+        }
+        Ok(Some(DisplaySettings {
+            framebuffer: self
+                .framebuffer
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_FRAMEBUFFER)),
+            idle,
+            time_zone_name,
+            time_zone,
+            redraw_interval: Duration::from_secs(redraw),
+            bold_font: self.bold_font,
+        }))
     }
 }
 

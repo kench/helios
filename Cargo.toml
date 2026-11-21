@@ -10,11 +10,13 @@ aws-credential-types = { version = "1.3.1", default-features = false }
 base64 = "0.23.1"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 cryptoki = "0.10.1"
+fontdue = "0.9.5"
 getrandom = "0.4.3"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
 hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+jiff = { version = "1.0.1", default-features = false, features = ["std", "tzdb-zoneinfo"] }
 libc = "0.2.191"
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls-no-provider"] }

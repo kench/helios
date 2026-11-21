@@ -385,6 +385,37 @@ impl Manager {
     }
 }
 
+/// Reports as module tests see them: (shadow, reported).
+#[cfg(test)]
+pub(crate) type TestReports = mpsc::UnboundedReceiver<(String, Map<String, Value>)>;
+/// Desired-state subscriptions as module tests see them: (shadow, where deltas go).
+#[cfg(test)]
+pub(crate) type TestDesired = mpsc::UnboundedReceiver<(String, mpsc::UnboundedSender<Value>)>;
+
+#[cfg(test)]
+impl ShadowHandle {
+    /// A handle for module tests: reports arrive on the returned channel as (shadow, reported),
+    /// and each `desired` call gets the matching sender from the second channel.
+    pub(crate) fn for_test() -> (Self, TestReports, TestDesired) {
+        let (requests, mut incoming) = mpsc::unbounded_channel();
+        let (reports_tx, reports) = mpsc::unbounded_channel();
+        let (desired_tx, desired) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(request) = incoming.recv().await {
+                match request {
+                    Request::Report { shadow, reported } => {
+                        let _ = reports_tx.send((shadow, reported));
+                    }
+                    Request::Desired { shadow, sender } => {
+                        let _ = desired_tx.send((shadow, sender));
+                    }
+                }
+            }
+        });
+        (Self { requests }, reports, desired)
+    }
+}
+
 /// `$aws/things/<thing>/shadow/name/<name>`.
 fn base(thing: &str, name: &str) -> String {
     format!("$aws/things/{thing}/shadow/name/{name}")

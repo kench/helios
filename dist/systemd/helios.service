@@ -8,6 +8,9 @@ After=network-online.target
 
 [Service]
 User=helios
+# The display module needs the screen (/dev/fb0, root:video). Uncomment where it's enabled; the
+# unit fails to start if the group doesn't exist. The scanner's autorun.sh sets it itself.
+#SupplementaryGroups=video
 ExecStart=/usr/bin/helios
 Restart=on-failure
 # Exit code 78 (EX_CONFIG) means a wrong or locked PIN, or a certificate that doesn't match the
