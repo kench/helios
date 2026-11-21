@@ -1,0 +1,5 @@
+// Installed by the helios package: unattended-upgrades installs Helios releases from the Helios
+// APT repository (Release: Origin "Helios", Label "Helios", Suite "stable").
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Helios,label=Helios,archive=stable";
+};

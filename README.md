@@ -99,6 +99,42 @@ helios provision verify --bootstrap                          # with the service'
 `--module` and `--token-label` default to `/usr/lib/softhsm/libsofthsm2.so` and `helios`. Exit
 codes: 0 on success, 1 on error, 78 for configuration errors (missing module or token, wrong PIN).
 
+## Releases
+
+The Debian boards (relay and transcoder, arm64) install Helios from the APT repository in
+helios-cloud's `AptRepository` stack, and `unattended-upgrades` keeps it current. The scanner
+isn't a Debian system and keeps updating from its USB drive.
+
+**Cutting a release:** set `version` in `Cargo.toml` (merged to `main`), then tag that commit
+`v<version>` and push the tag. `.github/workflows/release.yml` checks the tag matches the version
+and is on `main`, builds for `aarch64-unknown-linux-gnu` against glibc 2.31 with `cargo zigbuild`,
+packages it with `cargo deb` (`[package.metadata.deb]`, maintainer scripts in `dist/debian/`), and
+publishes: `.github/scripts/build-apt-repo.sh` adds the package to the pool, regenerates the index
+with `apt-ftparchive` and signs `Release`/`InRelease`; the workflow uploads packages first and
+`InRelease` last, then invalidates `/dists/*` on CloudFront. A version can't be republished with
+different contents.
+
+The package installs `/usr/bin/helios`, `helios.service` (not enabled: a board needs its config and
+token first), an example config in `/usr/share/doc/helios/examples/`, and
+`/etc/apt/apt.conf.d/52helios-unattended-upgrades`, which lets `unattended-upgrades` install Helios
+releases. Its `postinst` creates the `helios` system user and restarts Helios on upgrades if it's
+running. It depends on `softhsm2` and recommends `unattended-upgrades`.
+
+The workflow needs the repository secret `APT_SIGNING_KEY` (an armored GPG private key without a
+passphrase) and the variables `APT_BUCKET`, `APT_DISTRIBUTION_ID` and `APT_PUBLISHER_ROLE_ARN`
+(helios-cloud's stack outputs `AptBucketName`, `AptDistributionId` and `AptPublisherRoleArn`).
+
+**Setting up a board** (`<repo>` is the `AptRepositoryUrl` output):
+
+```sh
+sudo apt install curl gpg unattended-upgrades
+curl -fsSL <repo>/keys/helios-archive-keyring.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/helios-archive-keyring.gpg
+echo "deb [arch=arm64 signed-by=/usr/share/keyrings/helios-archive-keyring.gpg] <repo> stable main" \
+  | sudo tee /etc/apt/sources.list.d/helios.list
+sudo apt update && sudo apt install helios
+```
+
 ## CI
 
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`:
