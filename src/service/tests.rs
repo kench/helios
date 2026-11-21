@@ -98,6 +98,7 @@ fn timing() -> Timing {
             shutdown_wait: Duration::from_millis(200),
             ..crate::mqtt::manager::Timing::default()
         },
+        shadows: crate::mqtt::shadow::Timing::default(),
     }
 }
 
@@ -368,4 +369,40 @@ async fn shutdown_signal_installs() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn routes_shadow_replies_to_the_shadow_manager() {
+    let (incoming_tx, incoming) = mpsc::channel(4);
+    let (shadows_tx, mut shadows) = mpsc::channel(1);
+    let router = tokio::spawn(route(incoming, shadows_tx));
+    let message = |topic: &str| Incoming {
+        topic: topic.to_owned(),
+        payload: b"{}".to_vec(),
+    };
+
+    incoming_tx
+        .send(message("helios/t-1/cmd/video"))
+        .await
+        .unwrap();
+    incoming_tx
+        .send(message(
+            "$aws/things/t-1/shadow/name/helios/update/accepted",
+        ))
+        .await
+        .unwrap();
+    // The shadow channel holds one; this one is dropped with a warning.
+    incoming_tx
+        .send(message("$aws/things/t-1/shadow/name/helios/update/delta"))
+        .await
+        .unwrap();
+    drop(incoming_tx);
+    router.await.unwrap();
+
+    let routed = shadows.recv().await.unwrap();
+    assert_eq!(
+        routed.topic,
+        "$aws/things/t-1/shadow/name/helios/update/accepted"
+    );
+    assert!(shadows.recv().await.is_none());
 }

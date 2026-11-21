@@ -98,22 +98,33 @@ pub struct MqttStatus {
     pub last_disconnect_reason: Option<String>,
     /// Events the offline queue dropped since start.
     pub dropped_events: u64,
+    /// The thing name of the current or last session.
+    pub thing: Option<String>,
 }
 
 /// An event waiting to be published. The envelope is built when it's sent, once the thing name
 /// is known.
 #[derive(Debug, Clone)]
-struct PendingEvent {
+pub(crate) struct PendingEvent {
     module: String,
     kind: String,
     payload: Value,
     time: SystemTime,
 }
 
+/// What [`MqttHandle`] sends the manager.
+#[derive(Debug)]
+pub(crate) enum Request {
+    /// An event, queued while offline.
+    Event(PendingEvent),
+    /// A publish that only matters while connected, such as a shadow update: dropped otherwise.
+    Now { topic: String, payload: Vec<u8> },
+}
+
 /// Publishes through the manager. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct MqttHandle {
-    events: mpsc::UnboundedSender<PendingEvent>,
+    events: mpsc::UnboundedSender<Request>,
     status: watch::Receiver<MqttStatus>,
 }
 
@@ -122,18 +133,40 @@ impl MqttHandle {
     /// QoS 1. While disconnected it waits in the offline queue. Does nothing once the manager has
     /// stopped.
     pub fn publish_event(&self, module: &str, kind: &str, payload: Value) {
-        let _ = self.events.send(PendingEvent {
+        let _ = self.events.send(Request::Event(PendingEvent {
             module: module.to_owned(),
             kind: kind.to_owned(),
             payload,
             time: SystemTime::now(),
-        });
+        }));
+    }
+
+    /// Publishes `payload` on `topic` at QoS 1 if a session is up, and drops it otherwise: for
+    /// messages that are stale by the time a connection is back, such as shadow updates (which
+    /// are re-sent as snapshots after connecting) and command responses (LLD 2, section 6).
+    pub fn publish_now(&self, topic: String, payload: Vec<u8>) {
+        let _ = self.events.send(Request::Now { topic, payload });
     }
 
     /// The connection's state. Await changes with `changed()`.
     #[must_use]
     pub fn status(&self) -> watch::Receiver<MqttStatus> {
         self.status.clone()
+    }
+}
+
+impl MqttHandle {
+    /// For tests of components built on MQTT: a handle whose requests and status the test
+    /// controls.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (
+        Self,
+        mpsc::UnboundedReceiver<Request>,
+        watch::Sender<MqttStatus>,
+    ) {
+        let (events, requests) = mpsc::unbounded_channel();
+        let (status_tx, status) = watch::channel(MqttStatus::default());
+        (Self { events, status }, requests, status_tx)
     }
 }
 
@@ -207,7 +240,7 @@ struct Manager {
     options: Options,
     identity: IdentityHandle,
     incoming: mpsc::Sender<Incoming>,
-    events: mpsc::UnboundedReceiver<PendingEvent>,
+    events: mpsc::UnboundedReceiver<Request>,
     status: watch::Sender<MqttStatus>,
     cancel: CancellationToken,
     queue: OfflineQueue<PendingEvent>,
@@ -238,6 +271,14 @@ impl Manager {
                     }
                 }
             }
+        }
+    }
+
+    /// A request while disconnected: events wait in the queue, the rest are dropped.
+    fn offline_request(&mut self, request: Request) {
+        match request {
+            Request::Event(event) => self.queue.push(event),
+            Request::Now { .. } => tracing::debug!("MQTT publish dropped: not connected"),
         }
     }
 
@@ -299,7 +340,7 @@ impl Manager {
             tokio::select! {
                 () = self.cancel.cancelled() => return None,
                 changed = state.changed() => if changed.is_err() { return None },
-                Some(event) = self.events.recv() => self.queue.push(event),
+                Some(request) = self.events.recv() => self.offline_request(request),
             }
         }
     }
@@ -312,7 +353,7 @@ impl Manager {
             tokio::select! {
                 () = self.cancel.cancelled() => return false,
                 () = &mut sleep => return true,
-                Some(event) = self.events.recv() => self.queue.push(event),
+                Some(request) = self.events.recv() => self.offline_request(request),
             }
         }
     }
@@ -380,7 +421,17 @@ impl Manager {
                         return SessionEnd::IdentityLost;
                     }
                 }
-                Some(event) = self.events.recv() => self.queue.push(event),
+                Some(request) = self.events.recv() => match request {
+                    Request::Event(event) => self.queue.push(event),
+                    Request::Now { topic, payload } => {
+                        let sent = phase == Phase::Ready
+                            && rate.take()
+                            && client.try_publish(topic, QoS::AtLeastOnce, false, payload).is_ok();
+                        if !sent {
+                            tracing::debug!("MQTT publish dropped: not connected, or too many");
+                        }
+                    }
+                },
                 polled = eventloop.poll() => match polled {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
                         connected = Some(Instant::now());
@@ -466,6 +517,7 @@ impl Manager {
             status.session = session;
             status.connected_at = Some(now);
             status.dropped_events = dropped;
+            status.thing = Some(target.thing.clone());
         });
     }
 
