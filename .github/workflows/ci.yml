@@ -87,6 +87,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+      # Device modules are Cargo features, off by default; the build without them must stay
+      # clean too.
+      - name: Clippy without features
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+
   test:
     name: Test and coverage
     runs-on: ubuntu-latest
@@ -135,6 +140,9 @@ jobs:
 
       - name: Test
         run: cargo test --locked --all-targets --all-features
+
+      - name: Test without features
+        run: cargo test --locked --all-targets --no-default-features
 
       # HLD section 12: at least 90% line coverage across the workspace. Files
       # excluded from coverage must be listed here with --ignore-filename-regex.

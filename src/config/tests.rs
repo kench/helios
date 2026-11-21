@@ -236,7 +236,6 @@ fn reports_sections_it_does_not_use() {
         .unwrap();
 
     assert_eq!(config.ignored_sections, ["modules.usb", "telemetry"]);
-    assert!(config.display.is_none());
 }
 
 #[test]
@@ -628,6 +627,7 @@ fn rejects_bad_clock_settings() {
     }
 }
 
+#[cfg(feature = "module-display")]
 #[test]
 fn display_module_is_off_unless_enabled() {
     let files = Files::new();
@@ -639,6 +639,7 @@ fn display_module_is_off_unless_enabled() {
     assert!(disabled.display.is_none());
 }
 
+#[cfg(feature = "module-display")]
 #[test]
 fn display_module_defaults() {
     let files = Files::new();
@@ -655,6 +656,7 @@ fn display_module_defaults() {
     assert!(config.ignored_sections.is_empty());
 }
 
+#[cfg(feature = "module-display")]
 #[test]
 fn display_module_settings() {
     let files = Files::new();
@@ -679,6 +681,7 @@ fn display_module_settings() {
     assert_eq!(config.ignored_sections, ["modules.barcode"]);
 }
 
+#[cfg(feature = "module-display")]
 #[test]
 fn display_module_refuses_bad_settings() {
     let files = Files::new();
@@ -700,4 +703,15 @@ fn display_module_refuses_bad_settings() {
             files.error(&files.local(&format!("\n[modules.display]\nenabled = true\n{section}\n")));
         assert!(error.contains(expected), "{section}: {error}");
     }
+}
+
+#[cfg(not(feature = "module-display"))]
+#[test]
+fn a_build_without_the_display_module_ignores_its_section() {
+    let files = Files::new();
+
+    let config = files
+        .load(&files.local("\n[modules.display]\nenabled = true\nbold_font = 5\n"))
+        .unwrap();
+    assert_eq!(config.ignored_sections, ["modules.display"]);
 }

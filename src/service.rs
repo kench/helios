@@ -38,6 +38,7 @@ use crate::identity::manager::{
 };
 use crate::identity::pin::credentials_directory_from_env;
 use crate::identity::token::TokenBackend;
+#[cfg(feature = "module-display")]
 use crate::modules::display;
 use crate::mqtt::helios_shadow::{self, Sources};
 use crate::mqtt::manager::{Incoming, MqttHandle, MqttManager, Options as MqttOptions};
@@ -290,7 +291,12 @@ impl Service {
             mqtt.status(),
             started,
         );
+        #[allow(
+            unused_mut,
+            reason = "which modules there are depends on Cargo features"
+        )]
         let mut modules = Vec::new();
+        #[cfg(feature = "module-display")]
         if let Some(settings) = config.display {
             let inputs = display::Inputs {
                 commands: router.register(display::MODULE),

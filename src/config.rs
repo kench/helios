@@ -27,7 +27,9 @@ use crate::identity::manager::CertificateSource;
 use crate::identity::pin::PinSpec;
 use crate::identity::signer::DEFAULT_SIGN_TIMEOUT;
 use crate::identity::tls;
+#[cfg(feature = "module-display")]
 use crate::modules::display::DisplaySettings;
+#[cfg(feature = "module-display")]
 use crate::modules::display::templates::Screen;
 use crate::mqtt::helios_shadow;
 use crate::mqtt::{MAX_KEEP_ALIVE, MIN_KEEP_ALIVE, MqttSettings, PORT_443, PORT_8883};
@@ -46,9 +48,12 @@ pub const SOFTHSM2_CONF: &str = "SOFTHSM2_CONF";
 const DEFAULT_BOOTSTRAP_TIMEOUT_MS: u64 = 10_000;
 
 /// The display module's framebuffer when `modules.display.framebuffer` isn't set.
+#[cfg(feature = "module-display")]
 const DEFAULT_FRAMEBUFFER: &str = "/dev/fb0";
 /// How often the display redraws while the kernel's console is attached (LLD 9, section 3).
+#[cfg(feature = "module-display")]
 const DEFAULT_REDRAW_INTERVAL_S: u64 = 10;
+#[cfg(feature = "module-display")]
 const MAX_REDRAW_INTERVAL_S: u64 = 3600;
 
 /// The config can't be used. The message names the file and the setting.
@@ -92,6 +97,7 @@ pub struct Config {
     /// The `[clock]` settings (LLD 1, section 4.11).
     pub clock: ClockSettings,
     /// The `[modules.display]` settings, when it's enabled (LLD 9).
+    #[cfg(feature = "module-display")]
     pub display: Option<DisplaySettings>,
     /// Sections this version doesn't use: modules as `modules.<name>`, then top-level sections.
     pub ignored_sections: Vec<String>,
@@ -131,14 +137,16 @@ struct File {
     other: toml::Table,
 }
 
-/// `[modules.*]`: the ones this version has, and the rest, which are ignored.
+/// `[modules.*]`: the ones this build has, and the rest, which are ignored.
 #[derive(Debug, Default, Deserialize)]
 struct ModulesSection {
+    #[cfg(feature = "module-display")]
     display: Option<DisplaySection>,
     #[serde(flatten)]
     other: toml::Table,
 }
 
+#[cfg(feature = "module-display")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DisplaySection {
@@ -303,6 +311,7 @@ impl File {
             bootstrap,
             mqtt: self.mqtt.check()?,
             clock: self.clock.check()?,
+            #[cfg(feature = "module-display")]
             display: self
                 .modules
                 .display
@@ -320,6 +329,7 @@ impl File {
     }
 }
 
+#[cfg(feature = "module-display")]
 impl DisplaySection {
     /// The settings, or `None` when the module isn't enabled.
     fn check(self) -> Result<Option<DisplaySettings>, String> {

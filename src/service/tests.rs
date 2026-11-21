@@ -74,6 +74,7 @@ fn local_config(service: &MockService, pin_dir: &Path) -> Config {
             boot_mark: None,
             ..crate::clock::ClockSettings::default()
         },
+        #[cfg(feature = "module-display")]
         display: None,
         ignored_sections: vec!["modules.usb".into()],
     }
@@ -417,6 +418,7 @@ async fn routes_shadow_replies_and_commands() {
     assert!(commands.recv().await.is_none());
 }
 
+#[cfg(feature = "module-display")]
 #[tokio::test]
 async fn runs_the_display_module_and_waits_for_it_on_shutdown() {
     let device_ca = ca("Helios test device CA");

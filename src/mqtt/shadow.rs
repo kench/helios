@@ -386,13 +386,14 @@ impl Manager {
 }
 
 /// Reports as module tests see them: (shadow, reported).
-#[cfg(test)]
+#[cfg(all(test, feature = "module-display"))]
 pub(crate) type TestReports = mpsc::UnboundedReceiver<(String, Map<String, Value>)>;
 /// Desired-state subscriptions as module tests see them: (shadow, where deltas go).
-#[cfg(test)]
+#[cfg(all(test, feature = "module-display"))]
 pub(crate) type TestDesired = mpsc::UnboundedReceiver<(String, mpsc::UnboundedSender<Value>)>;
 
-#[cfg(test)]
+// Module tests only, so far the display's.
+#[cfg(all(test, feature = "module-display"))]
 impl ShadowHandle {
     /// A handle for module tests: reports arrive on the returned channel as (shadow, reported),
     /// and each `desired` call gets the matching sender from the second channel.
