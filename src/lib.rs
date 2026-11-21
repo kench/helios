@@ -15,5 +15,6 @@ pub mod identity;
 pub mod logging;
 pub mod mqtt;
 pub mod provision;
+pub mod router;
 pub mod service;
 pub mod ulid;

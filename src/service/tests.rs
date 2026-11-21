@@ -99,6 +99,7 @@ fn timing() -> Timing {
             ..crate::mqtt::manager::Timing::default()
         },
         shadows: crate::mqtt::shadow::Timing::default(),
+        router: crate::router::Timing::default(),
     }
 }
 
@@ -372,10 +373,11 @@ async fn shutdown_signal_installs() {
 }
 
 #[tokio::test]
-async fn routes_shadow_replies_to_the_shadow_manager() {
+async fn routes_shadow_replies_and_commands() {
     let (incoming_tx, incoming) = mpsc::channel(4);
     let (shadows_tx, mut shadows) = mpsc::channel(1);
-    let router = tokio::spawn(route(incoming, shadows_tx));
+    let (commands_tx, mut commands) = mpsc::channel(4);
+    let router = tokio::spawn(route(incoming, shadows_tx, commands_tx));
     let message = |topic: &str| Incoming {
         topic: topic.to_owned(),
         payload: b"{}".to_vec(),
@@ -405,4 +407,6 @@ async fn routes_shadow_replies_to_the_shadow_manager() {
         "$aws/things/t-1/shadow/name/helios/update/accepted"
     );
     assert!(shadows.recv().await.is_none());
+    assert_eq!(commands.recv().await.unwrap().topic, "helios/t-1/cmd/video");
+    assert!(commands.recv().await.is_none());
 }

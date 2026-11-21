@@ -4,8 +4,9 @@
 //! It loads `helios.toml`, starts the identity manager (with the bootstrap service or a local
 //! PIN), the credentials refresher and the MQTT connection manager (LLD 2, section 6), and runs
 //! until SIGTERM or SIGINT, or until the identity fails. On shutdown, MQTT stops first, so
-//! `lifecycle.offline` goes out before the token is closed. It also runs the shadow manager and
-//! reports the `helios` shadow (LLD 2, section 5). The command router and the modules come later.
+//! `lifecycle.offline` goes out before the token is closed. It also runs the shadow manager,
+//! reports the `helios` shadow (LLD 2, section 5), and routes commands (section 7), answering the
+//! built-in `helios` module's. The other modules come later.
 //!
 //! Exit codes, as `helios.service` expects them:
 //!
@@ -40,6 +41,8 @@ use crate::mqtt::helios_shadow::{self, Sources};
 use crate::mqtt::manager::{Incoming, MqttHandle, MqttManager, Options as MqttOptions};
 use crate::mqtt::shadow::{ShadowHandle, ShadowManager};
 use crate::provision::DEFAULT_TOKEN_LABEL;
+use crate::router::topics::TopicsTransport;
+use crate::router::{CommandTransport, Router, RouterHandle};
 use crate::{hardening, logging};
 
 /// Where the service finds things on the device. Tests point these at fakes.
@@ -68,6 +71,8 @@ pub struct Timing {
     pub mqtt: crate::mqtt::manager::Timing,
     /// The shadow manager's.
     pub shadows: crate::mqtt::shadow::Timing,
+    /// The router's.
+    pub router: crate::router::Timing,
 }
 
 /// Incoming MQTT messages wait here until the router and shadow manager read them.
@@ -129,6 +134,7 @@ pub struct Service {
     credentials: HeliosCredentialsProvider,
     mqtt: MqttHandle,
     shadows: ShadowHandle,
+    router: RouterHandle,
     identity_task: JoinHandle<ManagerExit>,
     credentials_task: JoinHandle<()>,
     mqtt_task: JoinHandle<()>,
@@ -213,6 +219,10 @@ impl Service {
             timing.credentials,
             cancel.clone(),
         );
+        // Only custom topics for now; mqtt.commands = "aws-iot-commands" is refused by the config
+        // checks until that transport exists (LLD 2, section 7.3).
+        let transport: Arc<dyn CommandTransport> = Arc::new(TopicsTransport);
+        let started = std::time::Instant::now();
         let mqtt_cancel = CancellationToken::new();
         let (incoming_tx, incoming) = mpsc::channel(INCOMING_CAPACITY);
         let (mqtt, mqtt_task) = MqttManager::start(
@@ -222,6 +232,7 @@ impl Service {
                 local_endpoint,
                 boot_id: platform.boot_id.clone(),
                 timing: timing.mqtt,
+                commands: Arc::clone(&transport),
             },
             incoming_tx,
             mqtt_cancel.clone(),
@@ -241,16 +252,30 @@ impl Service {
             helios_shadow::COUNTER_INTERVAL,
             cancel.clone(),
         );
-        let router = tokio::spawn(route(incoming, shadow_tx));
+        let (commands_tx, commands_rx) = mpsc::channel(INCOMING_CAPACITY);
+        let (router, router_task) = Router::start(
+            mqtt.clone(),
+            transport,
+            commands_rx,
+            timing.router,
+            cancel.clone(),
+        );
+        let helios_commands = crate::router::helios::start(
+            router.register(crate::router::helios::MODULE),
+            mqtt.status(),
+            started,
+        );
+        let routing = tokio::spawn(route(incoming, shadow_tx, commands_tx));
         Ok(Self {
             identity,
             credentials,
             mqtt,
             shadows,
+            router,
             identity_task,
             credentials_task,
             mqtt_task,
-            helpers: vec![router, shadow_task, reporter],
+            helpers: vec![routing, shadow_task, reporter, router_task, helios_commands],
             cancel,
             mqtt_cancel,
         })
@@ -278,6 +303,12 @@ impl Service {
     #[must_use]
     pub fn shadows(&self) -> &ShadowHandle {
         &self.shadows
+    }
+
+    /// The command router, for modules to register with.
+    #[must_use]
+    pub fn router(&self) -> &RouterHandle {
+        &self.router
     }
 
     /// Runs until `shutdown` completes or the identity manager stops, then stops everything
@@ -329,16 +360,21 @@ impl Service {
     }
 }
 
-/// Sends incoming MQTT messages where they belong: shadow replies to the shadow manager. Commands
-/// wait for the router (LLD 2, section 7) and are only logged for now.
-async fn route(mut incoming: mpsc::Receiver<Incoming>, shadows: mpsc::Sender<Incoming>) {
+/// Sends incoming MQTT messages where they belong: shadow replies to the shadow manager, and
+/// everything else to the router, which knows the command transport's topics.
+async fn route(
+    mut incoming: mpsc::Receiver<Incoming>,
+    shadows: mpsc::Sender<Incoming>,
+    commands: mpsc::Sender<Incoming>,
+) {
     while let Some(message) = incoming.recv().await {
-        if message.topic.starts_with("$aws/things/") {
-            if shadows.try_send(message).is_err() {
-                tracing::warn!("shadow reply dropped: the shadow manager is behind");
-            }
+        let (target, name) = if message.topic.starts_with("$aws/things/") {
+            (&shadows, "shadow manager")
         } else {
-            tracing::debug!(topic = %message.topic, bytes = message.payload.len(), "MQTT message not handled yet");
+            (&commands, "router")
+        };
+        if target.try_send(message).is_err() {
+            tracing::warn!("MQTT message dropped: the {name} is behind");
         }
     }
 }

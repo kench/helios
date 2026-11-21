@@ -27,6 +27,7 @@ use crate::identity::tls::Alpn;
 use crate::mqtt::envelope::Envelope;
 use crate::mqtt::queue::OfflineQueue;
 use crate::mqtt::{MqttSettings, PORT_443, topics};
+use crate::router::CommandTransport;
 
 /// The client's request channel; publishes beyond it wait in the offline queue.
 const CLIENT_CAPACITY: usize = 64;
@@ -74,6 +75,8 @@ pub struct Options {
     pub boot_id: Option<String>,
     /// Reconnect and shutdown timing.
     pub timing: Timing,
+    /// The command transport, whose subscriptions each session adds (LLD 2, section 7.1).
+    pub commands: Arc<dyn CommandTransport>,
 }
 
 /// A publish that arrived on a subscribed topic.
@@ -436,7 +439,8 @@ impl Manager {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
                         connected = Some(Instant::now());
                         phase = Phase::Subscribing;
-                        let filters = topics::session_filters(&target.thing)
+                        let filters = self
+                            .session_filters(&target.thing)
                             .into_iter()
                             .map(|path| SubscribeFilter::new(path, QoS::AtLeastOnce));
                         if let Err(error) = client.try_subscribe_many(filters) {
@@ -444,7 +448,7 @@ impl Manager {
                         }
                     }
                     Ok(Event::Incoming(Packet::SubAck(ack))) if phase == Phase::Subscribing => {
-                        let filters = topics::session_filters(&target.thing);
+                        let filters = self.session_filters(&target.thing);
                         for (filter, code) in filters.iter().zip(&ack.return_codes) {
                             if matches!(code, SubscribeReasonCode::Failure) {
                                 tracing::warn!(
@@ -476,6 +480,13 @@ impl Manager {
                 self.send_queued(target, &client, &mut rate);
             }
         }
+    }
+
+    /// What each session subscribes to: the shadows' replies and the command transport's topics.
+    fn session_filters(&self, thing: &str) -> Vec<String> {
+        let mut filters = topics::shadow_filters(thing);
+        filters.extend(self.options.commands.subscriptions(thing));
+        filters
     }
 
     /// Starts a session: `lifecycle.online`, then the queue.
