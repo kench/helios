@@ -22,6 +22,18 @@ set, as in CI. Each run uses its own temporary token directory.
 `build.rs` embeds the build time, which the identity manager treats as the earliest plausible
 clock reading when it checks certificate dates. Set `SOURCE_DATE_EPOCH` for reproducible builds.
 
+Device modules are Cargo features, off by default, so each device's build carries only the
+modules it uses. There's one so far, `module-display` (the display module, with its fonts and the
+`fontdue` and `jiff` crates). Builds by device:
+
+| Device | Build |
+| --- | --- |
+| Scanner (PROXmobil3) | `cargo zigbuild --release --target armv7-unknown-linux-gnueabihf.2.28 --features module-display` |
+| Relay, transcoder (Raspberry Pi 5) | no module features yet |
+
+The checks below use `--all-features`; CI also runs Clippy and the tests with
+`--no-default-features`.
+
 `dist/systemd/helios.service` has the identity-related unit settings (LLD 1, section 4.5). The
 full unit is defined in LLD 6. `dist/helios.toml` is an example config.
 
@@ -34,6 +46,8 @@ cargo install cargo-llvm-cov --locked --version 0.9.1
 cargo +nightly fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
+cargo clippy --locked --all-targets --no-default-features -- -D warnings
+cargo test --locked --all-targets --no-default-features
 cargo llvm-cov --locked --workspace --all-features --fail-under-lines 90
 ```
 
@@ -55,7 +69,7 @@ It never sets the clock.
 
 Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
 
-- `display` (LLD 9): screens on the scanner's framebuffer, drawn from templates compiled into
+- `display` (LLD 9, Cargo feature `module-display`): screens on the scanner's framebuffer, drawn from templates compiled into
   Helios (`status`, `message`, `result`, `blank`, `test`) with Noto Sans (`assets/fonts`, SIL
   Open Font License). The idle `status` screen shows the clock in `time_zone`, the thing name,
   the MQTT connection and the device's address. `display.show` (`template`, `fields`,
@@ -107,8 +121,8 @@ codes: 0 on success, 1 on error, 78 for configuration errors (missing module or 
   subject must follow `<type>(<scope>)!: <summary>`. The check is
   `.github/scripts/check-conventional-commit.sh`.
 - **Format:** `cargo +nightly fmt --check`.
-- **Clippy:** `-D warnings`, with the lints from `Cargo.toml`.
-- **Test and coverage:** installs SoftHSM2, then runs `cargo test` and `cargo llvm-cov` with at least
-  90% line coverage.
+- **Clippy:** `-D warnings`, with the lints from `Cargo.toml`, with all features and with none.
+- **Test and coverage:** installs SoftHSM2, then runs `cargo test` with all features and with none,
+  and `cargo llvm-cov` (all features) with at least 90% line coverage.
   The lcov and HTML reports are uploaded as the `coverage` artifact. Any file excluded from
   coverage must be listed in the workflow with `--ignore-filename-regex`.

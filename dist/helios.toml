@@ -50,7 +50,8 @@ helios_shadow_interval_s = 60  # 10 to 86400: how often the helios shadow may be
 warn_offset_s = 60           # warn when off from server time by more; error above 240 s
 
 [modules.display]
-# Screens on a framebuffer (LLD 9): the scanner's 800x480 screen. Needs the video group
+# Screens on a framebuffer (LLD 9): the scanner's 800x480 screen. Needs a build with the
+# module-display Cargo feature; other builds log this section as unused. Needs the video group
 # (/dev/fb0 is root:video) and the kernel's console detached from the framebuffer, which the
 # scanner's autorun.sh does. Commands: display.show, display.clear, display.status.
 enabled = false
