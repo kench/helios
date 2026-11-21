@@ -104,6 +104,49 @@ pub fn timestamp(time: SystemTime) -> String {
     )
 }
 
+/// Parses an RFC 3339 UTC timestamp as written by [`timestamp`]: `YYYY-MM-DDTHH:MM:SS`, an
+/// optional fraction of a second, and `Z`. Other offsets aren't accepted.
+#[must_use]
+pub fn parse_timestamp(text: &str) -> Option<SystemTime> {
+    let text = text.strip_suffix('Z')?;
+    let (date, time) = text.split_once('T')?;
+    let mut date = date.splitn(3, '-');
+    let year: i64 = date.next()?.parse().ok()?;
+    let month: u32 = date.next()?.parse().ok()?;
+    let day: u32 = date.next()?.parse().ok()?;
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let mut clock = clock.splitn(3, ':');
+    let hour: u64 = clock.next()?.parse().ok()?;
+    let minute: u64 = clock.next()?.parse().ok()?;
+    let second: u64 = clock.next()?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    if !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let nanos = format!("{fraction:0<9}").get(..9)?.parse::<u32>().ok()?;
+    let days = u64::try_from(days_from_civil(year, month, day)).ok()?;
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second;
+    Some(UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+}
+
+/// Days from 1970-01-01 to the proleptic Gregorian date (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let month = i64::from(month);
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// The proleptic Gregorian date `days` after 1970-01-01 (Howard Hinnant's algorithm).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -138,6 +181,36 @@ mod tests {
             timestamp(UNIX_EPOCH - Duration::from_secs(1)),
             "1970-01-01T00:00:00.000Z"
         );
+    }
+
+    #[test]
+    fn parses_what_it_writes() {
+        let time = UNIX_EPOCH + Duration::from_millis(1_795_237_507_363);
+
+        assert_eq!(parse_timestamp(&timestamp(time)), Some(time));
+        assert_eq!(
+            parse_timestamp("2000-02-29T00:00:00Z"),
+            Some(UNIX_EPOCH + Duration::from_secs(951_782_400))
+        );
+        assert_eq!(
+            parse_timestamp("2026-11-21T05:05:07.5Z"),
+            Some(UNIX_EPOCH + Duration::from_millis(1_795_237_507_500))
+        );
+    }
+
+    #[test]
+    fn rejects_other_forms() {
+        for text in [
+            "2026-11-21T05:05:07+01:00",
+            "2026-11-21 05:05:07Z",
+            "2026-13-01T00:00:00Z",
+            "2026-11-21T24:00:00Z",
+            "2026-11-21T05:05:07.x1Z",
+            "1969-12-31T23:59:59Z",
+            "nonsense",
+        ] {
+            assert_eq!(parse_timestamp(text), None, "{text}");
+        }
     }
 
     #[test]

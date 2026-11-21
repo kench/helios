@@ -236,6 +236,7 @@ fn options(port: u16) -> Options {
         local_endpoint: Some("localhost".to_owned()),
         boot_id: Some("boot-1".to_owned()),
         timing: timing(),
+        commands: Arc::new(crate::router::topics::TopicsTransport),
     }
 }
 
@@ -307,7 +308,9 @@ async fn connects_as_the_thing_with_a_will_and_a_clean_session() {
     let will: Value = serde_json::from_slice(&will.message).unwrap();
     assert_eq!(will["type"], "lifecycle.offline");
     assert_eq!(will["payload"]["reason"], "connection_lost");
-    assert_eq!(state.subscribes, vec![topics::session_filters(THING_NAME)]);
+    let mut filters = topics::shadow_filters(THING_NAME);
+    filters.push(format!("helios/{THING_NAME}/cmd/+"));
+    assert_eq!(state.subscribes, vec![filters]);
     let (topic, online) = &state.publishes[0];
     assert_eq!(topic, &lifecycle_topic());
     assert_eq!(online["type"], "lifecycle.online");
