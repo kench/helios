@@ -18,6 +18,8 @@ use rustls::{ClientConfig, RootCertStore};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::clock::ClockSamples;
+use crate::clock::offset::Source;
 use crate::https::{self, Endpoint, HttpsError, Limits};
 
 use crate::identity::bootstrap::api::{
@@ -165,6 +167,7 @@ pub struct BootstrapClient {
     base_path: String,
     tls: Arc<ClientConfig>,
     timeout: Duration,
+    clock: ClockSamples,
 }
 
 impl BootstrapClient {
@@ -192,7 +195,15 @@ impl BootstrapClient {
             base_path: uri.path().trim_end_matches('/').to_owned(),
             tls: tls::server_auth_config(roots, Alpn::Http1)?,
             timeout,
+            clock: ClockSamples::discard(),
         })
+    }
+
+    /// Offers each response's server time to the clock checks.
+    #[must_use]
+    pub fn with_clock(mut self, clock: ClockSamples) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// `Bootstrap`: looks the device up by its adapters.
@@ -251,6 +262,7 @@ impl BootstrapClient {
             limits,
         )
         .await?;
+        self.clock.offer_http(Source::Bootstrap, &response);
         if response.status.is_redirection() {
             return Err(BootstrapError::Redirect(response.status));
         }

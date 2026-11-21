@@ -59,8 +59,13 @@ async fn setup(timing: Timing, respond: impl FnOnce(&MockService)) -> Setup {
         role_alias: "helios-device-role-alias".into(),
     };
     let cancel = CancellationToken::new();
-    let (provider, task) =
-        HeliosCredentialsProvider::start(identity_handle, Some(local), timing, cancel.clone());
+    let (provider, task) = HeliosCredentialsProvider::start(
+        identity_handle,
+        Some(local),
+        timing,
+        crate::clock::ClockSamples::discard(),
+        cancel.clone(),
+    );
     Setup {
         service,
         provider,
@@ -227,8 +232,13 @@ async fn needs_an_endpoint_and_role_alias() {
     let service = MockService::start_mtls(&device_ca).await;
     let (identity, _token, identity_cancel) = ready_identity(&device_ca, service.roots()).await;
     let cancel = CancellationToken::new();
-    let (provider, task) =
-        HeliosCredentialsProvider::start(identity, None, timing(hourly), cancel.clone());
+    let (provider, task) = HeliosCredentialsProvider::start(
+        identity,
+        None,
+        timing(hourly),
+        crate::clock::ClockSamples::discard(),
+        cancel.clone(),
+    );
 
     let error = provider.provide_credentials().await.unwrap_err();
 

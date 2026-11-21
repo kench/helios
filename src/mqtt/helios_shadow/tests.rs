@@ -11,6 +11,7 @@ struct Setup {
     identity: watch::Sender<IdentityState>,
     credentials: watch::Sender<CredentialsStatus>,
     mqtt: watch::Sender<MqttStatus>,
+    clock: watch::Sender<ClockStatus>,
     published: tokio::sync::mpsc::UnboundedReceiver<MqttRequest>,
     replies: tokio::sync::mpsc::Sender<crate::mqtt::manager::Incoming>,
     cancel: CancellationToken,
@@ -31,14 +32,22 @@ fn setup(interval: Duration) -> Setup {
         reply_timeout: Duration::from_secs(10),
         tick: Duration::from_millis(5),
     };
-    let (shadows, _task) = ShadowManager::start(handle, incoming, timing, cancel.clone());
+    let (shadows, _task) = ShadowManager::start(
+        handle,
+        incoming,
+        timing,
+        crate::clock::ClockSamples::discard(),
+        cancel.clone(),
+    );
     let (identity, identity_rx) = watch::channel(IdentityState::Starting);
     let (credentials, credentials_rx) = watch::channel(CredentialsStatus::default());
+    let (clock, clock_rx) = watch::channel(ClockStatus::default());
     let _reporter = start(
         Sources {
             identity: identity_rx,
             credentials: credentials_rx,
             mqtt: mqtt.subscribe(),
+            clock: clock_rx,
             boot_id: Some("boot-1".into()),
             started_at: SystemTime::UNIX_EPOCH,
         },
@@ -55,6 +64,7 @@ fn setup(interval: Duration) -> Setup {
         identity,
         credentials,
         mqtt,
+        clock,
         published,
         replies,
         cancel,
@@ -159,4 +169,40 @@ async fn reports_bootstrap_and_fatal_reasons() {
     let reported = next_report(&mut setup).await;
     assert_eq!(reported["identity"]["state"], "fatal");
     assert_eq!(reported["identity"]["reason"], "token PIN is locked");
+}
+
+#[tokio::test]
+async fn reports_the_clock_checks_at_once() {
+    let mut setup = setup(COUNTER_INTERVAL);
+    let first = next_report(&mut setup).await;
+    assert_eq!(first["clock"]["synced"], Value::Null);
+    assert_eq!(first["clock"]["offset_ms"], Value::Null);
+
+    setup.clock.send_replace(ClockStatus {
+        synced: Some(true),
+        max_error_ms: Some(16_500),
+        drift_ppm: Some(-12.345_678),
+        offset: Some(crate::clock::offset::Offset {
+            offset_ms: 21_292_000,
+            uncertainty: Duration::from_millis(540),
+            source: crate::clock::offset::Source::Credentials,
+            at: SystemTime::UNIX_EPOCH,
+        }),
+        boot_offset_s: Some(21_292),
+    });
+    let clock = next_report(&mut setup).await["clock"].clone();
+
+    assert_eq!(
+        clock,
+        json!({
+            "synced": true,
+            "max_error_ms": 16_500,
+            "drift_ppm": -12.35,
+            "offset_ms": 21_292_000,
+            "offset_uncertainty_ms": 540,
+            "offset_source": "credentials",
+            "offset_at": "1970-01-01T00:00:00.000Z",
+            "boot_offset_s": 21_292,
+        })
+    );
 }

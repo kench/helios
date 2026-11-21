@@ -70,6 +70,10 @@ fn local_config(service: &MockService, pin_dir: &Path) -> Config {
             port: 9,
             ..crate::mqtt::MqttSettings::default()
         },
+        clock: crate::clock::ClockSettings {
+            boot_mark: None,
+            ..crate::clock::ClockSettings::default()
+        },
         ignored_sections: vec!["modules".into()],
     }
 }
@@ -100,6 +104,7 @@ fn timing() -> Timing {
         },
         shadows: crate::mqtt::shadow::Timing::default(),
         router: crate::router::Timing::default(),
+        clock: crate::clock::Timing::default(),
     }
 }
 

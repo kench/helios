@@ -20,6 +20,7 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use serde::Deserialize;
 
+use crate::clock::{ClockSettings, ERROR_OFFSET};
 use crate::identity::bootstrap::adapters::Interfaces;
 use crate::identity::bootstrap::api::AwsSettings;
 use crate::identity::manager::CertificateSource;
@@ -79,6 +80,8 @@ pub struct Config {
     pub bootstrap: Option<BootstrapConfig>,
     /// The `[mqtt]` settings (LLD 2, section 6).
     pub mqtt: MqttSettings,
+    /// The `[clock]` settings (LLD 1, section 4.11).
+    pub clock: ClockSettings,
     /// Top-level sections this version doesn't use, in file order.
     pub ignored_sections: Vec<String>,
 }
@@ -108,6 +111,8 @@ struct File {
     aws: AwsSection,
     #[serde(default)]
     mqtt: MqttSection,
+    #[serde(default)]
+    clock: ClockSection,
     /// Everything else: sections for other versions or modules.
     #[serde(flatten)]
     other: toml::Table,
@@ -158,6 +163,13 @@ struct MqttSection {
     keep_alive_s: Option<u64>,
     queue_messages: Option<usize>,
     commands: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClockSection {
+    warn_offset_s: Option<u64>,
+    state_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,7 +268,34 @@ impl File {
             aws,
             bootstrap,
             mqtt: self.mqtt.check()?,
+            clock: self.clock.check()?,
             ignored_sections: self.other.keys().cloned().collect(),
+        })
+    }
+}
+
+impl ClockSection {
+    fn check(self) -> Result<ClockSettings, String> {
+        let defaults = ClockSettings::default();
+        let warn_offset = self
+            .warn_offset_s
+            .map_or(defaults.warn_offset, Duration::from_secs);
+        if warn_offset.is_zero() || warn_offset >= ERROR_OFFSET {
+            return Err(format!(
+                "clock.warn_offset_s must be from 1 to {}, below the error level, not {}",
+                ERROR_OFFSET.as_secs() - 1,
+                warn_offset.as_secs()
+            ));
+        }
+        if self.state_file.is_some() {
+            return Err(
+                "clock.state_file isn't supported yet (LLD 1, section 4.11); leave it unset"
+                    .to_owned(),
+            );
+        }
+        Ok(ClockSettings {
+            warn_offset,
+            ..defaults
         })
     }
 }

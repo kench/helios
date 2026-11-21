@@ -41,3 +41,8 @@ port           = 8883        # or 443 (ALPN x-amzn-mqtt-ca) where 8883 is blocke
 keep_alive_s   = 60          # 30 to 1200
 queue_messages = 1000        # events kept while offline; the oldest are dropped first
 commands       = "topics"    # helios/<thing>/cmd|rsp/<module>; "aws-iot-commands" comes later
+
+[clock]
+# Clock checks (LLD 1, section 4.11). Helios reports the clock in the helios shadow but never
+# sets it. The platform may write /run/helios/boot-clock before NTP runs, for the boot offset.
+warn_offset_s = 60           # warn when off from server time by more; error above 240 s

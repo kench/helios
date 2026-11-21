@@ -7,6 +7,7 @@
 pub(crate) mod backoff;
 pub mod build_info;
 pub mod cli;
+pub mod clock;
 pub mod config;
 pub mod credentials;
 pub mod hardening;

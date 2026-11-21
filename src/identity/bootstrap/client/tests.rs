@@ -3,6 +3,8 @@
 use secrecy::ExposeSecret;
 
 use super::*;
+use crate::clock::ClockSamples;
+use crate::clock::offset::Source;
 use crate::identity::bootstrap::api::tests::{json, protocol_test_body, relay_adapters};
 use crate::identity::bootstrap::api::{Capability, Challenge};
 use crate::identity::testing::{MockResponse, MockService, ca};
@@ -368,4 +370,28 @@ fn parses_error_type_headers() {
     assert_eq!(error_type(&header("")), None);
     assert_eq!(error_type(&HeaderMap::new()), None);
     assert_eq!(retry_after(&HeaderMap::new()), None);
+}
+
+#[tokio::test]
+async fn offers_the_server_time_to_the_clock_checks() {
+    let service = MockService::start().await;
+    service.respond(
+        MockResponse::error(404, "UnknownDevice").header("date", "Sat, 21 Nov 2026 06:00:00 GMT"),
+    );
+    let (clock, mut samples) = ClockSamples::for_test();
+
+    let result = client(&service)
+        .with_clock(clock)
+        .bootstrap(&request())
+        .await;
+
+    assert!(result.is_err());
+    // Error responses carry the server's time too.
+    let sample = samples.try_recv().unwrap();
+    assert_eq!(sample.source, Source::Bootstrap);
+    assert_eq!(
+        sample.server,
+        std::time::UNIX_EPOCH + Duration::from_secs(1_795_240_800)
+    );
+    assert!(sample.received >= sample.sent);
 }

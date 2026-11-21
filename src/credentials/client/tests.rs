@@ -4,6 +4,8 @@
 use secrecy::ExposeSecret;
 
 use super::*;
+use crate::clock::ClockSamples;
+use crate::clock::offset::Source;
 use crate::identity::manager::IdentityHandle;
 use crate::identity::testing::{MockResponse, MockService, THING_NAME, ca, ready_identity};
 use crate::identity::tls::Alpn;
@@ -292,4 +294,24 @@ fn parses_rfc3339_utc_times() {
     ] {
         assert_eq!(parse_rfc3339(bad), None, "{bad}");
     }
+}
+
+#[tokio::test]
+async fn offers_the_server_time_to_the_clock_checks() {
+    let mut setup = setup().await;
+    let (clock, mut samples) = ClockSamples::for_test();
+    setup.client = setup.client.with_clock(clock);
+    setup.service.respond(
+        MockResponse::json(200, &body("2033-11-06T09:49:37Z"))
+            .header("date", "Sun, 06 Nov 2033 08:49:37 GMT"),
+    );
+
+    setup.fetch().await.unwrap();
+
+    let sample = samples.try_recv().unwrap();
+    assert_eq!(sample.source, Source::Credentials);
+    assert_eq!(
+        sample.server,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_014_879_777)
+    );
 }

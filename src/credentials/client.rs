@@ -17,6 +17,8 @@ use rustls::ClientConfig;
 use secrecy::SecretString;
 use serde::Deserialize;
 
+use crate::clock::ClockSamples;
+use crate::clock::offset::Source;
 use crate::https::{self, Endpoint, HttpsError, InvalidHost, Limits};
 
 /// Time allowed to connect.
@@ -102,6 +104,7 @@ pub struct CredentialsClient {
     endpoint: Endpoint,
     path: String,
     thing_name: String,
+    clock: ClockSamples,
 }
 
 impl CredentialsClient {
@@ -123,7 +126,15 @@ impl CredentialsClient {
             endpoint: Endpoint::parse(endpoint)?,
             path: format!("/role-aliases/{role_alias}/credentials"),
             thing_name: thing_name.to_owned(),
+            clock: ClockSamples::discard(),
         })
+    }
+
+    /// Offers each response's server time to the clock checks.
+    #[must_use]
+    pub fn with_clock(mut self, clock: ClockSamples) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Fetches credentials over mutual TLS with `tls`, normally
@@ -145,6 +156,7 @@ impl CredentialsClient {
             max_body: MAX_RESPONSE_LEN,
         };
         let response = https::send(&self.endpoint, tls, request, Bytes::new(), limits).await?;
+        self.clock.offer_http(Source::Credentials, &response);
         match response.status {
             StatusCode::OK => {}
             StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => {

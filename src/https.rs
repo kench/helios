@@ -6,7 +6,7 @@
 //! presented. Redirects are never followed: a 3xx comes back as a response like any other.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
@@ -110,6 +110,20 @@ pub struct Response {
     pub headers: HeaderMap,
     /// The whole body.
     pub body: Bytes,
+    /// When the request went out and the response came back, for clock checks.
+    pub exchange: Exchange,
+}
+
+/// The timing of one HTTP exchange: from sending the request to receiving the response's
+/// headers, after the connection and TLS handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exchange {
+    /// The device time when the request was sent.
+    pub sent: SystemTime,
+    /// The device time when the response's headers arrived.
+    pub received: SystemTime,
+    /// The time between them, by a monotonic clock.
+    pub round_trip: Duration,
 }
 
 /// The request failed before a complete response arrived.
@@ -180,7 +194,13 @@ async fn exchange(
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
     let connection = tokio::spawn(connection);
+    let (sent, started) = (SystemTime::now(), Instant::now());
     let response = sender.send_request(request).await?;
+    let exchange = Exchange {
+        sent,
+        received: SystemTime::now(),
+        round_trip: started.elapsed(),
+    };
     let (parts, body) = response.into_parts();
     let body = Limited::new(body, limits.max_body)
         .collect()
@@ -195,6 +215,7 @@ async fn exchange(
         status: parts.status,
         headers: parts.headers,
         body,
+        exchange,
     })
 }
 
