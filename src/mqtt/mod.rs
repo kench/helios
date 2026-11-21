@@ -18,6 +18,8 @@ pub struct MqttSettings {
     pub keep_alive: Duration,
     /// How many events the offline queue holds.
     pub queue_messages: usize,
+    /// How often the `helios` shadow may be updated for changes that aren't urgent.
+    pub helios_shadow_interval: Duration,
 }
 
 /// The standard MQTT-over-TLS port.
@@ -35,6 +37,7 @@ impl Default for MqttSettings {
             port: PORT_8883,
             keep_alive: Duration::from_secs(60),
             queue_messages: 1000,
+            helios_shadow_interval: crate::mqtt::helios_shadow::DEFAULT_INTERVAL,
         }
     }
 }

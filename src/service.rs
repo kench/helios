@@ -219,6 +219,7 @@ impl Service {
         let (identity, identity_task) =
             IdentityManager::start(manager, backend, pin, config.roots, cancel.clone())?;
         let local_endpoint = config.aws.as_ref().map(|aws| aws.iot_endpoint.clone());
+        let helios_shadow_interval = config.mqtt.helios_shadow_interval;
         let local = config.aws.map(|aws| LocalSettings {
             credentials_endpoint: aws.credentials_endpoint,
             role_alias: aws.role_alias,
@@ -266,7 +267,7 @@ impl Service {
                 started_at: std::time::SystemTime::now(),
             },
             shadows.clone(),
-            helios_shadow::COUNTER_INTERVAL,
+            helios_shadow_interval,
             cancel.clone(),
         );
         let (commands_tx, commands_rx) = mpsc::channel(INCOMING_CAPACITY);

@@ -99,7 +99,7 @@ async fn next_report(setup: &mut Setup) -> Value {
 
 #[tokio::test]
 async fn reports_the_agent_state() {
-    let mut setup = setup(COUNTER_INTERVAL);
+    let mut setup = setup(DEFAULT_INTERVAL);
 
     let reported = next_report(&mut setup).await;
 
@@ -113,7 +113,7 @@ async fn reports_the_agent_state() {
 
 #[tokio::test]
 async fn reports_significant_changes_at_once() {
-    let mut setup = setup(COUNTER_INTERVAL);
+    let mut setup = setup(DEFAULT_INTERVAL);
     next_report(&mut setup).await;
 
     setup.identity.send_replace(IdentityState::Unavailable {
@@ -152,7 +152,7 @@ async fn reports_counter_changes_at_most_once_an_interval() {
 
 #[tokio::test]
 async fn reports_bootstrap_and_fatal_reasons() {
-    let mut setup = setup(COUNTER_INTERVAL);
+    let mut setup = setup(DEFAULT_INTERVAL);
     next_report(&mut setup).await;
 
     setup.identity.send_replace(IdentityState::Bootstrapping {
@@ -173,7 +173,7 @@ async fn reports_bootstrap_and_fatal_reasons() {
 
 #[tokio::test]
 async fn reports_the_clock_checks_at_once() {
-    let mut setup = setup(COUNTER_INTERVAL);
+    let mut setup = setup(DEFAULT_INTERVAL);
     let first = next_report(&mut setup).await;
     assert_eq!(first["clock"]["synced"], Value::Null);
     assert_eq!(first["clock"]["offset_ms"], Value::Null);
@@ -205,4 +205,68 @@ async fn reports_the_clock_checks_at_once() {
             "boot_offset_s": 21_292,
         })
     );
+}
+
+#[tokio::test]
+async fn waits_for_the_interval_for_clock_details() {
+    let mut setup = setup(Duration::from_millis(300));
+    let offset = crate::clock::offset::Offset {
+        offset_ms: 0,
+        uncertainty: Duration::from_millis(540),
+        source: crate::clock::offset::Source::Credentials,
+        at: SystemTime::UNIX_EPOCH,
+    };
+    setup.clock.send_replace(ClockStatus {
+        synced: Some(true),
+        drift_ppm: Some(19.0),
+        offset: Some(offset),
+        ..ClockStatus::default()
+    });
+    let first = next_report(&mut setup).await;
+    // The first report may predate the clock status; wait for the one that has it.
+    if first["clock"]["synced"] != json!(true) {
+        next_report(&mut setup).await;
+    }
+    let start = Instant::now();
+
+    // NTP moves the frequency correction, and a new sample comes from another source.
+    setup.clock.send_modify(|clock| {
+        clock.drift_ppm = Some(24.2);
+        clock.offset = Some(crate::clock::offset::Offset {
+            source: crate::clock::offset::Source::Shadow,
+            ..offset
+        });
+    });
+    let reported = next_report(&mut setup).await;
+
+    assert_eq!(reported["clock"]["drift_ppm"], 24.2);
+    assert_eq!(reported["clock"]["offset_source"], "shadow");
+    assert!(
+        start.elapsed() >= Duration::from_millis(250),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn sends_a_waiting_change_as_soon_as_the_interval_has_passed() {
+    let mut setup = setup(Duration::from_millis(400));
+    next_report(&mut setup).await;
+
+    // An urgent report halfway through the interval, then a change that isn't urgent.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    setup.identity.send_replace(IdentityState::Bootstrapping {
+        attempts: 1,
+        last_error: None,
+    });
+    next_report(&mut setup).await;
+    let urgent = Instant::now();
+    setup.mqtt.send_modify(|status| status.dropped_events = 1);
+    let reported = next_report(&mut setup).await;
+
+    // About one interval after the urgent report; a fixed 400 ms timer would wait until 800 ms.
+    let waited = urgent.elapsed();
+    assert_eq!(reported["mqtt"]["dropped_events"], 1);
+    assert!(waited >= Duration::from_millis(350), "{waited:?}");
+    assert!(waited < Duration::from_millis(550), "{waited:?}");
 }

@@ -532,7 +532,7 @@ fn the_shipped_example_parses() {
 fn reads_the_mqtt_settings() {
     let files = Files::new();
     let text = files.local(
-        "\n[mqtt]\nport = 443\nkeep_alive_s = 300\nqueue_messages = 50\ncommands = \"topics\"\n",
+        "\n[mqtt]\nport = 443\nkeep_alive_s = 300\nqueue_messages = 50\ncommands = \"topics\"\nhelios_shadow_interval_s = 900\n",
     );
 
     let config = files.load(&text).unwrap();
@@ -540,6 +540,7 @@ fn reads_the_mqtt_settings() {
     assert_eq!(config.mqtt.port, 443);
     assert_eq!(config.mqtt.keep_alive, Duration::from_secs(300));
     assert_eq!(config.mqtt.queue_messages, 50);
+    assert_eq!(config.mqtt.helios_shadow_interval, Duration::from_secs(900));
     assert!(config.ignored_sections.is_empty());
 }
 
@@ -569,6 +570,14 @@ fn rejects_bad_mqtt_settings() {
         ),
         ("commands = \"aws-iot-commands\"", "isn't supported yet"),
         ("commands = \"jobs\"", "mqtt.commands must be"),
+        (
+            "helios_shadow_interval_s = 9",
+            "mqtt.helios_shadow_interval_s must be 10 to 86400",
+        ),
+        (
+            "helios_shadow_interval_s = 86401",
+            "mqtt.helios_shadow_interval_s must be 10 to 86400",
+        ),
         ("unknown = 1", "unknown"),
     ] {
         let error = files.error(&files.local(&format!("\n[mqtt]\n{section}\n")));
