@@ -1,0 +1,35 @@
+# Helios config: /etc/helios/helios.toml (LLD 1, section 3). No secrets go in this file.
+#
+# This example gets the PIN and the device identity from the bootstrap service. For
+# development without it, set identity.pin = "file:<path>" and fill in the settings marked
+# "local PIN" below.
+
+[bootstrap]
+url        = "https://device-management.services.kenley.tv/v1"
+ca         = "/etc/helios/amazon-root-cas.pem"   # same Amazon root CAs as aws.root_ca
+interfaces = "auto"                              # or a list, e.g. ["eth0", "wlan0"]
+timeout_ms = 10000
+challenge_key_label = "challenge-key"            # optional PIN-less key for challenges
+
+[device]
+# Local PIN: required. With bootstrap, set only to cross-check the service's value.
+# thing_name = "t-01JD5VY2K7M9Q4R6T8V0X2Z4B6"
+
+[identity]
+pkcs11_module = "/usr/lib/softhsm/libsofthsm2.so"   # scanner: /run/helios/lib/softhsm/libsofthsm2.so
+# Local PIN: required. With bootstrap, supplied by the service.
+# token_label = "helios"
+# key_label   = "device-key"
+certificate   = "token"          # "token" or a path to a PEM file
+pin           = "bootstrap"      # "bootstrap", "credential:<name>" or "file:<path>"
+allow_final_pin_try = false
+sign_timeout_ms     = 5000
+
+[aws]
+# Local PIN: all four required. With bootstrap, supplied by the service; if set here, the
+# service's values must match.
+# region               = "us-west-2"
+# iot_endpoint         = "<prefix>-ats.iot.us-west-2.amazonaws.com"
+# credentials_endpoint = "<prefix>.credentials.iot.us-west-2.amazonaws.com"
+# role_alias           = "helios-device-role-alias"
+root_ca = "/etc/helios/amazon-root-cas.pem"   # AmazonRootCA1 + AmazonRootCA3

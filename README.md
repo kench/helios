@@ -23,7 +23,7 @@ set, as in CI. Each run uses its own temporary token directory.
 clock reading when it checks certificate dates. Set `SOURCE_DATE_EPOCH` for reproducible builds.
 
 `dist/systemd/helios.service` has the identity-related unit settings (LLD 1, section 4.5). The
-full unit is defined in LLD 6.
+full unit is defined in LLD 6. `dist/helios.toml` is an example config.
 
 ```sh
 sudo apt install softhsm2
@@ -36,6 +36,28 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 cargo llvm-cov --locked --workspace --all-features --fail-under-lines 90
 ```
+
+## Running the service
+
+`helios` with no subcommand runs the service, as `helios.service` does. It reads
+`/etc/helios/helios.toml` (or `--config <path>`), runs the startup checks, starts the identity
+manager and keeps temporary AWS credentials fresh from the AWS IoT credentials provider (LLD 1,
+sections 3 to 6). MQTT and the modules come later (LLD 2).
+
+`dist/helios.toml` is an example config. With the bootstrap service it needs only the module
+and CA paths. For development without the service, set `identity.pin = "file:<path>"` and fill
+in `device.thing_name`, `identity.token_label`, `identity.key_label` and the four `[aws]`
+endpoint settings. Sections this version doesn't use, such as `[modules.usb]`, are logged and
+ignored; unknown keys in a known section are errors.
+
+```sh
+SOFTHSM2_CONF=/etc/helios/softhsm2.conf helios --config ./helios.toml
+HELIOS_LOG=debug helios        # error, warn, info (default), debug or trace
+```
+
+Logs go to stderr, without timestamps under journald. Exit codes: 0 after SIGTERM or SIGINT, 78
+for a config error or a fatal identity problem such as a wrong PIN (the unit doesn't restart on
+78), and 1 for anything else, which systemd restarts.
 
 ## Provisioning
 

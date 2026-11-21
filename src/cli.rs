@@ -1,8 +1,9 @@
 //! The `helios` command line (LLD 1, section 4.10).
 //!
-//! `helios provision` subcommands run on the device as the `helios` user, with the same
-//! `SOFTHSM2_CONF` as the service. The PIN comes from a terminal prompt, or from `--pin-file`
-//! in scripts, never from a command-line argument.
+//! Without a subcommand, `helios` runs the service ([`crate::service`]). The `helios provision`
+//! subcommands run on the device as the `helios` user, with the same `SOFTHSM2_CONF` as the
+//! service. The PIN comes from a terminal prompt, or from `--pin-file` in scripts, never from a
+//! command-line argument.
 //!
 //! Exit codes: 0 on success, 1 on error, 78 (`EX_CONFIG`) for configuration errors.
 
@@ -28,8 +29,17 @@ pub const EXIT_ERROR: u8 = 1;
 pub const EXIT_CONFIG: u8 = 78;
 
 #[derive(Debug, Parser)]
-#[command(name = "helios", version, about = "Helios on-device agent")]
+#[command(
+    name = "helios",
+    version,
+    about = "Helios on-device agent",
+    long_about = "Helios on-device agent. Without a subcommand, runs the service (as \
+                  helios.service does) with the config at --config."
+)]
 struct Cli {
+    /// The service's config file.
+    #[arg(long, default_value = crate::config::DEFAULT_PATH)]
+    config: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -293,14 +303,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>, console: &mut dyn Console) 
         }
     };
     let result = match cli.command {
-        None => {
-            let _ = writeln!(
-                console.out(),
-                "helios {}: the agent isn't wired up yet; see `helios provision --help`",
-                env!("CARGO_PKG_VERSION")
-            );
-            Ok(())
-        }
+        None => return crate::service::main(&cli.config),
         Some(Command::Provision(args)) => provision(&args, console),
     };
     match result {
@@ -624,12 +627,25 @@ mod tests {
     }
 
     #[test]
-    fn without_a_command_says_the_agent_is_not_wired_up() {
+    fn without_a_command_runs_the_service() {
         let mut console = ScriptedConsole::default();
 
-        assert_eq!(run_with(&[], &mut console), EXIT_OK);
+        // The service reads its config first; a missing one is a config error.
+        assert_eq!(
+            run_with(&["--config", "/nonexistent/helios.toml"], &mut console),
+            EXIT_CONFIG
+        );
+    }
 
-        assert!(text(&console.stdout).contains("see `helios provision --help`"));
+    #[test]
+    fn help_describes_the_service() {
+        let mut console = ScriptedConsole::default();
+
+        assert_eq!(run_with(&["--help"], &mut console), EXIT_OK);
+
+        let help = text(&console.stdout);
+        assert!(help.contains("--config"), "{help}");
+        assert!(help.contains(crate::config::DEFAULT_PATH), "{help}");
     }
 
     #[test]
