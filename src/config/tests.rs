@@ -235,6 +235,12 @@ fn reports_sections_it_does_not_use() {
         .load(&files.local("\n[modules.usb]\nenabled = true\n\n[telemetry]\ninterval_s = 30\n"))
         .unwrap();
 
+    #[cfg(feature = "module-usb")]
+    {
+        assert!(config.usb.is_some());
+        assert_eq!(config.ignored_sections, ["telemetry"]);
+    }
+    #[cfg(not(feature = "module-usb"))]
     assert_eq!(config.ignored_sections, ["modules.usb", "telemetry"]);
 }
 
