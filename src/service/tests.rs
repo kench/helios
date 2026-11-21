@@ -145,7 +145,15 @@ async fn gets_credentials_with_a_local_pin_and_stops_on_shutdown() {
         requests[0].path,
         "/role-aliases/helios-device-role-alias/credentials"
     );
-    assert!(!token.is_open(), "the token is closed on shutdown");
+    // The signer thread closes the token after the manager stops, without the manager
+    // waiting for it (a hung token mustn't block shutdown).
+    tokio::time::timeout(WAIT, async {
+        while token.is_open() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the token is closed on shutdown");
 }
 
 #[tokio::test]
