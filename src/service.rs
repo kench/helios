@@ -40,6 +40,7 @@ use crate::identity::pin::credentials_directory_from_env;
 use crate::identity::token::TokenBackend;
 #[cfg(feature = "module-display")]
 use crate::modules::display;
+use crate::modules::{Module, supervisor};
 use crate::mqtt::helios_shadow::{self, Sources};
 use crate::mqtt::manager::{Incoming, MqttHandle, MqttManager, Options as MqttOptions};
 use crate::mqtt::shadow::{ShadowHandle, ShadowManager};
@@ -78,6 +79,8 @@ pub struct Timing {
     pub router: crate::router::Timing,
     /// The clock checks'.
     pub clock: crate::clock::Timing,
+    /// The module supervisor's restarts.
+    pub modules: crate::modules::supervisor::Timing,
 }
 
 /// Incoming MQTT messages wait here until the router and shadow manager read them.
@@ -265,19 +268,7 @@ impl Service {
             clock_samples,
             cancel.clone(),
         );
-        let reporter = helios_shadow::start(
-            Sources {
-                identity: identity.watch(),
-                credentials: credentials.status(),
-                mqtt: mqtt.status(),
-                clock: clock_status,
-                boot_id: platform.boot_id.clone(),
-                started_at: std::time::SystemTime::now(),
-            },
-            shadows.clone(),
-            helios_shadow_interval,
-            cancel.clone(),
-        );
+        let started_at = std::time::SystemTime::now();
         let (commands_tx, commands_rx) = mpsc::channel(INCOMING_CAPACITY);
         let (router, router_task) = Router::start(
             mqtt.clone(),
@@ -295,25 +286,40 @@ impl Service {
             unused_mut,
             reason = "which modules there are depends on Cargo features"
         )]
-        let mut modules = Vec::new();
+        let mut enabled: Vec<Arc<dyn Module>> = Vec::new();
         #[cfg(feature = "module-display")]
         if let Some(settings) = config.display {
-            let inputs = display::Inputs {
-                commands: router.register(display::MODULE),
-                desired: shadows.desired(display::MODULE),
-                shadows: shadows.clone(),
-                mqtt: mqtt.status(),
-                sysfs: platform.sysfs.clone(),
-            };
-            modules.push(
-                display::start(settings, inputs, cancel.clone()).map_err(|message| {
-                    StartFailure {
-                        message,
-                        config: false,
-                    }
-                })?,
-            );
+            let module = display::DisplayModule::new(settings).map_err(|message| StartFailure {
+                message,
+                config: false,
+            })?;
+            enabled.push(Arc::new(module));
         }
+        let (module_states, modules) = supervisor::start(
+            enabled,
+            &supervisor::Deps {
+                router: router.clone(),
+                shadows: shadows.clone(),
+                mqtt: mqtt.clone(),
+                sysfs: platform.sysfs.clone(),
+            },
+            timing.modules,
+            &cancel,
+        );
+        let reporter = helios_shadow::start(
+            Sources {
+                identity: identity.watch(),
+                credentials: credentials.status(),
+                mqtt: mqtt.status(),
+                clock: clock_status,
+                modules: module_states,
+                boot_id: platform.boot_id.clone(),
+                started_at,
+            },
+            shadows.clone(),
+            helios_shadow_interval,
+            cancel.clone(),
+        );
         let routing = tokio::spawn(route(incoming, shadow_tx, commands_tx));
         Ok(Self {
             identity,

@@ -170,6 +170,16 @@ pub struct RouterHandle {
 }
 
 impl RouterHandle {
+    /// For tests: each registration arrives on the returned channel as (module, queue).
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (
+        Self,
+        mpsc::UnboundedReceiver<(String, mpsc::Sender<PendingCommand>)>,
+    ) {
+        let (registrations, received) = mpsc::unbounded_channel();
+        (Self { registrations }, received)
+    }
+
     /// Registers `module`: its commands arrive on the returned channel.
     #[must_use]
     pub fn register(&self, module: &str) -> mpsc::Receiver<PendingCommand> {

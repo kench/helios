@@ -12,6 +12,7 @@ struct Setup {
     credentials: watch::Sender<CredentialsStatus>,
     mqtt: watch::Sender<MqttStatus>,
     clock: watch::Sender<ClockStatus>,
+    modules: watch::Sender<crate::modules::ModuleStates>,
     published: tokio::sync::mpsc::UnboundedReceiver<MqttRequest>,
     replies: tokio::sync::mpsc::Sender<crate::mqtt::manager::Incoming>,
     cancel: CancellationToken,
@@ -42,12 +43,14 @@ fn setup(interval: Duration) -> Setup {
     let (identity, identity_rx) = watch::channel(IdentityState::Starting);
     let (credentials, credentials_rx) = watch::channel(CredentialsStatus::default());
     let (clock, clock_rx) = watch::channel(ClockStatus::default());
+    let (modules, modules_rx) = watch::channel(crate::modules::ModuleStates::new());
     let _reporter = start(
         Sources {
             identity: identity_rx,
             credentials: credentials_rx,
             mqtt: mqtt.subscribe(),
             clock: clock_rx,
+            modules: modules_rx,
             boot_id: Some("boot-1".into()),
             started_at: SystemTime::UNIX_EPOCH,
         },
@@ -65,6 +68,7 @@ fn setup(interval: Duration) -> Setup {
         credentials,
         mqtt,
         clock,
+        modules,
         published,
         replies,
         cancel,
@@ -269,4 +273,45 @@ async fn sends_a_waiting_change_as_soon_as_the_interval_has_passed() {
     assert_eq!(reported["mqtt"]["dropped_events"], 1);
     assert!(waited >= Duration::from_millis(350), "{waited:?}");
     assert!(waited < Duration::from_millis(550), "{waited:?}");
+}
+
+#[tokio::test]
+async fn reports_module_states_at_once_but_not_their_timestamps() {
+    use crate::modules::{ModuleStatus, RunState};
+    let mut setup = setup(Duration::from_secs(3600));
+    assert_eq!(next_report(&mut setup).await["modules"], json!({}));
+
+    setup.modules.send_modify(|modules| {
+        modules.insert(
+            "display",
+            ModuleStatus {
+                state: RunState::Restarting,
+                restarts: 0,
+                last_error: Some("framebuffer gone".into()),
+                since: SystemTime::UNIX_EPOCH,
+            },
+        );
+    });
+    let reported = next_report(&mut setup).await;
+
+    assert_eq!(
+        reported["modules"]["display"],
+        json!({
+            "state": "restarting",
+            "restarts": 0,
+            "last_error": "framebuffer gone",
+            "since": "1970-01-01T00:00:00.000Z",
+        })
+    );
+    // Only the time changes: not urgent, so nothing goes out before the hour's interval.
+    setup.modules.send_modify(|modules| {
+        if let Some(display) = modules.get_mut("display") {
+            display.since = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        }
+    });
+    let quiet = tokio::time::timeout(Duration::from_millis(300), next_report(&mut setup)).await;
+    assert!(
+        quiet.is_err(),
+        "a timestamp alone shouldn't be reported at once"
+    );
 }

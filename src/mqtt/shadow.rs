@@ -255,7 +255,13 @@ impl Manager {
                 }
             }
             Request::Desired { shadow, sender } => {
-                self.shadows.entry(shadow).or_default().desired = Some(sender);
+                self.shadows.entry(shadow.clone()).or_default().desired = Some(sender);
+                // Asked for while connected (a module restarted): read the shadow again, so the
+                // new receiver gets the full desired state, not just later deltas.
+                if let Some(thing) = self.thing() {
+                    self.mqtt
+                        .publish_now(format!("{}/get", base(&thing, &shadow)), b"{}".to_vec());
+                }
             }
         }
     }
@@ -386,14 +392,14 @@ impl Manager {
 }
 
 /// Reports as module tests see them: (shadow, reported).
-#[cfg(all(test, feature = "module-display"))]
+#[cfg(test)]
 pub(crate) type TestReports = mpsc::UnboundedReceiver<(String, Map<String, Value>)>;
 /// Desired-state subscriptions as module tests see them: (shadow, where deltas go).
-#[cfg(all(test, feature = "module-display"))]
+#[cfg(test)]
 pub(crate) type TestDesired = mpsc::UnboundedReceiver<(String, mpsc::UnboundedSender<Value>)>;
 
-// Module tests only, so far the display's.
-#[cfg(all(test, feature = "module-display"))]
+// Module and supervisor tests.
+#[cfg(test)]
 impl ShadowHandle {
     /// A handle for module tests: reports arrive on the returned channel as (shadow, reported),
     /// and each `desired` call gets the matching sender from the second channel.

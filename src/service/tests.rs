@@ -107,6 +107,7 @@ fn timing() -> Timing {
         shadows: crate::mqtt::shadow::Timing::default(),
         router: crate::router::Timing::default(),
         clock: crate::clock::Timing::default(),
+        modules: crate::modules::supervisor::Timing::default(),
     }
 }
 

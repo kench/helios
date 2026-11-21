@@ -334,6 +334,28 @@ async fn passes_desired_state_to_the_module() {
 }
 
 #[tokio::test]
+async fn reads_the_shadow_again_for_a_desired_request_made_while_connected() {
+    let mut setup = setup();
+    connect(&setup, 1);
+    // A restarted module asks again mid-session: it gets a get, so the full desired state.
+    let mut desired = setup.shadows.desired("helios");
+    let (topic, _) = next(&mut setup).await;
+    assert_eq!(topic, "$aws/things/t-1/shadow/name/helios/get");
+
+    reply(
+        &setup,
+        "get/accepted",
+        json!({"state": {"desired": {"idle": {"template": "status"}}}}),
+    )
+    .await;
+    let state = tokio::time::timeout(WAIT, desired.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state, json!({"idle": {"template": "status"}}));
+}
+
+#[tokio::test]
 async fn skips_documents_too_large_for_aws_iot() {
     let mut setup = setup();
     connect(&setup, 1);
