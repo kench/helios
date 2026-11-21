@@ -143,9 +143,8 @@ impl PendingCommand {
         let _ = self.reply.send(outcome);
     }
 
-    /// A command for module tests (so far the display's), with the channel its answer
-    /// arrives on.
-    #[cfg(all(test, feature = "module-display"))]
+    /// A command for module tests, with the channel its answer arrives on.
+    #[cfg(all(test, any(feature = "module-display", feature = "module-usb")))]
     pub(crate) fn for_test(
         module: &str,
         name: &str,

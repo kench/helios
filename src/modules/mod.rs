@@ -2,8 +2,9 @@
 //! the framework that runs them (LLD 5, section 14; LLD 8, section 3).
 //!
 //! - `display`: screens on the scanner's framebuffer (LLD 9).
+//! - `usb`: USB devices arriving and leaving, from kernel uevents and sysfs (LLD 5).
 //!
-//! Each module is behind a Cargo feature (`module-display`), off by default, so a device's build
+//! Each module is behind a Cargo feature (`module-display`, `module-usb`), off by default, so a device's build
 //! carries only the modules it uses. In a build without it, the module's config section is
 //! reported as unused, like any other unknown section.
 //!
@@ -28,6 +29,8 @@ use crate::router::PendingCommand;
 #[cfg(feature = "module-display")]
 pub mod display;
 pub mod supervisor;
+#[cfg(feature = "module-usb")]
+pub mod usb;
 
 /// What a module's run returns.
 pub type ModuleFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ModuleError>> + Send + 'a>>;

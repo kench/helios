@@ -14,7 +14,7 @@ src/identity/      PKCS#11 token, rustls signer, PINs, bootstrap client, identit
 src/credentials/   AWS credentials through the AWS IoT credentials provider
 src/mqtt/          connection manager, envelopes, shadow manager, the helios shadow (LLD 2)
 src/router/        command router; CommandTransport (custom cmd/rsp topics now)
-src/clock/         clock checks (LLD 1, 4.11); kernel.rs holds the only allowed unsafe code
+src/clock/         clock checks (LLD 1, 4.11); kernel.rs holds an allowed unsafe call (adjtimex)
 src/modules/       device modules behind Cargo features (display: LLD 9), the Module trait and
                    the supervisor that restarts them (LLD 5, section 14)
 src/provision/     `helios provision` (challenge key, show, verify)
@@ -64,8 +64,11 @@ version rather than moving the tag.
 ## Rules
 
 - Conventional Commits for commits and PR titles (checked in CI); squash merges.
-- `unsafe_code = "deny"`. The only exception is the read-only `adjtimex` call in
-  `src/clock/kernel.rs`; any other `unsafe` needs the owner's OK. Prefer safe crates (`rustix`).
+- `unsafe_code = "deny"`. The approved exceptions: the read-only `adjtimex` call in
+  `src/clock/kernel.rs`, and registering owned descriptors with tokio
+  (`AsyncFd::register_with_interest`) in `src/modules/usb/uevent.rs` and `mounts.rs`, since tokio
+  deprecated its safe-looking constructors as unsound. Any other `unsafe` needs the owner's OK.
+  Prefer safe crates (`rustix`).
 - `unwrap_used` is denied. Document errors and panics on public items; keep 90% line coverage.
 - Never log or print PINs, and never put them in process arguments.
 - Modules are Cargo features, off by default; a module's config section is ignored in builds

@@ -99,6 +99,9 @@ pub struct Config {
     /// The `[modules.display]` settings, when it's enabled (LLD 9).
     #[cfg(feature = "module-display")]
     pub display: Option<DisplaySettings>,
+    /// Enabled USB monitoring settings.
+    #[cfg(feature = "module-usb")]
+    pub usb: Option<crate::modules::usb::UsbSettings>,
     /// Sections this version doesn't use: modules as `modules.<name>`, then top-level sections.
     pub ignored_sections: Vec<String>,
 }
@@ -140,6 +143,8 @@ struct File {
 /// `[modules.*]`: the ones this build has, and the rest, which are ignored.
 #[derive(Debug, Default, Deserialize)]
 struct ModulesSection {
+    #[cfg(feature = "module-usb")]
+    usb: Option<crate::modules::usb::UsbSettings>,
     #[cfg(feature = "module-display")]
     display: Option<DisplaySection>,
     #[serde(flatten)]
@@ -316,6 +321,13 @@ impl File {
                 .modules
                 .display
                 .map(DisplaySection::check)
+                .transpose()?
+                .flatten(),
+            #[cfg(feature = "module-usb")]
+            usb: self
+                .modules
+                .usb
+                .map(crate::modules::usb::UsbSettings::check)
                 .transpose()?
                 .flatten(),
             ignored_sections: self

@@ -10,6 +10,8 @@
 //! (NetworkManager Wi-Fi MAC randomization, or a board that makes one up at boot) wouldn't
 //! match the bootstrap service's records.
 
+use crate::sysfs::on_usb;
+
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -272,17 +274,6 @@ fn is_built_in(interface: &Path) -> bool {
         return false;
     };
     !on_usb(&device)
-}
-
-/// Whether the device sits below a USB bus in the sysfs device tree (a `usbN` root hub).
-fn on_usb(device: &Path) -> bool {
-    device.components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .and_then(|name| name.strip_prefix("usb"))
-            .is_some_and(|bus| !bus.is_empty() && bus.bytes().all(|b| b.is_ascii_digit()))
-    })
 }
 
 /// The permanent MAC: from the kernel if it reports one, otherwise the current address if it

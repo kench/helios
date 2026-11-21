@@ -44,8 +44,19 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[cfg(feature = "module-usb")]
+mod usb;
+
 #[derive(Debug, Subcommand)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "only one command is parsed per process"
+)]
 enum Command {
+    /// Inspect USB devices and kernel events.
+    #[cfg(feature = "module-usb")]
+    #[command(subcommand)]
+    Usb(usb::Command),
     /// Set up and inspect the device's token.
     Provision(ProvisionArgs),
 }
@@ -305,6 +316,8 @@ pub fn run(args: impl IntoIterator<Item = OsString>, console: &mut dyn Console) 
     let result = match cli.command {
         None => return crate::service::main(&cli.config),
         Some(Command::Provision(args)) => provision(&args, console),
+        #[cfg(feature = "module-usb")]
+        Some(Command::Usb(command)) => usb::run(command, console.out()),
     };
     match result {
         Ok(()) => EXIT_OK,

@@ -141,6 +141,8 @@ impl From<StartError> for StartFailure {
 
 /// The running service.
 pub struct Service {
+    #[cfg(feature = "module-usb")]
+    usb: Option<crate::modules::usb::UsbHandle>,
     identity: IdentityHandle,
     credentials: HeliosCredentialsProvider,
     mqtt: MqttHandle,
@@ -295,6 +297,15 @@ impl Service {
             })?;
             enabled.push(Arc::new(module));
         }
+        #[cfg(feature = "module-usb")]
+        let usb = config.usb.map(|settings| {
+            let handle = crate::modules::usb::UsbHandle::default();
+            enabled.push(Arc::new(crate::modules::usb::UsbModule::new(
+                settings,
+                handle.clone(),
+            )));
+            handle
+        });
         let (module_states, modules) = supervisor::start(
             enabled,
             &supervisor::Deps {
@@ -322,6 +333,8 @@ impl Service {
         );
         let routing = tokio::spawn(route(incoming, shadow_tx, commands_tx));
         Ok(Self {
+            #[cfg(feature = "module-usb")]
+            usb,
             identity,
             credentials,
             mqtt,
@@ -342,6 +355,13 @@ impl Service {
             cancel,
             mqtt_cancel,
         })
+    }
+
+    /// The USB monitor's handle when enabled.
+    #[cfg(feature = "module-usb")]
+    #[must_use]
+    pub fn usb(&self) -> Option<&crate::modules::usb::UsbHandle> {
+        self.usb.as_ref()
     }
 
     /// The device identity.

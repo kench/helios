@@ -76,6 +76,8 @@ fn local_config(service: &MockService, pin_dir: &Path) -> Config {
         },
         #[cfg(feature = "module-display")]
         display: None,
+        #[cfg(feature = "module-usb")]
+        usb: None,
         ignored_sections: vec!["modules.usb".into()],
     }
 }
