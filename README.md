@@ -45,7 +45,8 @@ manager, keeps temporary AWS credentials fresh from the AWS IoT credentials prov
 sections 3 to 6), and keeps an MQTT 3.1.1 connection to AWS IoT Core (LLD 2, section 6): client
 ID = thing name, the token-backed TLS identity, a clean session, `lifecycle.online` after each
 connect and `lifecycle.offline` as the Last Will and on shutdown, and a bounded offline queue for
-events. It reports the `helios` shadow, answers commands through the router (`helios.ping`
+events. It reports the `helios` shadow (urgent changes at once, the rest at most once per
+`mqtt.helios_shadow_interval_s`, 60 s by default), answers commands through the router (`helios.ping`
 for now), and checks the clock (LLD 1, section 4.11): the kernel's NTP state, the offset from
 server time in replies it gets anyway, and, if the platform writes `/run/helios/boot-clock`
 before NTP runs, how far off the clock was at power-on. It reports them in the shadow's `clock`

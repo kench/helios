@@ -27,6 +27,7 @@ use crate::identity::manager::CertificateSource;
 use crate::identity::pin::PinSpec;
 use crate::identity::signer::DEFAULT_SIGN_TIMEOUT;
 use crate::identity::tls;
+use crate::mqtt::helios_shadow;
 use crate::mqtt::{MAX_KEEP_ALIVE, MIN_KEEP_ALIVE, MqttSettings, PORT_443, PORT_8883};
 use crate::provision::DEFAULT_MODULE;
 
@@ -163,6 +164,7 @@ struct MqttSection {
     keep_alive_s: Option<u64>,
     queue_messages: Option<usize>,
     commands: Option<String>,
+    helios_shadow_interval_s: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -339,10 +341,24 @@ impl MqttSection {
                 ));
             }
         }
+        let helios_shadow_interval = self
+            .helios_shadow_interval_s
+            .map_or(defaults.helios_shadow_interval, Duration::from_secs);
+        if !(helios_shadow::MIN_INTERVAL..=helios_shadow::MAX_INTERVAL)
+            .contains(&helios_shadow_interval)
+        {
+            return Err(format!(
+                "mqtt.helios_shadow_interval_s must be {} to {}, not {}",
+                helios_shadow::MIN_INTERVAL.as_secs(),
+                helios_shadow::MAX_INTERVAL.as_secs(),
+                helios_shadow_interval.as_secs()
+            ));
+        }
         Ok(MqttSettings {
             port,
             keep_alive,
             queue_messages,
+            helios_shadow_interval,
         })
     }
 }

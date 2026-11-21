@@ -1,9 +1,10 @@
 //! The `helios` shadow (LLD 2, section 5): the agent's own reported state, from the identity,
 //! the credentials and the MQTT connection. Reported only; it accepts no desired state.
 //!
-//! It's reported whenever something meaningful changes (the identity state, the MQTT session, a
-//! credentials error, the clock checks' results). A change to counters or timestamps alone is reported at most once a
-//! minute.
+//! Urgent changes are reported at once: the identity state, the MQTT session or disconnect
+//! reason, a credentials error, and the clock's synced flag, offset or boot offset. Other changes
+//! (timestamps, counters, the clock's drift and error bounds) are reported at most once per
+//! `mqtt.helios_shadow_interval_s`, 60 s by default.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,8 +23,15 @@ use crate::mqtt::shadow::ShadowHandle;
 /// The shadow's name.
 pub const SHADOW: &str = "helios";
 
-/// How often a change to counters alone is reported.
-pub const COUNTER_INTERVAL: Duration = Duration::from_secs(60);
+/// The default `mqtt.helios_shadow_interval_s`: how often changes that aren't urgent are
+/// reported.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The shortest `mqtt.helios_shadow_interval_s`.
+pub const MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The longest `mqtt.helios_shadow_interval_s`: a day.
+pub const MAX_INTERVAL: Duration = Duration::from_secs(86_400);
 
 /// What the reporter watches.
 pub struct Sources {
@@ -64,41 +72,58 @@ async fn run(
 ) {
     // The last report: its state, its significant part, and when it was sent.
     let mut last: Option<(Map<String, Value>, Value, Instant)> = None;
-    let mut timer = tokio::time::interval(interval);
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let reported = reported(&sources);
         let key = significant(&reported);
+        // When a change that isn't urgent may go: `interval` after the last report.
+        let mut waiting_until = None;
         let due = match &last {
             None => true,
             Some((previous, previous_key, at)) => {
-                *previous_key != key || (*previous != reported && at.elapsed() >= interval)
+                if *previous_key != key {
+                    true
+                } else if *previous != reported {
+                    waiting_until = Some(*at + interval);
+                    at.elapsed() >= interval
+                } else {
+                    false
+                }
             }
         };
         if due {
             shadows.report(SHADOW, reported.clone());
             last = Some((reported, key, Instant::now()));
+            waiting_until = None;
         }
+        let wake = async {
+            match waiting_until {
+                Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             () = cancel.cancelled() => return,
             changed = sources.identity.changed() => if changed.is_err() { return },
             changed = sources.credentials.changed() => if changed.is_err() { return },
             changed = sources.mqtt.changed() => if changed.is_err() { return },
             changed = sources.clock.changed() => if changed.is_err() { return },
-            _ = timer.tick() => {}
+            () = wake => {}
         }
     }
 }
 
-/// The parts of the state that are reported as soon as they change.
+/// The parts of the state that are reported as soon as they change. The clock's drift, error
+/// bounds and offset details move with every NTP adjustment and sample, so they wait for the
+/// interval; its offset only changes when the clock moves by a second or more.
 fn significant(reported: &Map<String, Value>) -> Value {
     json!({
         "identity": reported["identity"]["state"],
         "credentials_error": reported["credentials"]["last_error"],
         "mqtt_session": reported["mqtt"]["session"],
         "mqtt_reason": reported["mqtt"]["last_disconnect_reason"],
-        // The clock checks publish only changes worth reporting.
-        "clock": reported["clock"],
+        "clock_synced": reported["clock"]["synced"],
+        "clock_offset": reported["clock"]["offset_ms"],
+        "clock_boot_offset": reported["clock"]["boot_offset_s"],
     })
 }
 

@@ -370,6 +370,8 @@ impl Manager {
                 );
                 continue;
             }
+            tracing::debug!(shadow = %name, bytes = bytes.len(), "shadow update sent");
+            tracing::trace!(shadow = %name, document = %document, "shadow update");
             self.mqtt
                 .publish_now(format!("{}/update", base(&thing, name)), bytes);
             shadow.in_flight = Some(InFlight {
