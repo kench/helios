@@ -27,6 +27,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::backoff::Backoff;
+use crate::modules::{Module, ModuleContext, ModuleFuture};
 use crate::mqtt::manager::MqttStatus;
 use crate::mqtt::shadow::ShadowHandle;
 use crate::router::{Outcome, PendingCommand, codes};
@@ -75,8 +76,79 @@ pub struct Inputs {
     pub sysfs: PathBuf,
 }
 
-/// Starts the display module. It runs until `cancel` is cancelled, then shows "Helios stopped"
-/// and ends, so await the handle before exiting.
+/// The display module, for the supervisor. The fonts are loaded once, when it's created; each
+/// run starts from them with a fresh screen state.
+pub struct DisplayModule {
+    settings: DisplaySettings,
+    fonts: Fonts,
+    /// The configured bold font and whether it loaded; null for the built-in one.
+    bold_font: Value,
+}
+
+impl DisplayModule {
+    /// Loads the fonts, and the configured bold font if there is one. A bold font that can't be
+    /// read or parsed is reported in the shadow, and the built-in one is used.
+    ///
+    /// # Errors
+    ///
+    /// If the compiled-in fonts can't be loaded.
+    pub fn new(settings: DisplaySettings) -> Result<Self, String> {
+        let mut fonts = Fonts::load()?;
+        let bold_font = settings.bold_font.as_ref().map_or(Value::Null, |path| {
+            let loaded = std::fs::read(path)
+                .map_err(|error| format!("can't read it: {error}"))
+                .and_then(|bytes| fonts.replace_bold(bytes));
+            match loaded {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), "bold font loaded");
+                    json!({"path": path, "error": null})
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "bold font not loaded; using the built-in Noto Sans Bold"
+                    );
+                    json!({"path": path, "error": error})
+                }
+            }
+        });
+        Ok(Self {
+            settings,
+            fonts,
+            bold_font,
+        })
+    }
+
+    fn display(&self, inputs: Inputs) -> Display {
+        let mut display = Display::new(self.settings.clone(), inputs, self.fonts.clone());
+        display.bold_font = self.bold_font.clone();
+        display
+    }
+}
+
+impl Module for DisplayModule {
+    fn name(&self) -> &'static str {
+        MODULE
+    }
+
+    fn run(&self, ctx: ModuleContext) -> ModuleFuture<'_> {
+        Box::pin(async move {
+            let inputs = Inputs {
+                commands: ctx.commands,
+                desired: ctx.desired,
+                shadows: ctx.shadows,
+                mqtt: ctx.mqtt.status(),
+                sysfs: ctx.sysfs,
+            };
+            self.display(inputs).run(ctx.cancel).await;
+            Ok(())
+        })
+    }
+}
+
+/// Starts the display module outside the supervisor. It runs until `cancel` is cancelled, then
+/// shows "Helios stopped" and ends, so await the handle before exiting.
 ///
 /// # Errors
 ///
@@ -90,29 +162,8 @@ pub fn start(
     inputs: Inputs,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>, String> {
-    let mut fonts = Fonts::load()?;
-    let bold_font = settings.bold_font.as_ref().map(|path| {
-        let loaded = std::fs::read(path)
-            .map_err(|error| format!("can't read it: {error}"))
-            .and_then(|bytes| fonts.replace_bold(bytes));
-        match loaded {
-            Ok(()) => {
-                tracing::info!(path = %path.display(), "bold font loaded");
-                json!({"path": path, "error": null})
-            }
-            Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "bold font not loaded; using the built-in Noto Sans Bold"
-                );
-                json!({"path": path, "error": error})
-            }
-        }
-    });
-    let mut display = Display::new(settings, inputs, fonts);
-    display.bold_font = bold_font.unwrap_or(Value::Null);
-    Ok(tokio::spawn(display.run(cancel)))
+    let module = DisplayModule::new(settings)?;
+    Ok(tokio::spawn(module.display(inputs).run(cancel)))
 }
 
 /// What's on screen, or should be.

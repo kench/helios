@@ -61,6 +61,7 @@ pub struct TextBox {
 }
 
 /// The fonts and their glyph cache.
+#[derive(Clone)]
 pub struct Fonts {
     regular: Font,
     bold: Font,

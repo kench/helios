@@ -4,7 +4,8 @@
 //! Urgent changes are reported at once: the identity state, the MQTT session or disconnect
 //! reason, a credentials error, and the clock's synced flag, offset or boot offset. Other changes
 //! (timestamps, counters, the clock's drift and error bounds) are reported at most once per
-//! `mqtt.helios_shadow_interval_s`, 60 s by default.
+//! `mqtt.helios_shadow_interval_s`, 60 s by default. Each module's state (`modules`) is urgent
+//! too, except when it last changed.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -16,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::clock::ClockStatus;
 use crate::credentials::provider::CredentialsStatus;
 use crate::identity::manager::IdentityState;
+use crate::modules::ModuleStates;
 use crate::mqtt::envelope::timestamp;
 use crate::mqtt::manager::MqttStatus;
 use crate::mqtt::shadow::ShadowHandle;
@@ -43,6 +45,8 @@ pub struct Sources {
     pub mqtt: watch::Receiver<MqttStatus>,
     /// The clock checks' results (LLD 1, section 4.11).
     pub clock: watch::Receiver<ClockStatus>,
+    /// Each device module's state, from the supervisor.
+    pub modules: watch::Receiver<ModuleStates>,
     /// The kernel's boot ID.
     pub boot_id: Option<String>,
     /// When Helios started.
@@ -107,6 +111,7 @@ async fn run(
             changed = sources.credentials.changed() => if changed.is_err() { return },
             changed = sources.mqtt.changed() => if changed.is_err() { return },
             changed = sources.clock.changed() => if changed.is_err() { return },
+            changed = sources.modules.changed() => if changed.is_err() { return },
             () = wake => {}
         }
     }
@@ -124,6 +129,19 @@ fn significant(reported: &Map<String, Value>) -> Value {
         "clock_synced": reported["clock"]["synced"],
         "clock_offset": reported["clock"]["offset_ms"],
         "clock_boot_offset": reported["clock"]["boot_offset_s"],
+        "modules": reported["modules"]
+            .as_object()
+            .map(|modules| {
+                modules
+                    .iter()
+                    .map(|(name, module)| {
+                        (
+                            name.clone(),
+                            json!([module["state"], module["restarts"], module["last_error"]]),
+                        )
+                    })
+                    .collect::<Map<String, Value>>()
+            }),
     })
 }
 
@@ -133,6 +151,22 @@ fn reported(sources: &Sources) -> Map<String, Value> {
     let credentials = sources.credentials.borrow().clone();
     let mqtt = sources.mqtt.borrow().clone();
     let clock = sources.clock.borrow().clone();
+    let modules: Map<String, Value> = sources
+        .modules
+        .borrow()
+        .iter()
+        .map(|(name, status)| {
+            (
+                (*name).to_owned(),
+                json!({
+                    "state": status.state.as_str(),
+                    "restarts": status.restarts,
+                    "last_error": status.last_error,
+                    "since": timestamp(status.since),
+                }),
+            )
+        })
+        .collect();
     let mut identity_json = json!({"state": identity.name()});
     match &identity {
         IdentityState::Ready(ready) => {
@@ -182,6 +216,7 @@ fn reported(sources: &Sources) -> Map<String, Value> {
             "boot_offset_s": clock.boot_offset_s,
         }),
     );
+    reported.insert("modules".into(), Value::Object(modules));
     reported
 }
 
