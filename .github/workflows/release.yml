@@ -72,7 +72,8 @@ jobs:
         run: cargo zigbuild --locked --release --target "$TARGET.$GLIBC"
 
       - name: Package
-        run: cargo deb --target "$TARGET" --no-build
+        # The release profile already strips (Cargo.toml); the runner has no arm64 strip.
+        run: cargo deb --target "$TARGET" --no-build --no-strip
 
       - name: Upload the package
         uses: actions/upload-artifact@v7
