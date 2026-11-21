@@ -51,13 +51,26 @@ for now), and checks the clock (LLD 1, section 4.11): the kernel's NTP state, th
 server time in replies it gets anyway, and, if the platform writes `/run/helios/boot-clock`
 before NTP runs, how far off the clock was at power-on. It reports them in the shadow's `clock`
 object and logs offsets over `clock.warn_offset_s` (60 s) as warnings and over 240 s as errors.
-It never sets the clock. The other modules come later (LLD 2).
+It never sets the clock.
+
+Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
+
+- `display` (LLD 9): screens on the scanner's framebuffer, drawn from templates compiled into
+  Helios (`status`, `message`, `result`, `blank`, `test`) with Noto Sans (`assets/fonts`, SIL
+  Open Font License). The idle `status` screen shows the clock in `time_zone`, the thing name,
+  the MQTT connection and the device's address. `display.show` (`template`, `fields`,
+  `duration_s`), `display.clear` and `display.status` change it, and the `display` shadow's
+  desired state `{"idle": {"template": …, "fields": …}}` sets the idle screen. It writes only the
+  rows that change, needs no `unsafe` code, and shows "Helios stopped" on shutdown. It needs the
+  `video` group.
+
+The other modules come later.
 
 `dist/helios.toml` is an example config. With the bootstrap service it needs only the module
 and CA paths. For development without the service, set `identity.pin = "file:<path>"` and fill
 in `device.thing_name`, `identity.token_label`, `identity.key_label` and the four `[aws]`
 endpoint settings. Sections this version doesn't use, such as `[modules.usb]`, are logged and
-ignored; unknown keys in a known section are errors.
+ignored (as `modules.usb`); unknown keys in a known section are errors.
 
 ```sh
 SOFTHSM2_CONF=/etc/helios/softhsm2.conf helios --config ./helios.toml

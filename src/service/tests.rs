@@ -74,7 +74,8 @@ fn local_config(service: &MockService, pin_dir: &Path) -> Config {
             boot_mark: None,
             ..crate::clock::ClockSettings::default()
         },
-        ignored_sections: vec!["modules".into()],
+        display: None,
+        ignored_sections: vec!["modules.usb".into()],
     }
 }
 
@@ -414,4 +415,49 @@ async fn routes_shadow_replies_and_commands() {
     assert!(shadows.recv().await.is_none());
     assert_eq!(commands.recv().await.unwrap().topic, "helios/t-1/cmd/video");
     assert!(commands.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn runs_the_display_module_and_waits_for_it_on_shutdown() {
+    let device_ca = ca("Helios test device CA");
+    let service = MockService::start_mtls(&device_ca).await;
+    service.respond(credentials_response());
+    let pin = pin_file("1234");
+    let dir = tempfile::tempdir().unwrap();
+    let graphics = dir.path().join("sys/class/graphics/fb0");
+    std::fs::create_dir_all(&graphics).unwrap();
+    std::fs::write(graphics.join("virtual_size"), "800,480\n").unwrap();
+    std::fs::write(graphics.join("bits_per_pixel"), "32\n").unwrap();
+    std::fs::write(graphics.join("stride"), "3200\n").unwrap();
+    let framebuffer = dir.path().join("fb0");
+    std::fs::write(&framebuffer, vec![0u8; 800 * 480 * 4]).unwrap();
+    let mut config = local_config(&service, pin.path());
+    config.display = Some(crate::modules::display::DisplaySettings {
+        framebuffer: framebuffer.clone(),
+        idle: crate::modules::display::templates::Screen::Blank,
+        time_zone_name: "UTC".into(),
+        time_zone: jiff::tz::TimeZone::UTC,
+        redraw_interval: Duration::from_secs(10),
+    });
+    let mut platform = platform();
+    platform.sysfs = dir.path().join("sys");
+
+    let helios = Service::start(config, Box::new(token(&device_ca)), &platform, timing()).unwrap();
+    // The blank idle screen is drawn as soon as the module starts.
+    let opaque = |path: &Path| std::fs::read(path).unwrap()[3] == 0xff;
+    tokio::time::timeout(WAIT, async {
+        while !opaque(&framebuffer) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the idle screen is drawn");
+    let (stop, task) = run(helios);
+    stop.send(()).unwrap();
+    let code = tokio::time::timeout(WAIT, task).await.unwrap().unwrap();
+
+    assert_eq!(code, EXIT_OK);
+    // "Helios stopped" on the dark background, written before the service returned.
+    let bytes = std::fs::read(&framebuffer).unwrap();
+    assert_eq!(&bytes[..4], &[30, 22, 18, 255]);
 }

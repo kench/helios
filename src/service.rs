@@ -38,6 +38,7 @@ use crate::identity::manager::{
 };
 use crate::identity::pin::credentials_directory_from_env;
 use crate::identity::token::TokenBackend;
+use crate::modules::display;
 use crate::mqtt::helios_shadow::{self, Sources};
 use crate::mqtt::manager::{Incoming, MqttHandle, MqttManager, Options as MqttOptions};
 use crate::mqtt::shadow::{ShadowHandle, ShadowManager};
@@ -80,6 +81,9 @@ pub struct Timing {
 
 /// Incoming MQTT messages wait here until the router and shadow manager read them.
 const INCOMING_CAPACITY: usize = 64;
+
+/// How long modules get to finish after shutdown starts.
+const MODULE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Platform {
     /// The real device.
@@ -143,6 +147,9 @@ pub struct Service {
     mqtt_task: JoinHandle<()>,
     /// Routes incoming MQTT messages, runs the shadow manager and reports the `helios` shadow.
     helpers: Vec<JoinHandle<()>>,
+    /// The device modules, which get time to finish after `cancel` (the display shows that
+    /// Helios stopped).
+    modules: Vec<JoinHandle<()>>,
     cancel: CancellationToken,
     /// Stops MQTT before everything else.
     mqtt_cancel: CancellationToken,
@@ -283,6 +290,24 @@ impl Service {
             mqtt.status(),
             started,
         );
+        let mut modules = Vec::new();
+        if let Some(settings) = config.display {
+            let inputs = display::Inputs {
+                commands: router.register(display::MODULE),
+                desired: shadows.desired(display::MODULE),
+                shadows: shadows.clone(),
+                mqtt: mqtt.status(),
+                sysfs: platform.sysfs.clone(),
+            };
+            modules.push(
+                display::start(settings, inputs, cancel.clone()).map_err(|message| {
+                    StartFailure {
+                        message,
+                        config: false,
+                    }
+                })?,
+            );
+        }
         let routing = tokio::spawn(route(incoming, shadow_tx, commands_tx));
         Ok(Self {
             identity,
@@ -301,6 +326,7 @@ impl Service {
                 helios_commands,
                 clock_task,
             ],
+            modules,
             cancel,
             mqtt_cancel,
         })
@@ -344,6 +370,7 @@ impl Service {
             credentials_task,
             mqtt_task,
             helpers,
+            modules,
             cancel,
             mqtt_cancel,
             ..
@@ -366,6 +393,14 @@ impl Service {
         };
         cancel.cancel();
         let _ = credentials_task.await;
+        for module in modules {
+            if tokio::time::timeout(MODULE_STOP_TIMEOUT, module)
+                .await
+                .is_err()
+            {
+                tracing::warn!("a module didn't stop in time");
+            }
+        }
         for helper in helpers {
             helper.abort();
         }
