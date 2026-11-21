@@ -1,6 +1,6 @@
 [package]
 name = "helios"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 publish = false
 license = "CC0-1.0"
@@ -8,6 +8,11 @@ description = "Helios on-device agent for AWS IoT Core"
 
 # The Debian package for the relay and transcoder boards (arm64), built by the release workflow
 # with `cargo deb --target aarch64-unknown-linux-gnu --no-build` after a zigbuild for glibc 2.31.
+[profile.release]
+# Strip symbols at link time, for every target (cross builds included), so packaging needs no
+# target-specific strip tool.
+strip = true
+
 [package.metadata.deb]
 maintainer = "Kenley <kench@users.noreply.github.com>"
 copyright = "Kenley"
