@@ -4,7 +4,9 @@
 //! section 4: nginx under systemd, with its publish hook and statistics page in [`rtmp`]) or a
 //! test pattern, and go to `direct` SRT outputs or `srtla` ones through `srtla_send` (section 5).
 //! Each configured stream is `live` (run whenever its input is there) or `stopped`, from config,
-//! the `stream` shadow's desired state, or `stream.start` / `stream.stop`. The module starts
+//! the `stream` shadow's desired state, or `stream.start` / `stream.stop`. The desired state can
+//! also change a stream's source, profile, destination and ceiling percentage (HLD section
+//! 7.3.7), checked as `helios.toml` is; what it refuses is reported in the stream's `rejected`. The module starts
 //! ffmpeg when a live stream's input is there, reads its `-progress` output, restarts it with
 //! backoff when it exits or stalls, and stops it when the input goes or the stream is stopped.
 //!
@@ -16,6 +18,7 @@ mod addrs;
 mod client;
 mod control;
 pub mod daemon;
+mod destination;
 #[cfg(test)]
 mod e2e;
 mod encoder;
@@ -42,12 +45,13 @@ use crate::router::{Outcome, codes};
 use super::{Module, ModuleContext, ModuleError, ModuleFuture};
 use addrs::Address;
 pub use client::StreamClient;
+use destination::Destination;
 use encoder::{Backend, Signal, Watch};
 use ffmpeg::{CameraNodes, Progress};
 use process::{Job, JobEvent, JobSpec, Spawner, Tagged};
 use rtmp::IngestEvent;
 pub use settings::StreamSettings;
-use settings::{Source, Stream};
+use settings::{Output, Profile, Source, Stream};
 use srtla::Senders;
 
 /// The module name: commands, events, shadow and config section.
@@ -209,10 +213,30 @@ impl Running {
     }
 }
 
+/// A desired value the stream refused, for the shadow's `rejected`.
+#[derive(Debug, Clone)]
+struct Rejected {
+    /// What was asked, so the same value sent again keeps its first time.
+    value: Value,
+    reason: String,
+    at: SystemTime,
+}
+
 /// One stream's state.
 struct Entry {
     id: String,
+    /// The stream as `helios.toml` defines it.
+    configured: Stream,
+    /// The stream as it runs: `configured` with the desired state's source, profile and
+    /// destination (`output` is then `stream:<id>`, and `streamid` the destination's).
     config: Stream,
+    /// A destination set through the shadow, and the output it makes.
+    destination: Option<(Destination, Output)>,
+    /// A `source_ceiling_percent` set through the shadow.
+    ceiling_override: Option<u32>,
+    /// Desired values refused, by setting: `source`, `profile`, `destination`,
+    /// `source_ceiling_percent`, `bitrate` or `state`.
+    rejected: BTreeMap<&'static str, Rejected>,
     desired_live: bool,
     /// The bitrate in use: the override if there is one, else the profile's.
     bitrate_kbps: u32,
@@ -261,17 +285,57 @@ impl Entry {
         })
     }
 
-    fn status(&self, with_log: bool) -> Value {
-        let mut source = match &self.config.source {
-            Source::Camera { video, audio } => {
-                json!({"type": "camera", "video": video, "audio": audio})
-            }
-            Source::Rtmp { camera } => json!({"type": "rtmp", "camera": camera}),
-            Source::Test { size, fps } => json!({"type": "test", "size": size, "fps": fps}),
-        };
+    /// The output it sends to: its destination's, or the configured one.
+    fn output<'s>(&'s self, settings: &'s StreamSettings) -> Option<&'s Output> {
+        match &self.destination {
+            Some((_, output)) => Some(output),
+            None => settings.outputs.get(&self.config.output),
+        }
+    }
+
+    /// Its profile, with the ceiling percentage set through the shadow.
+    fn profile(&self, settings: &StreamSettings) -> Option<Profile> {
+        let mut profile = settings.profiles.get(&self.config.profile)?.clone();
+        if let Some(percent) = self.ceiling_override {
+            profile.source_ceiling_percent = percent;
+        }
+        Some(profile)
+    }
+
+    /// The destination URL in use, in the Control API's normal form.
+    fn destination_url(&self, settings: &StreamSettings) -> Value {
+        match &self.destination {
+            Some((destination, _)) => json!(destination.url()),
+            None => settings
+                .outputs
+                .get(&self.config.output)
+                .map_or(Value::Null, |output| {
+                    json!(Destination::of_output(output, &self.config.streamid).url())
+                }),
+        }
+    }
+
+    fn status(&self, settings: &StreamSettings, with_log: bool) -> Value {
+        let mut source = source_value(&self.config.source);
         if let (Some(source), Value::Object(camera)) = (source.as_object_mut(), &self.camera) {
             source.extend(camera.clone());
         }
+        let rejected: Vec<Value> = self
+            .rejected
+            .iter()
+            .map(|(setting, rejected)| {
+                json!({"setting": setting, "reason": rejected.reason, "at": timestamp(rejected.at)})
+            })
+            .collect();
+        // Every key, null when not overridden: the shadow only removes a key set to null.
+        let overrides = json!({
+            "source": (self.config.source != self.configured.source)
+                .then(|| source_value(&self.config.source)),
+            "profile": (self.config.profile != self.configured.profile)
+                .then_some(&self.config.profile),
+            "destination": self.destination.as_ref().map(|(destination, _)| destination.url()),
+            "source_ceiling_percent": self.ceiling_override,
+        });
         let mut status = json!({
             "state": self.state.as_str(),
             "since": timestamp(self.since),
@@ -284,7 +348,11 @@ impl Entry {
             "bitrate_ceiling_kbps": self.source_ceiling,
             "encoder": self.encoder(),
             "output": self.config.output,
+            "destination": self.destination_url(settings),
+            "source_ceiling_percent": self.profile(settings).map(|p| p.source_ceiling_percent),
             "last_error": self.last_error.as_ref().or(self.unusable.as_ref()),
+            "rejected": rejected,
+            "overrides": overrides,
         });
         if with_log {
             status["log"] = json!(self.lines);
@@ -308,6 +376,8 @@ struct Streams<'a> {
     addresses: Vec<Address>,
     addresses_at: Option<Instant>,
     ingest: Ingest,
+    /// ffmpeg's encoders, once listed: a profile set through the shadow must find its own.
+    encoders: Option<BTreeSet<String>>,
 }
 
 impl<'a> Streams<'a> {
@@ -319,6 +389,10 @@ impl<'a> Streams<'a> {
             .iter()
             .map(|(id, config)| Entry {
                 id: id.clone(),
+                configured: config.clone(),
+                destination: None,
+                ceiling_override: None,
+                rejected: BTreeMap::new(),
                 desired_live: config.desired == "live",
                 bitrate_kbps: module
                     .settings
@@ -361,6 +435,7 @@ impl<'a> Streams<'a> {
             addresses: Vec::new(),
             addresses_at: None,
             ingest: Ingest::default(),
+            encoders: None,
         }
     }
 
@@ -479,7 +554,7 @@ impl<'a> Streams<'a> {
     fn follow_sources(&mut self) {
         for index in 0..self.entries.len() {
             let entry = &self.entries[index];
-            let Some(profile) = self.module.settings.profiles.get(&entry.config.profile) else {
+            let Some(profile) = entry.profile(&self.module.settings) else {
                 continue;
             };
             let source = entry
@@ -491,7 +566,7 @@ impl<'a> Streams<'a> {
             let Some(source_kbps) = source else {
                 continue;
             };
-            let target = encoder::source_ceiling(profile, entry.bitrate_kbps, source_kbps);
+            let target = encoder::source_ceiling(&profile, entry.bitrate_kbps, source_kbps);
             let entry = &mut self.entries[index];
             // Rounded to whole kbps, for the shadow.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -542,6 +617,7 @@ impl<'a> Streams<'a> {
             for entry in &mut self.entries {
                 entry.unusable = missing_encoders(settings, &entry.config, &encoders);
             }
+            self.encoders = Some(encoders);
         }
         let mut snapshot = module.usb.snapshot();
         let mut stats = tokio::time::interval(settings.stats_interval());
@@ -562,7 +638,7 @@ impl<'a> Streams<'a> {
         // Desired state queued before the start (the daemon's saved state) applies before the
         // first pass, so a stream saved as stopped doesn't start for a moment.
         while let Ok(state) = ctx.desired.try_recv() {
-            self.desired(&state);
+            self.desired(&state, &ctx);
         }
         loop {
             let devices = snapshot.borrow_and_update().clone();
@@ -584,7 +660,7 @@ impl<'a> Streams<'a> {
                     None => commands_open = false,
                 },
                 desired = ctx.desired.recv(), if desired_open => match desired {
-                    Some(state) => self.desired(&state),
+                    Some(state) => self.desired(&state, &ctx),
                     None => desired_open = false,
                 },
                 changed = snapshot.changed() => {
@@ -752,11 +828,9 @@ impl<'a> Streams<'a> {
     fn start_job(&mut self, index: usize, ctx: &ModuleContext) {
         let module = self.module;
         let settings = &module.settings;
-        let entry = &mut self.entries[index];
-        let (Some(profile), Some(output)) = (
-            settings.profiles.get(&entry.config.profile),
-            settings.outputs.get(&entry.config.output),
-        ) else {
+        let entry = &self.entries[index];
+        let (Some(profile), Some(output)) = (entry.profile(settings), entry.output(settings))
+        else {
             return;
         };
         let target = ffmpeg::Target {
@@ -777,8 +851,8 @@ impl<'a> Streams<'a> {
             (Source::Rtmp { .. }, _, Some(url)) => encoder::Input::Rtmp(url),
             _ => return,
         };
-        let range = encoder::Range::new(profile, entry.bitrate_kbps, entry.source_ceiling);
-        let plan = encoder::plan(settings, &entry.id, profile, target, input, range);
+        let range = encoder::Range::new(&profile, entry.bitrate_kbps, entry.source_ceiling);
+        let plan = encoder::plan(settings, &entry.id, &profile, target, input, range);
         let backend = profile.encoder;
         if let Err(error) = write_files(&plan.files) {
             let message = format!("can't write {}'s files: {error}", backend.name());
@@ -864,7 +938,10 @@ impl<'a> Streams<'a> {
             .retain(|at| now.duration_since(*at) < Duration::from_secs(60));
         entry.quiet = entry.connections.len() > FLAP_LIMIT;
         if !entry.quiet {
-            let payload = json!({"stream_id": entry.id, "source": entry.status(false)["source"]});
+            let payload = json!({
+                "stream_id": entry.id,
+                "source": entry.status(&self.module.settings, false)["source"],
+            });
             ctx.mqtt.publish_event(MODULE, "stream.connected", payload);
         }
     }
@@ -984,7 +1061,7 @@ impl<'a> Streams<'a> {
             return match id {
                 None => Outcome::Ok(self.statuses(true)),
                 Some(id) => match self.entries.iter().find(|entry| entry.id == id) {
-                    Some(entry) => Outcome::Ok(entry.status(true)),
+                    Some(entry) => Outcome::Ok(entry.status(&self.module.settings, true)),
                     None => Outcome::error(codes::INVALID_MESSAGE, format!("no stream {id:?}")),
                 },
             };
@@ -1012,7 +1089,7 @@ impl<'a> Streams<'a> {
         } else {
             self.set_live(index, false, BitrateChange::Keep);
         }
-        Outcome::Ok(self.entries[index].status(false))
+        Outcome::Ok(self.entries[index].status(&self.module.settings, false))
     }
 
     fn bitrate_allowed(&self, index: usize, bitrate: u32) -> bool {
@@ -1091,15 +1168,15 @@ impl<'a> Streams<'a> {
         let entry = &self.entries[index];
         let (Some(running), Some(profile), Some(output)) = (
             entry.job.as_ref(),
-            settings.profiles.get(&entry.config.profile),
-            settings.outputs.get(&entry.config.output),
+            entry.profile(settings),
+            entry.output(settings),
         ) else {
             return false;
         };
         if !running.backend.reloads() {
             return false;
         }
-        let range = encoder::Range::new(profile, entry.bitrate_kbps, entry.source_ceiling);
+        let range = encoder::Range::new(&profile, entry.bitrate_kbps, entry.source_ceiling);
         let file = encoder::range_file(
             settings,
             running.backend,
@@ -1123,10 +1200,13 @@ impl<'a> Streams<'a> {
         }
     }
 
-    /// The `stream` shadow's desired state: `{"streams": {"<id>": {"state", "bitrate_kbps"}}}`,
-    /// `bitrate_kbps` being an override (`null` for the profile's). A bitrate outside the
-    /// profile's limits is ignored.
-    fn desired(&mut self, state: &Value) {
+    /// The `stream` shadow's desired state (HLD section 7.3.7): `{"streams": {"<id>": {...}}}`
+    /// with `state`, `bitrate_kbps` (an override, `null` for the profile's), and `source`,
+    /// `profile`, `destination` and `source_ceiling_percent` (`null` for `helios.toml`'s). Each
+    /// member present is applied in that order (settings first, so a bitrate is checked against
+    /// the new profile) or refused, and a refusal is reported in the stream's `rejected` until a
+    /// value for that setting is accepted.
+    fn desired(&mut self, state: &Value, ctx: &ModuleContext) {
         let Some(streams) = state.get("streams").and_then(Value::as_object) else {
             return;
         };
@@ -1135,22 +1215,283 @@ impl<'a> Streams<'a> {
                 tracing::warn!(stream = %id, "desired state for an unknown stream");
                 continue;
             };
-            let bitrate = self
-                .bitrate_change(index, desired.get("bitrate_kbps"))
-                .unwrap_or_else(|()| {
-                    tracing::warn!(stream = %id, "desired bitrate_kbps outside the profile's limits");
+            self.desired_settings(index, desired, ctx);
+            let value = desired.get("bitrate_kbps");
+            let bitrate = match self.bitrate_change(index, value) {
+                Ok(change) => {
+                    if value.is_some() {
+                        self.accept(index, "bitrate");
+                    }
+                    change
+                }
+                Err(()) => {
+                    let value = value.cloned().unwrap_or_default();
+                    let reason = "bitrate_kbps is outside the profile's limits".to_owned();
+                    self.reject(index, "bitrate", &value, reason);
                     BitrateChange::Keep
-                });
-            match desired.get("state").and_then(Value::as_str) {
-                Some("live") => self.set_live(index, true, bitrate),
-                Some("stopped") => self.set_live(index, false, bitrate),
-                _ if bitrate != BitrateChange::Keep => {
+                }
+            };
+            match desired.get("state") {
+                Some(value) if value == "live" || value == "stopped" => {
+                    self.accept(index, "state");
+                    self.set_live(index, value == "live", bitrate);
+                }
+                Some(value) => {
+                    let reason = "state must be live or stopped".to_owned();
+                    self.reject(index, "state", value, reason);
+                }
+                None if bitrate != BitrateChange::Keep => {
                     let live = self.entries[index].desired_live;
                     self.set_live(index, live, bitrate);
                 }
-                _ => tracing::warn!(stream = %id, "desired state needs live or stopped"),
+                None => {}
             }
         }
+    }
+
+    /// The desired `profile`, `source`, `destination` and `source_ceiling_percent`. A changed
+    /// source, profile or destination stops the job; the next pass starts it again with them.
+    fn desired_settings(&mut self, index: usize, desired: &Value, ctx: &ModuleContext) {
+        let settings = &self.module.settings;
+        let mut reconfigured = false;
+        if let Some(value) = desired.get("profile") {
+            let entry = &self.entries[index];
+            let wanted = match value {
+                Value::Null => Ok(entry.configured.profile.clone()),
+                Value::String(name) => Ok(name.clone()),
+                _ => Err("profile must be a profile name".to_owned()),
+            };
+            let checked = wanted.and_then(|name| {
+                let mut candidate = entry.config.clone();
+                candidate.profile = name;
+                self.check(index, &candidate).map(|()| candidate)
+            });
+            match checked {
+                Ok(candidate) => {
+                    self.accept(index, "profile");
+                    if candidate.profile != self.entries[index].config.profile {
+                        self.entries[index].config.profile = candidate.profile;
+                        reconfigured = true;
+                    }
+                }
+                Err(reason) => self.reject(index, "profile", value, reason),
+            }
+        }
+        if let Some(value) = desired.get("source") {
+            let entry = &self.entries[index];
+            let wanted = match value {
+                Value::Null => Ok(entry.configured.source.clone()),
+                value => serde_json::from_value::<Source>(value.clone())
+                    .map_err(|error| format!("source: {error}")),
+            };
+            let checked = wanted.and_then(|source| {
+                let mut candidate = entry.config.clone();
+                candidate.source = source;
+                self.check(index, &candidate).map(|()| candidate)
+            });
+            match checked {
+                Ok(candidate) => {
+                    self.accept(index, "source");
+                    if candidate.source != self.entries[index].config.source {
+                        self.entries[index].config.source = candidate.source;
+                        reconfigured = true;
+                    }
+                }
+                Err(reason) => self.reject(index, "source", value, reason),
+            }
+        }
+        if let Some(value) = desired.get("destination") {
+            match self.destination_for(index, value) {
+                Ok(destination) => {
+                    self.accept(index, "destination");
+                    let url = |d: &Option<(Destination, Output)>| d.as_ref().map(|(d, _)| d.url());
+                    if url(&destination) != url(&self.entries[index].destination) {
+                        self.set_destination(index, destination);
+                        reconfigured = true;
+                    }
+                }
+                Err(reason) => self.reject(index, "destination", value, reason),
+            }
+        }
+        if let Some(value) = desired.get("source_ceiling_percent") {
+            let wanted = match value {
+                Value::Null => Ok(None),
+                value => value
+                    .as_u64()
+                    .and_then(|percent| u32::try_from(percent).ok())
+                    .filter(|percent| *percent <= 400)
+                    .map(Some)
+                    .ok_or_else(|| "source_ceiling_percent must be 0 to 400".to_owned()),
+            };
+            match wanted {
+                Ok(percent) => {
+                    self.accept(index, "source_ceiling_percent");
+                    if percent != self.entries[index].ceiling_override {
+                        self.set_ceiling(index, percent);
+                    }
+                }
+                Err(reason) => self.reject(index, "source_ceiling_percent", value, reason),
+            }
+        }
+        if reconfigured {
+            tracing::info!(
+                stream = %self.entries[index].id, profile = %self.entries[index].config.profile,
+                output = %self.entries[index].config.output, "new settings from the desired state"
+            );
+            self.stop_job(index);
+            self.disconnect(index, "reconfigured", ctx);
+            let encoders = self.encoders.as_ref();
+            let entry = &mut self.entries[index];
+            entry.nodes = None;
+            entry.camera = Value::Null;
+            entry.source_ceiling = None;
+            entry.source_kbps = None;
+            entry.progress = None;
+            entry.last_error = None;
+            entry.restart_at = None;
+            entry.failures.clear();
+            entry.backoff.reset();
+            entry.unusable =
+                encoders.and_then(|encoders| missing_encoders(settings, &entry.config, encoders));
+            if entry.state == State::Failed {
+                entry.set_state(State::Stopped);
+            }
+            // The bitrate follows the new profile; an override outside its limits goes.
+            if let Some(profile) = settings.profiles.get(&entry.config.profile) {
+                let limits = profile.min_bitrate_kbps..=profile.max_bitrate_kbps;
+                if entry
+                    .bitrate_override
+                    .is_some_and(|kbps| profile.video == "copy" || !limits.contains(&kbps))
+                {
+                    entry.bitrate_override = None;
+                }
+                entry.bitrate_kbps = entry.bitrate_override.unwrap_or(profile.bitrate_kbps);
+            }
+        }
+    }
+
+    /// Checks a stream's new source or profile as `helios.toml`'s are checked, and that ffmpeg
+    /// has the profile's encoders and no other stream takes the RTMP key.
+    fn check(&self, index: usize, candidate: &Stream) -> Result<(), String> {
+        let settings = &self.module.settings;
+        let entry = &self.entries[index];
+        settings.check_stream(&entry.id, candidate)?;
+        if let Some(key) = candidate.source.rtmp_key()
+            && let Some(other) = self.entries.iter().find(|other| {
+                other.id != entry.id && other.config.source.rtmp_key().as_ref() == Some(&key)
+            })
+        {
+            return Err(format!(
+                "{}: stream {} already takes RTMP key {key:?}",
+                entry.id, other.id
+            ));
+        }
+        if let Some(missing) = self
+            .encoders
+            .as_ref()
+            .and_then(|encoders| missing_encoders(settings, candidate, encoders))
+        {
+            return Err(missing);
+        }
+        Ok(())
+    }
+
+    /// The destination a desired `destination` asks for: `None` for the configured one (`null`,
+    /// or a URL equal to it).
+    fn destination_for(
+        &self,
+        index: usize,
+        value: &Value,
+    ) -> Result<Option<(Destination, Output)>, String> {
+        let settings = &self.module.settings;
+        let entry = &self.entries[index];
+        let url = match value {
+            Value::Null => return Ok(None),
+            Value::String(url) => url,
+            _ => return Err("destination must be an srt:// or srtla:// URL".into()),
+        };
+        let destination = Destination::parse(url)?;
+        let Some(base) = settings.outputs.get(&entry.configured.output) else {
+            return Err(format!("no output {:?}", entry.configured.output));
+        };
+        if destination.url() == Destination::of_output(base, &entry.configured.streamid).url() {
+            return Ok(None);
+        }
+        let output = destination.output(base, &settings.srtla_uplinks);
+        if output.mode == "srtla" && output.uplinks.is_empty() {
+            return Err(
+                "an srtla:// destination needs uplinks: modules.stream.srtla_uplinks is empty"
+                    .into(),
+            );
+        }
+        Ok(Some((destination, output)))
+    }
+
+    /// Points the stream at `destination` (`None`: the configured output), with its own sender
+    /// if it's SRTLA.
+    fn set_destination(&mut self, index: usize, destination: Option<(Destination, Output)>) {
+        let settings = &self.module.settings;
+        let entry = &mut self.entries[index];
+        let name = format!("stream:{}", entry.id);
+        let sender = destination
+            .as_ref()
+            .filter(|(_, output)| output.mode == "srtla")
+            .and_then(|(_, output)| {
+                Some((output.clone(), settings.stream_sender_port(&entry.id)?))
+            });
+        match &destination {
+            Some((url, _)) => {
+                entry.config.output.clone_from(&name);
+                entry.config.streamid = url
+                    .streamid
+                    .clone()
+                    .unwrap_or_else(|| entry.configured.streamid.clone());
+            }
+            None => {
+                entry.config.output.clone_from(&entry.configured.output);
+                entry.config.streamid.clone_from(&entry.configured.streamid);
+            }
+        }
+        entry.destination = destination;
+        self.senders.set_dynamic(&name, sender);
+    }
+
+    /// A new ceiling percentage: the ceiling is worked out again from the camera's bitrate, and
+    /// a running GStreamer encoder takes it without a restart.
+    fn set_ceiling(&mut self, index: usize, percent: Option<u32>) {
+        let entry = &mut self.entries[index];
+        entry.ceiling_override = percent;
+        entry.source_ceiling = None;
+        self.follow_sources();
+        let entry = &self.entries[index];
+        if entry.source_ceiling.is_none() && entry.job.is_some() && !self.reload_bitrate(index) {
+            self.stop_job(index);
+        }
+    }
+
+    /// Records a refused desired value; the same value again keeps its first time.
+    fn reject(&mut self, index: usize, setting: &'static str, value: &Value, reason: String) {
+        let entry = &mut self.entries[index];
+        if entry
+            .rejected
+            .get(setting)
+            .is_some_and(|rejected| rejected.value == *value)
+        {
+            return;
+        }
+        tracing::warn!(stream = %entry.id, setting, %reason, "desired setting refused");
+        entry.rejected.insert(
+            setting,
+            Rejected {
+                value: value.clone(),
+                reason,
+                at: SystemTime::now(),
+            },
+        );
+    }
+
+    fn accept(&mut self, index: usize, setting: &str) {
+        self.entries[index].rejected.remove(setting);
     }
 
     fn stats(&self, ctx: &ModuleContext) {
@@ -1173,7 +1514,12 @@ impl<'a> Streams<'a> {
         Value::Object(
             self.entries
                 .iter()
-                .map(|entry| (entry.id.clone(), entry.status(with_log)))
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        entry.status(&self.module.settings, with_log),
+                    )
+                })
                 .collect(),
         )
     }
@@ -1193,10 +1539,10 @@ impl<'a> Streams<'a> {
         // Encoder and per-link figures change all the time: they wait for the interval.
         let ingest = self.ingest_report();
         let full = json!({
-            "streams": streams, "outputs": self.senders.report(now, false), "rtmp_ingest": ingest,
+            "streams": streams, "outputs": self.outputs_report(now, false), "rtmp_ingest": ingest,
         });
         let significant = json!({
-            "streams": quiet_streams, "outputs": self.senders.report(now, true),
+            "streams": quiet_streams, "outputs": self.outputs_report(now, true),
             "rtmp_ingest": ingest,
         });
         let due = match &self.reported {
@@ -1211,6 +1557,20 @@ impl<'a> Streams<'a> {
             ctx.shadows.report(MODULE, reported);
             self.reported = Some((significant, full, Instant::now()));
         }
+    }
+
+    /// The senders' report, with `null` for each stream's destination sender that isn't there:
+    /// the shadow keeps a nested key until it's set to `null`.
+    fn outputs_report(&self, now: Instant, significant: bool) -> Value {
+        let mut outputs = self.senders.report(now, significant);
+        if let Some(outputs) = outputs.as_object_mut() {
+            for entry in &self.entries {
+                outputs
+                    .entry(format!("stream:{}", entry.id))
+                    .or_insert(Value::Null);
+            }
+        }
+        outputs
     }
 
     /// The next time something needs looking at: a restart, a stall check, or a pending
@@ -1300,6 +1660,17 @@ fn missing_encoders(
             missing.join(" or ")
         )
     })
+}
+
+/// A source as the shadow shows it (and as `helios.toml` writes it).
+fn source_value(source: &Source) -> Value {
+    match source {
+        Source::Camera { video, audio } => {
+            json!({"type": "camera", "video": video, "audio": audio})
+        }
+        Source::Rtmp { camera } => json!({"type": "rtmp", "camera": camera}),
+        Source::Test { size, fps } => json!({"type": "test", "size": size, "fps": fps}),
+    }
 }
 
 /// Finds a USB device by `usb:<port>` or `<vid>:<pid>:<serial>`.

@@ -80,7 +80,10 @@ control_socket = "/run/helios-stream/control.sock"  # the daemon's; Helios conne
 state_dir = "/var/lib/helios-stream"  # the daemon saves the desired state here
 client_user = "helios"             # who may use the control socket (besides root)
 runtime_dir = "/run/helios-stream" # senders' IP files and control sockets go in <runtime_dir>/srtla
-srtla_port_base = 6000             # srtla outputs get local ports from here, in name order
+srtla_port_base = 6000             # srtla outputs get local ports from here, in name order,
+                                   # then each stream one for an srtla:// destination
+# srtla_uplinks = ["usb:ethernet", "usb:cellular", "usb:wifi"]  # what an srtla:// destination
+                                   # set through the shadow bonds when its output is direct
 sender_idle_s = 60                 # 1 to 3600: how long a sender outlives its last stream
 stats_interval_s = 30              # 5 to 3600: stream.stats while live
 
