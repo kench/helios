@@ -34,11 +34,15 @@ enum Request {
 #[error("the signer thread has stopped")]
 pub struct SignerStopped;
 
-/// Owns the signer thread. Dropping it asks the thread to close the token and stop.
+/// Owns the signer thread. Dropping it asks the thread to close the token and stop, without
+/// waiting; [`SignerHandle::shutdown_within`] waits.
 #[derive(Debug)]
 pub struct SignerHandle {
     client: SignerClient,
     thread: Option<JoinHandle<()>>,
+    /// Closed (its sender dropped) once the thread has closed and dropped the backend, which
+    /// for PKCS#11 also finalizes the module. (In a mutex only so the handle is `Sync`.)
+    finished: std::sync::Mutex<mpsc::Receiver<()>>,
 }
 
 /// Sends signing requests to the signer thread. Cheap to clone, and usable from any thread.
@@ -64,9 +68,15 @@ impl SignerHandle {
         timeout: Duration,
     ) -> std::io::Result<Self> {
         let (requests, receiver) = mpsc::channel();
+        let (done, finished) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("helios-signer".to_owned())
-            .spawn(move || serve(backend, &receiver))?;
+            .spawn(move || {
+                // Dropped last, after the backend (even if serving panics): `finished` then
+                // knows the module is finalized.
+                let _done = done;
+                serve(backend, &receiver);
+            })?;
         Ok(Self {
             client: SignerClient {
                 requests,
@@ -74,6 +84,7 @@ impl SignerHandle {
                 timeout,
             },
             thread: Some(thread),
+            finished: std::sync::Mutex::new(finished),
         })
     }
 
@@ -125,6 +136,25 @@ impl SignerHandle {
     /// Closes the token and waits for the thread to stop.
     pub fn shutdown(mut self) {
         self.stop(true);
+    }
+
+    /// Closes the token and waits up to `limit` for the thread to have dropped it (and so
+    /// finalized the PKCS#11 module): `false` if it hasn't by then, for example because a hung
+    /// token holds the thread, which is then left to finish on its own. A process that opens
+    /// the module again soon after (`helios provision verify`, or the next test) needs this:
+    /// a second initialize while the first finalize runs can crash the module.
+    #[must_use]
+    pub fn shutdown_within(mut self, limit: Duration) -> bool {
+        self.stop(false);
+        let finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match finished.recv_timeout(limit) {
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            // The sender is only dropped, never used: the thread is done.
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+        }
     }
 
     fn stop(&mut self, wait: bool) {
@@ -347,6 +377,89 @@ mod tests {
             .await;
 
         assert_eq!(outcome, Err(SignerStopped));
+    }
+
+    /// A backend that records when it's dropped (a PKCS#11 module finalizes then) and can be
+    /// made to hang in a job.
+    struct DropRecorder {
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for DropRecorder {
+        fn drop(&mut self) {
+            // Like C_Finalize, which takes a moment.
+            std::thread::sleep(Duration::from_millis(50));
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl TokenBackend for DropRecorder {
+        fn open(&mut self) -> Result<crate::identity::token::TokenSummary, TokenError> {
+            Err(TokenError::NotOpen)
+        }
+        fn pin_status(&mut self) -> Result<crate::identity::token::PinStatus, TokenError> {
+            Err(TokenError::NotOpen)
+        }
+        fn sign_without_login(&mut self, _: &str, _: &Digest) -> Result<RawSignature, TokenError> {
+            Err(TokenError::NotOpen)
+        }
+        fn login(&mut self, _: &SecretString) -> Result<(), TokenError> {
+            Err(TokenError::NotOpen)
+        }
+        fn find_key(&mut self, _: &str) -> Result<KeyRef, TokenError> {
+            Err(TokenError::NotOpen)
+        }
+        fn read_certificate(&mut self, _: &KeyRef) -> Result<Option<Vec<u8>>, TokenError> {
+            Err(TokenError::NotOpen)
+        }
+        fn sign_digest(&mut self, _: &KeyRef, _: &Digest) -> Result<RawSignature, TokenError> {
+            Err(TokenError::NotOpen)
+        }
+        fn close(&mut self) {}
+        fn set_token_label(&mut self, _: &str) {}
+    }
+
+    fn drop_recorder() -> (SignerHandle, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = DropRecorder {
+            dropped: dropped.clone(),
+        };
+        let handle = SignerHandle::spawn(Box::new(backend), None, DEFAULT_SIGN_TIMEOUT).unwrap();
+        (handle, dropped)
+    }
+
+    #[test]
+    fn shutdown_within_waits_until_the_backend_is_dropped() {
+        let (handle, dropped) = drop_recorder();
+        assert!(handle.shutdown_within(Duration::from_secs(5)));
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the module is finalized before it returns"
+        );
+
+        // Dropping the handle doesn't wait (a hung token mustn't block the caller).
+        let (handle, dropped) = drop_recorder();
+        drop(handle);
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_within_gives_up_on_a_hung_token() {
+        let (handle, dropped) = drop_recorder();
+        let (release, hung) = std::sync::mpsc::channel::<()>();
+        let _job = handle
+            .submit(move |_| {
+                let _ = hung.recv();
+            })
+            .unwrap();
+        assert!(!handle.shutdown_within(Duration::from_millis(50)));
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        // Once the token answers, the thread still closes it.
+        release.send(()).unwrap();
+        while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A backend whose signing panics, like a crashing PKCS#11 module.
