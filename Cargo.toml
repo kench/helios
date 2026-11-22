@@ -24,14 +24,17 @@ token, reports its state, and runs its modules. The service is installed but not
 provision the device (config and token), then `systemctl enable --now helios`."""
 depends = "libc6 (>= 2.31), adduser, softhsm2"
 recommends = "unattended-upgrades"
-# helios-rtmp.service (rtmp-ingest) runs nginx with the RTMP module: on the boards that ingest RTMP.
-suggests = "nginx, libnginx-mod-rtmp"
+# helios-rtmp.service (rtmp-ingest) runs nginx with the RTMP module, on the boards that ingest
+# RTMP; helios-firewall.service needs nft.
+suggests = "nginx, libnginx-mod-rtmp, nftables"
 assets = [
     ["target/release/helios", "usr/bin/", "755"],
     ["dist/systemd/helios.service", "lib/systemd/system/", "644"],
     ["dist/systemd/helios-stream.service", "lib/systemd/system/", "644"],
     ["dist/systemd/helios-rtmp.service", "lib/systemd/system/", "644"],
     ["dist/rtmp/nginx.conf", "etc/helios/rtmp/", "644"],
+    ["dist/systemd/helios-firewall.service", "lib/systemd/system/", "644"],
+    ["dist/nftables/helios.nft", "etc/helios/firewall.nft", "644"],
     ["dist/helios.toml", "usr/share/doc/helios/examples/", "644"],
     ["dist/debian/52helios-unattended-upgrades", "etc/apt/apt.conf.d/", "644"],
     ["README.md", "usr/share/doc/helios/", "644"],

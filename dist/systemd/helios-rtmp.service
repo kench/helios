@@ -5,8 +5,8 @@
 
 [Unit]
 Description=Helios RTMP ingest (nginx)
-Wants=network-online.target
-After=network-online.target helios-stream.service
+Wants=network-online.target helios-firewall.service
+After=network-online.target helios-stream.service helios-firewall.service
 
 [Service]
 Type=exec

@@ -26,7 +26,8 @@ if [ "$1" = configure ]; then
         systemctl daemon-reload || true
         # Upgrades restart a running Helios; installs and stopped services are left alone.
         systemctl try-restart helios.service || true
-        # nginx reloads a changed config without dropping cameras.
+        # New firewall rules apply at once; nginx reloads a changed config without dropping cameras.
+        systemctl try-reload-or-restart helios-firewall.service || true
         systemctl try-reload-or-restart helios-rtmp.service || true
         if systemctl is-active --quiet helios-stream.service; then
             touch /run/helios-stream/restart-pending || true
