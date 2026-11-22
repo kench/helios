@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use ::cryptoki::context::{CInitializeArgs, Pkcs11};
 use ::cryptoki::error::{Error as CryptokiError, RvError};
 use ::cryptoki::mechanism::Mechanism;
+use ::cryptoki::mechanism::elliptic_curve::{EcKdf, Ecdh1DeriveParams};
 use ::cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle};
 use ::cryptoki::session::{Session, UserType};
 use ::cryptoki::slot::Slot;
 use secrecy::SecretString;
+use secrecy::zeroize::Zeroizing;
 
 use crate::identity::token::{
     Digest, KeyHandle, KeyRef, PinStatus, RawSignature, TokenBackend, TokenError, TokenSummary,
@@ -110,6 +112,85 @@ impl CryptokiToken {
             id,
             handle: KeyHandle { generation, index },
         })
+    }
+
+    /// The one object of `class` labelled `label`, if any.
+    fn find_one(
+        &mut self,
+        class: ObjectClass,
+        label: &str,
+    ) -> Result<Option<ObjectHandle>, TokenError> {
+        let template = [
+            Attribute::Class(class),
+            Attribute::KeyType(KeyType::EC),
+            Attribute::Label(label.as_bytes().to_vec()),
+        ];
+        let handles = self
+            .token()?
+            .session
+            .find_objects(&template)
+            .map_err(map_error)?;
+        match handles.as_slice() {
+            [] => Ok(None),
+            [handle] => Ok(Some(*handle)),
+            more => Err(TokenError::Ambiguous {
+                what: format!("EC keys of one class with label {label:?}"),
+                count: more.len(),
+            }),
+        }
+    }
+
+    /// The public key's point, unwrapped from `CKA_EC_POINT`'s DER OCTET STRING.
+    fn public_point(&mut self, handle: ObjectHandle) -> Result<Vec<u8>, TokenError> {
+        let attributes = self
+            .token()?
+            .session
+            .get_attributes(handle, &[AttributeType::EcPoint])
+            .map_err(map_error)?;
+        let der = attributes
+            .into_iter()
+            .find_map(|attribute| match attribute {
+                Attribute::EcPoint(point) => Some(point),
+                _ => None,
+            })
+            .ok_or_else(|| TokenError::Other("the secrets key has no CKA_EC_POINT".into()))?;
+        ec_point(&der)
+    }
+
+    /// Generates the secrets key pair in a short read-write session (the identity session is
+    /// read-only); the login carries over to it.
+    fn generate_secrets_key(&mut self, label: &str) -> Result<(), TokenError> {
+        let token = self.token()?;
+        let session = token
+            .pkcs11
+            .open_rw_session(token.slot)
+            .map_err(map_error)?;
+        let label = label.as_bytes().to_vec();
+        let id = b"helios-secrets".to_vec();
+        let public = [
+            Attribute::Token(true),
+            Attribute::Label(label.clone()),
+            Attribute::Id(id.clone()),
+            Attribute::EcParams(P256_OID.to_vec()),
+            Attribute::Derive(true),
+            Attribute::Verify(false),
+        ];
+        let private = [
+            Attribute::Token(true),
+            Attribute::Label(label),
+            Attribute::Id(id),
+            Attribute::Private(true),
+            Attribute::Sensitive(true),
+            Attribute::Extractable(false),
+            Attribute::Derive(true),
+            Attribute::Sign(false),
+            Attribute::Decrypt(false),
+            Attribute::Unwrap(false),
+        ];
+        session
+            .generate_key_pair(&Mechanism::EccKeyPairGen, &public, &private)
+            .map_err(map_error)?;
+        Ok(())
     }
 
     fn sign_with(&mut self, key: &KeyRef, digest: &Digest) -> Result<RawSignature, TokenError> {
@@ -244,6 +325,68 @@ impl TokenBackend for CryptokiToken {
             label.clone_into(&mut self.token_label);
         }
     }
+
+    fn secrets_key(&mut self, label: &str) -> Result<Vec<u8>, TokenError> {
+        if self.find_one(ObjectClass::PRIVATE_KEY, label)?.is_none() {
+            self.generate_secrets_key(label)?;
+        }
+        let public = self
+            .find_one(ObjectClass::PUBLIC_KEY, label)?
+            .ok_or_else(|| TokenError::KeyNotFound {
+                label: format!("{label} (public)"),
+            })?;
+        self.public_point(public)
+    }
+
+    fn ecdh(&mut self, label: &str, peer: &[u8]) -> Result<Zeroizing<Vec<u8>>, TokenError> {
+        let private = self
+            .find_one(ObjectClass::PRIVATE_KEY, label)?
+            .ok_or_else(|| TokenError::KeyNotFound {
+                label: label.to_owned(),
+            })?;
+        // The agreed x-coordinate as a session object Helios may read, then destroyed.
+        let template = [
+            Attribute::Class(ObjectClass::SECRET_KEY),
+            Attribute::KeyType(KeyType::GENERIC_SECRET),
+            Attribute::ValueLen(32.into()),
+            Attribute::Token(false),
+            Attribute::Sensitive(false),
+            Attribute::Extractable(true),
+        ];
+        let session = &self.token()?.session;
+        let mechanism = Mechanism::Ecdh1Derive(Ecdh1DeriveParams::new(EcKdf::null(), peer));
+        let secret = session
+            .derive_key(&mechanism, private, &template)
+            .map_err(map_error)?;
+        let value = session.get_attributes(secret, &[AttributeType::Value]);
+        let _ = session.destroy_object(secret);
+        value
+            .map_err(map_error)?
+            .into_iter()
+            .find_map(|attribute| match attribute {
+                Attribute::Value(value) => Some(Zeroizing::new(value)),
+                _ => None,
+            })
+            .ok_or_else(|| TokenError::Other("the derived secret has no value".into()))
+    }
+}
+
+/// DER of the prime256v1 (P-256) OID, for `CKA_EC_PARAMS`.
+const P256_OID: [u8; 10] = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+
+/// The point inside `CKA_EC_POINT`: a DER OCTET STRING (`04 41 04 …` for P-256), or, from
+/// some modules, the raw point.
+fn ec_point(der: &[u8]) -> Result<Vec<u8>, TokenError> {
+    let point = match der {
+        [0x04, 0x41, rest @ ..] if rest.len() == 65 => rest,
+        raw if raw.len() == 65 && raw[0] == 0x04 => raw,
+        _ => {
+            return Err(TokenError::Other(
+                "the secrets key isn't an uncompressed P-256 point".into(),
+            ));
+        }
+    };
+    Ok(point.to_vec())
 }
 
 /// Maps a `cryptoki` error to a [`TokenError`], following the table in LLD 1, section 4.2.

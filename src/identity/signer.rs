@@ -121,16 +121,7 @@ impl SignerHandle {
         R: Send + 'static,
         F: FnOnce(&mut dyn TokenBackend) -> R + Send + 'static,
     {
-        let (reply, result) = oneshot::channel();
-        let job: Job = Box::new(move |backend| {
-            // The caller may have stopped waiting. There is nothing to do then.
-            let _ = reply.send(job(backend));
-        });
-        self.client
-            .requests
-            .send(Request::Run(job))
-            .map_err(|_| SignerStopped)?;
-        Ok(result)
+        self.client.submit(job)
     }
 
     /// Closes the token and waits for the thread to stop.
@@ -175,6 +166,41 @@ impl Drop for SignerHandle {
 }
 
 impl SignerClient {
+    /// Runs `job` on the signer thread with the backend and returns its result: for token
+    /// work other than signing, such as ECDH with the secrets key.
+    ///
+    /// # Errors
+    ///
+    /// [`SignerStopped`] if the thread has stopped.
+    pub async fn run<R, F>(&self, job: F) -> Result<R, SignerStopped>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut dyn TokenBackend) -> R + Send + 'static,
+    {
+        self.submit(job)?.await.map_err(|_| SignerStopped)
+    }
+
+    /// Queues `job` on the signer thread and returns a receiver for its result.
+    ///
+    /// # Errors
+    ///
+    /// [`SignerStopped`] if the thread has stopped.
+    pub fn submit<R, F>(&self, job: F) -> Result<oneshot::Receiver<R>, SignerStopped>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut dyn TokenBackend) -> R + Send + 'static,
+    {
+        let (reply, result) = oneshot::channel();
+        let job: Job = Box::new(move |backend| {
+            // The caller may have stopped waiting. There is nothing to do then.
+            let _ = reply.send(job(backend));
+        });
+        self.requests
+            .send(Request::Run(job))
+            .map_err(|_| SignerStopped)?;
+        Ok(result)
+    }
+
     /// Signs `digest` with `key` and waits up to the configured timeout. Blocks the calling
     /// thread, because rustls calls signers synchronously.
     ///

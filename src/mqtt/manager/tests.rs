@@ -325,6 +325,33 @@ async fn connects_as_the_thing_with_a_will_and_a_clean_session() {
 }
 
 #[tokio::test]
+async fn subscribes_in_batches_of_eight_and_goes_online_after_the_last() {
+    let running = start_with(
+        |options| options.commands = crate::mqtt::CommandTransports::default().transport(),
+        |_| {},
+    )
+    .await;
+    let broker = &running.broker;
+    broker
+        .until("lifecycle.online", |s| !s.publishes.is_empty())
+        .await;
+    let state = broker.state();
+    let mut filters = topics::shadow_filters(THING_NAME);
+    filters.push(format!("helios/{THING_NAME}/cmd/+"));
+    let base = format!("$aws/commands/things/{THING_NAME}/executions/+");
+    filters.push(format!("{base}/request/json"));
+    filters.push(format!("{base}/response/accepted/json"));
+    filters.push(format!("{base}/response/rejected/json"));
+    // Five shadow filters, the custom topic and three for AWS IoT commands: nine, so two.
+    assert_eq!(filters.len(), 9);
+    assert_eq!(
+        state.subscribes,
+        vec![filters[..8].to_vec(), filters[8..].to_vec()]
+    );
+    assert_eq!(state.publishes[0].1["type"], "lifecycle.online");
+}
+
+#[tokio::test]
 async fn reports_the_connection_in_its_status() {
     let running = start().await;
     let mut status = running.handle.status();

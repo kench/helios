@@ -278,6 +278,8 @@ pub struct Identity {
     pub device: DeviceInfo,
     /// Problems worth reporting that don't stop the identity being used.
     pub warnings: Vec<Warning>,
+    /// The key secrets are sealed to (LLD 3, section 10.7), if the token has or could make one.
+    pub secrets: Option<crate::identity::secrets::SecretsKey>,
 }
 
 /// Facts about the device certificate, for logs and the `helios` shadow.
@@ -332,6 +334,13 @@ pub enum Warning {
     CertificateChanged {
         /// The previous certificate's fingerprint.
         previous: String,
+    },
+    /// The token has no key for sealed secrets and couldn't make one, so values sealed to the
+    /// device (a Wi-Fi passphrase from the Control API) can't be read.
+    #[error("no key for sealed secrets: {reason}")]
+    NoSecretsKey {
+        /// Why.
+        reason: String,
     },
 }
 
@@ -556,6 +565,8 @@ struct Opened {
     token_certificate: Option<Vec<u8>>,
     digest: Digest,
     signature: RawSignature,
+    /// The secrets key's public point, or why there's none (not fatal).
+    secrets: Result<Vec<u8>, TokenError>,
 }
 
 type OpenResult = Result<Opened, Failure>;
@@ -748,6 +759,26 @@ impl Manager {
             });
         }
         self.last_fingerprint = Some(fingerprint);
+        let secrets = match opened.secrets {
+            Ok(point) => match <[u8; crate::identity::secrets::POINT_LEN]>::try_from(point) {
+                Ok(point) => Some(crate::identity::secrets::SecretsKey::new(
+                    point,
+                    self.signer.client(),
+                )),
+                Err(_) => {
+                    warnings.push(Warning::NoSecretsKey {
+                        reason: "its public key isn't an uncompressed P-256 point".into(),
+                    });
+                    None
+                }
+            },
+            Err(error) => {
+                warnings.push(Warning::NoSecretsKey {
+                    reason: error.to_string(),
+                });
+                None
+            }
+        };
 
         Ok(Identity {
             certified_key: tls::certified_key(chain, self.signer.client(), opened.key),
@@ -759,6 +790,7 @@ impl Manager {
             token: opened.summary,
             device: self.device.clone(),
             warnings,
+            secrets,
         })
     }
 
@@ -881,6 +913,7 @@ fn open_steps(backend: &mut dyn TokenBackend, request: &OpenRequest) -> OpenResu
     let signature = backend
         .sign_digest(&key, &request.digest)
         .map_err(token_failure)?;
+    let secrets = backend.secrets_key(crate::identity::secrets::SECRETS_KEY_LABEL);
     Ok(Opened {
         summary,
         pin_count_low: status.count_low,
@@ -888,6 +921,7 @@ fn open_steps(backend: &mut dyn TokenBackend, request: &OpenRequest) -> OpenResu
         token_certificate,
         digest: request.digest,
         signature,
+        secrets,
     })
 }
 

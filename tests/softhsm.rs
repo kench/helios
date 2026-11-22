@@ -280,6 +280,84 @@ mod suite {
 
     #[test]
     #[ignore = "run by softhsm_suite"]
+    fn makes_the_secrets_key_once_and_derives_with_it() {
+        use p256::elliptic_curve::sec1::ToSec1Point;
+
+        if !in_suite() {
+            return;
+        }
+        provisioned_token("secrets");
+        let mut token = backend("secrets");
+        token.open().unwrap();
+        token.login(&pin(USER_PIN)).unwrap();
+        let public = token.secrets_key("helios-secrets").unwrap();
+        assert_eq!(public.len(), 65);
+        assert_eq!(public[0], 0x04);
+        // Found, not made again, now and after reopening.
+        assert_eq!(token.secrets_key("helios-secrets").unwrap(), public);
+        token.open().unwrap();
+        token.login(&pin(USER_PIN)).unwrap();
+        assert_eq!(token.secrets_key("helios-secrets").unwrap(), public);
+
+        // ECDH agrees with the peer's side.
+        let peer = p256::SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let peer_point = peer.public_key().to_sec1_point(false);
+        let derived = token.ecdh("helios-secrets", peer_point.as_bytes()).unwrap();
+        let ours = p256::PublicKey::from_sec1_bytes(&public).unwrap();
+        let expected = p256::ecdh::diffie_hellman(peer.to_nonzero_scalar(), ours.as_affine());
+        assert_eq!(derived.as_slice(), expected.raw_secret_bytes().as_slice());
+        assert!(
+            token.ecdh("helios-secrets", &[4; 65]).is_err(),
+            "not a point"
+        );
+        assert!(matches!(
+            token.ecdh("no-such-key", peer_point.as_bytes()),
+            Err(TokenError::KeyNotFound { .. })
+        ));
+
+        // The private half can only derive, and never leaves the token.
+        token.close();
+        let pkcs11 = pkcs11();
+        let session = pkcs11
+            .open_ro_session(slot_with_label(&pkcs11, "secrets"))
+            .unwrap();
+        session.login(UserType::User, Some(&pin(USER_PIN))).unwrap();
+        let private = session
+            .find_objects(&[
+                Attribute::Class(ObjectClass::PRIVATE_KEY),
+                Attribute::Label(b"helios-secrets".to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(private.len(), 1);
+        let attributes = session
+            .get_attributes(
+                private[0],
+                &[
+                    AttributeType::Sign,
+                    AttributeType::Derive,
+                    AttributeType::Extractable,
+                    AttributeType::Sensitive,
+                    AttributeType::Token,
+                ],
+            )
+            .unwrap();
+        assert!(
+            attributes.contains(&Attribute::Sign(false)),
+            "{attributes:?}"
+        );
+        assert!(attributes.contains(&Attribute::Derive(true)));
+        assert!(attributes.contains(&Attribute::Extractable(false)));
+        assert!(attributes.contains(&Attribute::Sensitive(true)));
+        assert!(attributes.contains(&Attribute::Token(true)));
+        // No derived secret is left behind as a session object.
+        let secrets = session
+            .find_objects(&[Attribute::Class(ObjectClass::SECRET_KEY)])
+            .unwrap();
+        assert!(secrets.is_empty());
+    }
+
+    #[test]
+    #[ignore = "run by softhsm_suite"]
     fn key_references_do_not_survive_a_reopen() {
         if !in_suite() {
             return;
