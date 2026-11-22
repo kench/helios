@@ -55,6 +55,7 @@ fn local_config(service: &MockService, pin_dir: &Path) -> Config {
         thing_name: Some(THING_NAME.into()),
         certificate: CertificateSource::Token,
         allow_final_pin_try: false,
+        token_copy: crate::identity::token_copy::TokenCopy::Direct,
         sign_timeout: DEFAULT_SIGN_TIMEOUT,
         roots: service.roots(),
         aws: Some(AwsSettings {

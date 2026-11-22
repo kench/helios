@@ -52,6 +52,9 @@ pub struct Sources {
     pub boot_id: Option<String>,
     /// When Helios started.
     pub started_at: SystemTime,
+    /// The token's working copy, with `identity.token_copy = "tmpfs"` (LLD 1, section 4.12):
+    /// `{"copy", "restored_from", "restored_at", "lost"}`; null otherwise, and not reported.
+    pub token: Value,
 }
 
 /// Starts the reporter, which ends when `cancel` is cancelled.
@@ -187,6 +190,9 @@ fn reported(sources: &Sources) -> Map<String, Value> {
     reported.insert("boot_id".into(), json!(sources.boot_id));
     reported.insert("started_at".into(), json!(timestamp(sources.started_at)));
     reported.insert("identity".into(), identity_json);
+    if !sources.token.is_null() {
+        reported.insert("token".into(), sources.token.clone());
+    }
     // The key the cloud seals secrets to (LLD 3, section 10.7): only its public half.
     if let IdentityState::Ready(ready) = &identity
         && let Some(key) = &ready.secrets

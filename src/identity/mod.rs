@@ -15,3 +15,4 @@ pub mod signer;
 pub(crate) mod testing;
 pub mod tls;
 pub mod token;
+pub mod token_copy;

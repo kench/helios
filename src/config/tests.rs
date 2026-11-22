@@ -172,6 +172,35 @@ fn reads_the_optional_identity_settings() {
 }
 
 #[test]
+fn reads_the_token_copy_mode() {
+    use crate::identity::token_copy::TokenCopy;
+    let files = Files::new();
+    let with = |line: &str| {
+        files.local("").replace(
+            "pin           = \"file:/etc/helios/pin\"",
+            &format!("pin           = \"file:/etc/helios/pin\"\n{line}"),
+        )
+    };
+    assert_eq!(files.load(&with("")).unwrap().token_copy, TokenCopy::Direct);
+    assert_eq!(
+        files
+            .load(&with("token_copy = \"tmpfs\""))
+            .unwrap()
+            .token_copy,
+        TokenCopy::Tmpfs
+    );
+    assert_eq!(
+        files
+            .load(&with("token_copy = \"direct\""))
+            .unwrap()
+            .token_copy,
+        TokenCopy::Direct
+    );
+    let error = files.load(&with("token_copy = \"ram\"")).unwrap_err();
+    assert!(error.message.contains("token_copy"), "{error}");
+}
+
+#[test]
 fn defaults_to_the_softhsm2_module() {
     let files = Files::new();
     let text = files.local("").replace(

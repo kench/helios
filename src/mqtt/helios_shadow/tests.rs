@@ -25,6 +25,10 @@ impl Drop for Setup {
 }
 
 fn setup(interval: Duration) -> Setup {
+    setup_with(interval, Value::Null)
+}
+
+fn setup_with(interval: Duration, token: Value) -> Setup {
     let (handle, published, mqtt) = MqttHandle::for_test();
     let (replies, incoming) = tokio::sync::mpsc::channel(4);
     let cancel = CancellationToken::new();
@@ -53,6 +57,7 @@ fn setup(interval: Duration) -> Setup {
             modules: modules_rx,
             boot_id: Some("boot-1".into()),
             started_at: SystemTime::UNIX_EPOCH,
+            token,
         },
         shadows,
         interval,
@@ -113,6 +118,17 @@ async fn reports_the_agent_state() {
     assert_eq!(reported["identity"]["state"], "starting");
     assert_eq!(reported["mqtt"]["session"], 1);
     assert_eq!(reported["credentials"]["last_error"], Value::Null);
+}
+
+#[tokio::test]
+async fn reports_the_token_copy_only_when_there_is_one() {
+    let mut direct = setup(DEFAULT_INTERVAL);
+    assert!(next_report(&mut direct).await.get("token").is_none());
+
+    let token = json!({"copy": "tmpfs", "restored_from": "tokens.old",
+                       "restored_at": "2026-11-22T22:30:00.000Z", "lost": false});
+    let mut tmpfs = setup_with(DEFAULT_INTERVAL, token.clone());
+    assert_eq!(next_report(&mut tmpfs).await["token"], token);
 }
 
 #[tokio::test]
