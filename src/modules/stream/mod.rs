@@ -18,6 +18,7 @@ mod control;
 pub mod daemon;
 #[cfg(test)]
 mod e2e;
+mod encoder;
 mod ffmpeg;
 mod process;
 mod rtmp;
@@ -41,7 +42,8 @@ use crate::router::{Outcome, codes};
 use super::{Module, ModuleContext, ModuleError, ModuleFuture};
 use addrs::Address;
 pub use client::StreamClient;
-use ffmpeg::{CameraNodes, Progress, ProgressParser};
+use encoder::{Backend, Signal, Watch};
+use ffmpeg::{CameraNodes, Progress};
 use process::{Job, JobEvent, JobSpec, Spawner, Tagged};
 use rtmp::IngestEvent;
 pub use settings::StreamSettings;
@@ -57,6 +59,8 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 const STALL: Duration = Duration::from_secs(10);
 /// How long a new job may take to show progress.
 const FIRST_PROGRESS: Duration = Duration::from_secs(20);
+/// How long a GStreamer encoder may take to connect over SRT (it retries by itself).
+const FIRST_CONNECT: Duration = Duration::from_secs(60);
 /// This many failures within [`FAILURE_WINDOW`] make a stream `failed`.
 const FAILURE_LIMIT: usize = 5;
 const FAILURE_WINDOW: Duration = Duration::from_secs(600);
@@ -178,10 +182,28 @@ struct Running {
     id: u64,
     job: Box<dyn Job>,
     started: Instant,
-    /// When ffmpeg's output time last moved forward.
+    /// When ffmpeg's output time last moved forward, or a GStreamer encoder connected.
     advanced: Option<Instant>,
     out_time_us: Option<i64>,
-    parser: ProgressParser,
+    backend: Backend,
+    watch: Watch,
+}
+
+impl Running {
+    /// Whether it's stalled: no progress for too long (ffmpeg), or no SRT connection in time (a
+    /// GStreamer encoder, which catches its own stalls once connected).
+    fn stalled(&self, now: Instant) -> bool {
+        self.deadline().is_some_and(|at| now >= at)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        match (self.backend.reports_progress(), self.advanced) {
+            (true, Some(at)) => Some(at + STALL),
+            (true, None) => Some(self.started + FIRST_PROGRESS),
+            (false, None) => Some(self.started + FIRST_CONNECT),
+            (false, Some(_)) => None,
+        }
+    }
 }
 
 /// One stream's state.
@@ -570,22 +592,26 @@ impl<'a> Streams<'a> {
         }
         self.connect(index, ctx);
         let stalled = self.entries[index].job.as_ref().map(|running| {
-            let quiet_since = running.advanced.unwrap_or(running.started);
-            let limit = if running.advanced.is_some() {
-                STALL
-            } else {
-                FIRST_PROGRESS
-            };
-            now.duration_since(quiet_since) >= limit
+            (
+                running.stalled(now),
+                running.backend,
+                running.advanced.is_some(),
+            )
         });
         match stalled {
-            Some(true) => {
-                tracing::warn!(stream = %self.entries[index].id, "ffmpeg stalled; restarting it");
+            Some((true, backend, advanced)) => {
+                let name = backend.name();
+                tracing::warn!(stream = %self.entries[index].id, "{name} stalled; restarting it");
                 self.stop_job(index);
-                self.failed_run(index, "ffmpeg stopped making progress".into(), now, ctx);
+                let reason = if backend.reports_progress() || advanced {
+                    format!("{name} stopped making progress")
+                } else {
+                    format!("{name} didn't connect over SRT in time")
+                };
+                self.failed_run(index, reason, now, ctx);
                 return;
             }
-            Some(false) => return,
+            Some((false, ..)) => return,
             None => {}
         }
         let entry = &mut self.entries[index];
@@ -666,30 +692,32 @@ impl<'a> Streams<'a> {
             streamid: &entry.config.streamid,
             sender_port: self.senders.port(&entry.config.output),
         };
-        let args = match (&entry.config.source, entry.nodes.as_ref()) {
-            (Source::Test { size, fps }, _) => {
-                ffmpeg::test_args(profile, target, size, *fps, entry.bitrate_kbps)
-            }
-            (Source::Camera { .. }, Some(nodes)) => {
-                ffmpeg::camera_args(profile, target, nodes, entry.bitrate_kbps)
-            }
-            (Source::Rtmp { .. }, _) => {
-                let Some(key) = entry.config.source.rtmp_key() else {
-                    return;
-                };
-                let url = format!(
-                    "rtmp://127.0.0.1:{}/{}/{key}",
-                    settings.rtmp_ingest.port,
-                    rtmp::APP
-                );
-                ffmpeg::rtmp_args(profile, target, &url, entry.bitrate_kbps)
-            }
-            (Source::Camera { .. }, None) => return,
+        let url = entry.config.source.rtmp_key().map(|key| {
+            format!(
+                "rtmp://127.0.0.1:{}/{}/{key}",
+                settings.rtmp_ingest.port,
+                rtmp::APP
+            )
+        });
+        let input = match (&entry.config.source, entry.nodes.as_ref(), url.as_deref()) {
+            (Source::Test { size, fps }, _, _) => encoder::Input::Test { size, fps: *fps },
+            (Source::Camera { .. }, Some(nodes), _) => encoder::Input::Camera(nodes),
+            (Source::Rtmp { .. }, _, Some(url)) => encoder::Input::Rtmp(url),
+            _ => return,
         };
+        let range = encoder::Range::new(profile, entry.bitrate_kbps);
+        let plan = encoder::plan(settings, &entry.id, profile, target, input, range);
+        let backend = profile.encoder;
+        if let Err(error) = write_files(&plan.files) {
+            let message = format!("can't write {}'s files: {error}", backend.name());
+            self.failed_run(index, message, Instant::now(), ctx);
+            return;
+        }
         let spec = JobSpec {
             name: entry.id.clone(),
-            program: settings.ffmpeg.clone(),
-            args,
+            program: plan.program,
+            args: plan.args,
+            env: plan.env,
         };
         self.next_job += 1;
         let id = self.next_job;
@@ -697,14 +725,15 @@ impl<'a> Streams<'a> {
         entry.restart_at = None;
         match module.spawner.spawn(&spec, id, self.events_tx.clone()) {
             Ok(job) => {
-                tracing::info!(stream = %entry.id, "ffmpeg started");
+                tracing::info!(stream = %entry.id, encoder = backend.name(), "encoder started");
                 entry.job = Some(Running {
                     id,
                     job,
                     started: Instant::now(),
                     advanced: None,
                     out_time_us: None,
-                    parser: ProgressParser::default(),
+                    backend,
+                    watch: Watch::new(backend),
                 });
                 entry.progress = None;
                 if entry.state != State::Reconnecting {
@@ -712,7 +741,7 @@ impl<'a> Streams<'a> {
                 }
             }
             Err(error) => {
-                let message = format!("can't start {}: {error}", settings.ffmpeg.display());
+                let message = format!("can't start {}: {error}", spec.program.display());
                 self.failed_run(index, message, Instant::now(), ctx);
             }
         }
@@ -795,43 +824,8 @@ impl<'a> Streams<'a> {
         };
         let now = Instant::now();
         match tagged.event {
-            JobEvent::Stdout(line) => {
-                let entry = &mut self.entries[index];
-                let Some(running) = entry.job.as_mut() else {
-                    return;
-                };
-                let Some(progress) = running.parser.line(&line) else {
-                    return;
-                };
-                if progress
-                    .out_time_us
-                    .is_some_and(|t| Some(t) > running.out_time_us)
-                {
-                    running.out_time_us = progress.out_time_us;
-                    running.advanced = Some(now);
-                    if entry.state != State::Live {
-                        entry.set_state(State::Live);
-                        entry.last_error = None;
-                        if !entry.quiet {
-                            let payload = json!({
-                                "stream_id": entry.id, "profile": entry.config.profile,
-                                "bitrate_kbps": entry.bitrate_kbps, "output": entry.config.output,
-                                "active_links": self.senders.active_links(&entry.config.output),
-                            });
-                            ctx.mqtt.publish_event(MODULE, "stream.live", payload);
-                        }
-                    }
-                }
-                entry.progress = Some(progress);
-            }
-            JobEvent::Stderr(line) => {
-                let entry = &mut self.entries[index];
-                tracing::debug!(stream = %entry.id, "ffmpeg: {line}");
-                if entry.lines.len() == LOG_LINES {
-                    entry.lines.pop_front();
-                }
-                entry.lines.push_back(line);
-            }
+            JobEvent::Stdout(line) => self.job_line(index, &line, true, now, ctx),
+            JobEvent::Stderr(line) => self.job_line(index, &line, false, now, ctx),
             JobEvent::Exited(code) => {
                 let entry = &mut self.entries[index];
                 let Some(running) = entry.job.take() else {
@@ -841,12 +835,73 @@ impl<'a> Streams<'a> {
                     entry.backoff.reset();
                 }
                 let last = entry.lines.back().cloned();
+                let name = running.backend.name();
                 let reason = match (code, last) {
-                    (_, Some(line)) => format!("ffmpeg exited ({}): {line}", exit_text(code)),
-                    (code, None) => format!("ffmpeg exited ({})", exit_text(code)),
+                    (_, Some(line)) => format!("{name} exited ({}): {line}", exit_text(code)),
+                    (code, None) => format!("{name} exited ({})", exit_text(code)),
                 };
-                tracing::warn!(stream = %entry.id, %reason, "ffmpeg exited");
+                tracing::warn!(stream = %entry.id, %reason, "encoder exited");
                 self.failed_run(index, reason, now, ctx);
+            }
+        }
+    }
+
+    /// A line of a stream job's output: ffmpeg's progress (stdout), or log lines, which for a
+    /// GStreamer encoder include its SRT connection.
+    fn job_line(
+        &mut self,
+        index: usize,
+        line: &str,
+        stdout: bool,
+        now: Instant,
+        ctx: &ModuleContext,
+    ) {
+        let entry = &mut self.entries[index];
+        let Some(running) = entry.job.as_mut() else {
+            return;
+        };
+        let signal = if stdout {
+            running.watch.stdout(line)
+        } else {
+            running.watch.stderr(line)
+        };
+        let backend = running.backend;
+        let advanced = match signal {
+            Some(Signal::Progress(progress)) => {
+                let moved = progress
+                    .out_time_us
+                    .is_some_and(|t| Some(t) > running.out_time_us);
+                if moved {
+                    running.out_time_us = progress.out_time_us;
+                    running.advanced = Some(now);
+                }
+                entry.progress = Some(progress);
+                moved
+            }
+            Some(Signal::Connected) => {
+                running.advanced = Some(now);
+                true
+            }
+            None => false,
+        };
+        // ffmpeg's stdout is its progress; everything else is kept for stream.status.
+        if !(stdout && backend.reports_progress()) {
+            tracing::debug!(stream = %entry.id, "{}: {line}", backend.name());
+            if entry.lines.len() == LOG_LINES {
+                entry.lines.pop_front();
+            }
+            entry.lines.push_back(line.to_owned());
+        }
+        if advanced && entry.state != State::Live {
+            entry.set_state(State::Live);
+            entry.last_error = None;
+            if !entry.quiet {
+                let payload = json!({
+                    "stream_id": entry.id, "profile": entry.config.profile,
+                    "bitrate_kbps": entry.bitrate_kbps, "output": entry.config.output,
+                    "active_links": self.senders.active_links(&entry.config.output),
+                });
+                ctx.mqtt.publish_event(MODULE, "stream.live", payload);
             }
         }
     }
@@ -951,7 +1006,48 @@ impl<'a> Streams<'a> {
         let bitrate = entry.bitrate_override.unwrap_or(profile_kbps);
         if bitrate != entry.bitrate_kbps {
             entry.bitrate_kbps = bitrate;
-            self.stop_job(index);
+            if !self.reload_bitrate(index) {
+                self.stop_job(index);
+            }
+        }
+    }
+
+    /// Gives a running GStreamer encoder the stream's new bitrate range (rewritten file, then
+    /// SIGHUP); `false` if the job must restart instead (ffmpeg, or no job).
+    fn reload_bitrate(&mut self, index: usize) -> bool {
+        let settings = &self.module.settings;
+        let entry = &self.entries[index];
+        let (Some(running), Some(profile), Some(output)) = (
+            entry.job.as_ref(),
+            settings.profiles.get(&entry.config.profile),
+            settings.outputs.get(&entry.config.output),
+        ) else {
+            return false;
+        };
+        if !running.backend.reloads() {
+            return false;
+        }
+        let range = encoder::Range::new(profile, entry.bitrate_kbps);
+        let file = encoder::range_file(
+            settings,
+            running.backend,
+            &entry.id,
+            range,
+            output.latency_ms,
+        );
+        match write_files(std::slice::from_ref(&file)) {
+            Ok(()) => {
+                tracing::info!(
+                    stream = %entry.id, min_kbps = range.min_kbps, max_kbps = range.max_kbps,
+                    "new bitrate range for {}", running.backend.name()
+                );
+                running.job.reload();
+                true
+            }
+            Err(error) => {
+                tracing::warn!(stream = %entry.id, %error, "can't write the bitrate range; restarting");
+                false
+            }
         }
     }
 
@@ -1053,11 +1149,8 @@ impl<'a> Streams<'a> {
             if let Some(at) = entry.restart_at {
                 wake = wake.min(at);
             }
-            if let Some(running) = &entry.job {
-                wake = wake.min(match running.advanced {
-                    Some(at) => at + STALL,
-                    None => running.started + FIRST_PROGRESS,
-                });
+            if let Some(at) = entry.job.as_ref().and_then(Running::deadline) {
+                wake = wake.min(at);
             }
         }
         if let Some((_, _, at)) = &self.reported {
@@ -1086,6 +1179,20 @@ impl<'a> Streams<'a> {
     }
 }
 
+/// Writes a job's files (a GStreamer encoder's pipeline and bitrate range), each replaced in
+/// one step so a SIGHUP never reads half a file.
+fn write_files(files: &[(PathBuf, String)]) -> std::io::Result<()> {
+    for (path, contents) in files {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let partial = path.with_extension("partial");
+        std::fs::write(&partial, contents)?;
+        std::fs::rename(&partial, path)?;
+    }
+    Ok(())
+}
+
 fn exit_text(code: Option<i32>) -> String {
     code.map_or_else(
         || "killed by a signal".into(),
@@ -1100,6 +1207,9 @@ fn missing_encoders(
     encoders: &BTreeSet<String>,
 ) -> Option<String> {
     let profile = settings.profiles.get(&stream.profile)?;
+    if profile.encoder != Backend::Ffmpeg {
+        return None; // GStreamer elements; a missing one fails the job with its message
+    }
     let mut needed = Vec::new();
     if profile.video != "copy" {
         needed.push(profile.video.as_str());

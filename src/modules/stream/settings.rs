@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::encoder::{Backend, BitrateMode};
+
 /// The stream module's settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -19,6 +21,12 @@ pub struct StreamSettings {
     pub(crate) ffmpeg: PathBuf,
     /// The `srtla_send` to run for `srtla` outputs.
     pub(crate) srtla_send: PathBuf,
+    /// The GStreamer encoders, for profiles with `encoder = "belacoder"` or `"ceracoder"`.
+    pub(crate) belacoder: PathBuf,
+    pub(crate) ceracoder: PathBuf,
+    /// `GST_PLUGIN_PATH` for them: where helios-packages' Rockchip plugin is, if not in
+    /// GStreamer's own directory.
+    pub(crate) gst_plugin_path: Option<PathBuf>,
     /// The stream daemon's control socket (LLD 4, section 15), which Helios connects to.
     pub(crate) control_socket: PathBuf,
     /// Where the daemon keeps the desired state across its restarts.
@@ -73,6 +81,9 @@ impl Default for StreamSettings {
             enabled: true,
             ffmpeg: "/usr/lib/helios-ffmpeg/bin/ffmpeg".into(),
             srtla_send: "/usr/bin/srtla_send".into(),
+            belacoder: "/usr/bin/belacoder".into(),
+            ceracoder: "/usr/bin/ceracoder".into(),
+            gst_plugin_path: None,
             control_socket: "/run/helios-stream/control.sock".into(),
             state_dir: "/var/lib/helios-stream".into(),
             client_user: "helios".into(),
@@ -137,6 +148,14 @@ pub struct Profile {
     /// For cameras: what to ask the camera for.
     #[serde(default)]
     pub(crate) input: CameraInput,
+    /// What encodes: `ffmpeg` (the default), or `belacoder` / `ceracoder` (GStreamer, which
+    /// can adapt the bitrate).
+    #[serde(default)]
+    pub(crate) encoder: Backend,
+    /// `fixed` (the default), or `adaptive`: between `min_bitrate_kbps` and the stream's
+    /// bitrate, as the link allows (belacoder and ceracoder only).
+    #[serde(default)]
+    pub(crate) bitrate_mode: BitrateMode,
 }
 
 fn default_bitrate() -> u32 {
@@ -364,6 +383,32 @@ impl StreamSettings {
             }
             if profile.video == "copy" && !profile.scale.is_empty() {
                 return Err(format!("{at}: scale needs an encoder, not copy"));
+            }
+            let backend = profile.encoder;
+            if backend == Backend::Ffmpeg {
+                if profile.bitrate_mode == BitrateMode::Adaptive {
+                    return Err(format!(
+                        "{at}: bitrate_mode = \"adaptive\" needs encoder = \"belacoder\" or \
+                         \"ceracoder\""
+                    ));
+                }
+            } else {
+                let encoders = backend.video_encoders();
+                if !encoders.contains(&profile.video.as_str()) {
+                    return Err(format!(
+                        "{at}: encoder = \"{}\" takes video {}",
+                        backend.name(),
+                        encoders.join(", ")
+                    ));
+                }
+                if !profile.input.format.is_empty()
+                    && !["mjpeg", "yuyv422"].contains(&profile.input.format.as_str())
+                {
+                    return Err(format!(
+                        "{at}.input.format must be mjpeg or yuyv422 for encoder = \"{}\"",
+                        backend.name()
+                    ));
+                }
             }
         }
         for (name, stream) in &self.streams {

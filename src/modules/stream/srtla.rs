@@ -229,6 +229,7 @@ impl Senders {
                     sender.output.port.to_string(),
                     self.dir.join(format!("{name}.ips")).display().to_string(),
                 ],
+                env: Vec::new(),
             };
             *spawning.next_job += 1;
             let id = *spawning.next_job;
