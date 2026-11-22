@@ -240,9 +240,9 @@ async fn times_out_slow_commands() {
 }
 
 #[tokio::test]
-async fn a_past_deadline_times_out_at_once() {
+async fn a_past_deadline_times_out_at_once_and_never_runs() {
     let mut setup = setup(Timing::default());
-    let _video = setup.router.register("video");
+    let mut video = setup.router.register("video");
     registered(&mut setup).await;
 
     setup
@@ -258,6 +258,11 @@ async fn a_past_deadline_times_out_at_once() {
     let (_, envelope) = response(&mut setup).await;
 
     assert_eq!(envelope.status, Some(Status::Timeout));
+    assert_eq!(
+        envelope.error.unwrap().message,
+        "the command arrived after its deadline"
+    );
+    assert!(video.try_recv().is_err(), "the module never sees it");
 }
 
 #[tokio::test]

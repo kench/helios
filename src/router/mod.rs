@@ -321,6 +321,21 @@ impl Running {
             tracing::debug!(id = %command.id, "repeated command dropped");
             return;
         }
+        // A command that arrives after its deadline isn't run: its sender has stopped waiting
+        // and reported a failure, so running it now (a Wi-Fi network saved, a stream started)
+        // would contradict that.
+        if command
+            .deadline
+            .is_some_and(|deadline| deadline <= SystemTime::now())
+        {
+            tracing::warn!(id = %command.id, module = %command.module, name = %command.name, "command arrived after its deadline");
+            self.respond(
+                &thing,
+                &command,
+                &Outcome::error(codes::TIMEOUT, "the command arrived after its deadline"),
+            );
+            return;
+        }
         let Some(module) = self.modules.get(&command.module) else {
             let message = format!("no module {:?}", command.module);
             self.respond(
