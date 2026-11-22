@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::mqtt::manager::{Incoming, MqttHandle};
 
+pub mod aws_commands;
 pub mod helios;
 pub mod topics;
 

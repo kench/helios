@@ -33,6 +33,8 @@ use crate::router::CommandTransport;
 const CLIENT_CAPACITY: usize = 64;
 /// Incoming packets up to AWS IoT's 128 KB payload limit, plus the topic and headers.
 const MAX_PACKET: usize = 132 * 1024;
+/// AWS IoT's limit on the topic filters in one SUBSCRIBE.
+const MAX_FILTERS_PER_SUBSCRIBE: usize = 8;
 
 /// Timing for reconnects and shutdown. Tests shorten it.
 #[derive(Debug, Clone, Copy)]
@@ -440,6 +442,9 @@ impl Manager {
         let mut rate = RateLimit::new(self.options.timing.publishes_per_second);
         let mut flush = tokio::time::interval(Duration::from_millis(100));
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The SUBSCRIBEs still waiting for their SUBACK, oldest first, with their filters.
+        let mut subscribing: std::collections::VecDeque<Vec<String>> =
+            std::collections::VecDeque::new();
         loop {
             tokio::select! {
                 biased;
@@ -472,16 +477,23 @@ impl Manager {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
                         connected = Some(Instant::now());
                         phase = Phase::Subscribing;
-                        let filters = self
+                        // AWS IoT takes at most 8 filters in one SUBSCRIBE.
+                        subscribing = self
                             .session_filters(&target.thing)
-                            .into_iter()
-                            .map(|path| SubscribeFilter::new(path, QoS::AtLeastOnce));
-                        if let Err(error) = client.try_subscribe_many(filters) {
-                            return failed(format!("subscribe: {error}"), connected);
+                            .chunks(MAX_FILTERS_PER_SUBSCRIBE)
+                            .map(<[String]>::to_vec)
+                            .collect();
+                        for chunk in &subscribing {
+                            let filters = chunk
+                                .iter()
+                                .map(|path| SubscribeFilter::new(path.clone(), QoS::AtLeastOnce));
+                            if let Err(error) = client.try_subscribe_many(filters) {
+                                return failed(format!("subscribe: {error}"), connected);
+                            }
                         }
                     }
                     Ok(Event::Incoming(Packet::SubAck(ack))) if phase == Phase::Subscribing => {
-                        let filters = self.session_filters(&target.thing);
+                        let filters = subscribing.pop_front().unwrap_or_default();
                         for (filter, code) in filters.iter().zip(&ack.return_codes) {
                             if matches!(code, SubscribeReasonCode::Failure) {
                                 tracing::warn!(
@@ -490,8 +502,10 @@ impl Manager {
                                 );
                             }
                         }
-                        phase = Phase::Ready;
-                        self.online(target, &client);
+                        if subscribing.is_empty() {
+                            phase = Phase::Ready;
+                            self.online(target, &client);
+                        }
                     }
                     Ok(Event::Incoming(Packet::Publish(publish))) => {
                         let message = Incoming {
