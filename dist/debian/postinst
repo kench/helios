@@ -1,6 +1,6 @@
 #!/bin/sh
-# helios postinst: the helios, helios-stream and helios-rtmp system users, and a restart on upgrade if Helios
-# is running. The services aren't enabled or started on install: a device needs its config and
+# helios postinst: the helios, helios-stream and helios-rtmp system users, a restart on upgrade if Helios
+# is running, and helios-wifi.path enabled on a device that has Helios enabled. The services aren't enabled or started on install: a device needs its config and
 # token first (provisioning), and then enables helios.service (and helios-stream.service where
 # it streams) itself. The stream daemon isn't restarted here: it's told an upgrade is waiting,
 # and restarts itself once no stream is live (LLD 4, section 15).
@@ -31,6 +31,10 @@ if [ "$1" = configure ]; then
         systemctl try-reload-or-restart helios-rtmp.service || true
         if systemctl is-active --quiet helios-stream.service; then
             touch /run/helios-stream/restart-pending || true
+        fi
+        # A provisioned device (Helios enabled) applies Wi-Fi networks from this version on.
+        if systemctl is-enabled --quiet helios.service; then
+            systemctl enable --now helios-wifi.path || true
         fi
     fi
 fi

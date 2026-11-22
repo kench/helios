@@ -35,8 +35,9 @@ pub mod codes {
     pub const INTERNAL: &str = "INTERNAL";
 }
 
-/// A command as modules see it, whichever transport carried it.
-#[derive(Debug, Clone, PartialEq)]
+/// A command as modules see it, whichever transport carried it. Its `Debug` leaves out the
+/// arguments, which can hold secrets (a Wi-Fi passphrase).
+#[derive(Clone, PartialEq)]
 pub struct Command {
     /// The envelope `id`, or the AWS IoT execution ID.
     pub id: String,
@@ -48,6 +49,18 @@ pub struct Command {
     pub args: Value,
     /// When the sender stops waiting, if it said.
     pub deadline: Option<SystemTime>,
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Command")
+            .field("id", &self.id)
+            .field("module", &self.module)
+            .field("name", &self.name)
+            .field("args", &format_args!(".."))
+            .field("deadline", &self.deadline)
+            .finish()
+    }
 }
 
 /// How a command ended.
@@ -164,7 +177,14 @@ impl PendingCommand {
     }
 
     /// A command for module tests, with the channel its answer arrives on.
-    #[cfg(all(test, any(feature = "module-display", feature = "module-usb")))]
+    #[cfg(all(
+        test,
+        any(
+            feature = "module-display",
+            feature = "module-usb",
+            feature = "module-net"
+        )
+    ))]
     pub(crate) fn for_test(
         module: &str,
         name: &str,
@@ -299,6 +319,21 @@ impl Running {
         };
         if !self.first_time(&command.id) {
             tracing::debug!(id = %command.id, "repeated command dropped");
+            return;
+        }
+        // A command that arrives after its deadline isn't run: its sender has stopped waiting
+        // and reported a failure, so running it now (a Wi-Fi network saved, a stream started)
+        // would contradict that.
+        if command
+            .deadline
+            .is_some_and(|deadline| deadline <= SystemTime::now())
+        {
+            tracing::warn!(id = %command.id, module = %command.module, name = %command.name, "command arrived after its deadline");
+            self.respond(
+                &thing,
+                &command,
+                &Outcome::error(codes::TIMEOUT, "the command arrived after its deadline"),
+            );
             return;
         }
         let Some(module) = self.modules.get(&command.module) else {

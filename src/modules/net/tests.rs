@@ -460,23 +460,31 @@ fn since_moves_only_with_the_operating_state() {
     let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_000_000);
     let later = start + Duration::from_secs(60);
     let up = json!({"eth0": {"oper_state": "up", "mtu": 1500}});
-    let (first, event) = reporter.update(snapshot(up.clone(), false), start).unwrap();
+    let (first, event) = reporter
+        .update(snapshot(up.clone(), false), json!({}), start)
+        .unwrap();
     assert!(event.is_none(), "no event for the first report");
     let since = first["interfaces"]["eth0"]["since"].clone();
     assert!(since.as_str().unwrap().starts_with("2026-11-18T"));
     assert!(
-        reporter.update(snapshot(up, false), later).is_none(),
+        reporter
+            .update(snapshot(up, false), json!({}), later)
+            .is_none(),
         "nothing changed"
     );
     let bigger = json!({"eth0": {"oper_state": "up", "mtu": 9000}});
-    let (second, event) = reporter.update(snapshot(bigger, false), later).unwrap();
+    let (second, event) = reporter
+        .update(snapshot(bigger, false), json!({}), later)
+        .unwrap();
     assert_eq!(second["interfaces"]["eth0"]["since"], since);
     assert_eq!(
         event,
         Some(json!({"added": [], "removed": [], "changed": {"eth0": ["mtu"]}}))
     );
     let down = json!({"eth0": {"oper_state": "down", "mtu": 9000}});
-    let (third, _) = reporter.update(snapshot(down, true), later).unwrap();
+    let (third, _) = reporter
+        .update(snapshot(down, true), json!({}), later)
+        .unwrap();
     assert_ne!(third["interfaces"]["eth0"]["since"], since);
     assert_eq!(third["truncated"], true);
 }
@@ -547,6 +555,7 @@ async fn reports_at_start_and_after_a_change() {
     let module = Arc::new(NetModule::with_kernel(
         NetSettings::default(),
         Arc::clone(&kernel) as Arc<dyn Kernel>,
+        sysfs.path(),
     ));
     let (ctx, mut reports, mut requests) = context(sysfs.path());
     let cancel = ctx.cancel.clone();
@@ -620,7 +629,7 @@ async fn fails_when_the_kernel_does() {
     let (kernel, _changes) = FakeKernel::new(board_tables());
     kernel.watch.lock().unwrap().take();
     let (ctx, _reports, _requests) = context(sysfs.path());
-    let error = NetModule::with_kernel(NetSettings::default(), kernel)
+    let error = NetModule::with_kernel(NetSettings::default(), kernel, sysfs.path())
         .run(ctx)
         .await
         .unwrap_err();
@@ -630,7 +639,7 @@ async fn fails_when_the_kernel_does() {
     let (kernel, _changes) = FakeKernel::new(board_tables());
     *kernel.fail_dumps.lock().unwrap() = true;
     let (ctx, _reports, _requests) = context(sysfs.path());
-    let error = NetModule::with_kernel(NetSettings::default(), kernel)
+    let error = NetModule::with_kernel(NetSettings::default(), kernel, sysfs.path())
         .run(ctx)
         .await
         .unwrap_err();
@@ -639,8 +648,9 @@ async fn fails_when_the_kernel_does() {
     // The change socket fails later: the listener stops, and so does the run.
     let (kernel, changes) = FakeKernel::new(board_tables());
     let (ctx, mut reports, _requests) = context(sysfs.path());
+    let wifi_dir = sysfs.path().to_owned();
     let running = tokio::spawn(async move {
-        NetModule::with_kernel(NetSettings::default(), kernel)
+        NetModule::with_kernel(NetSettings::default(), kernel, &wifi_dir)
             .run(ctx)
             .await
     });
@@ -671,4 +681,149 @@ fn a_missing_nexthop_dump_is_fine_but_other_errors_are_not() {
         snapshot.interfaces["enP4p65s0"]["default_routes"],
         json!([{"family": "ipv4", "gateway": "192.168.5.1", "metric": 100}])
     );
+}
+
+async fn ask(
+    commands: &mpsc::Sender<crate::router::PendingCommand>,
+    name: &str,
+    args: Value,
+) -> crate::router::Outcome {
+    let (pending, answer) = crate::router::PendingCommand::for_test("net", name, args);
+    commands.send(pending).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), answer)
+        .await
+        .expect("an answer")
+        .expect("answered")
+}
+
+fn error_code(outcome: &crate::router::Outcome) -> &str {
+    match outcome {
+        crate::router::Outcome::Err { code, .. } => code,
+        crate::router::Outcome::Ok(value) => panic!("expected an error, got {value}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sets_removes_and_lists_wifi_networks() {
+    let sysfs = board_sysfs();
+    let wifi_dir = tempfile::tempdir().unwrap();
+    let (kernel, _changes) = FakeKernel::new(board_tables());
+    let (mut ctx, mut reports, _requests) = context(sysfs.path());
+    let (commands, receiver) = mpsc::channel(4);
+    ctx.commands = receiver;
+    let cancel = ctx.cancel.clone();
+    let module = NetModule::with_kernel(NetSettings::default(), kernel, wifi_dir.path());
+    let running = tokio::spawn(async move { module.run(ctx).await });
+    let first = next_report(&mut reports).await;
+    assert_eq!(first["wifi"], json!({"networks": [], "applied": null}));
+
+    let saved = ask(
+        &commands,
+        "net.wifi.set",
+        json!({"ssid": "Venue / Media", "passphrase": "correct horse battery", "hidden": true}),
+    )
+    .await;
+    assert_eq!(
+        saved,
+        crate::router::Outcome::Ok(json!({"network": {
+            "ssid": "Venue / Media", "security": "personal", "hidden": true,
+        }}))
+    );
+    let report = next_report(&mut reports).await;
+    assert_eq!(
+        report["wifi"]["networks"],
+        json!([{"ssid": "Venue / Media", "security": "personal", "hidden": true}])
+    );
+    assert!(
+        !report.to_string().contains("horse"),
+        "no passphrase in the shadow"
+    );
+    let stored = std::fs::read_to_string(wifi_dir.path().join("networks.json")).unwrap();
+    assert!(stored.contains("correct horse battery"));
+
+    let open = ask(&commands, "net.wifi.set", json!({"ssid": "Cafe"})).await;
+    assert!(matches!(open, crate::router::Outcome::Ok(_)));
+    next_report(&mut reports).await;
+    let listed = ask(&commands, "net.wifi.list", json!(null)).await;
+    assert_eq!(
+        listed,
+        crate::router::Outcome::Ok(json!({"networks": [
+            {"ssid": "Venue / Media", "security": "personal", "hidden": true},
+            {"ssid": "Cafe", "security": "open", "hidden": false},
+        ]}))
+    );
+
+    for (args, code) in [
+        (
+            json!({"ssid": "Home", "passphrase": "short"}),
+            "INVALID_PASSPHRASE",
+        ),
+        (
+            json!({"ssid": "Home", "passphrase": 12_345_678}),
+            "INVALID_PASSPHRASE",
+        ),
+        (
+            json!({"passphrase": "correct horse battery"}),
+            "INVALID_SSID",
+        ),
+        (json!({"ssid": ""}), "INVALID_SSID"),
+        (
+            json!({"ssid": "Home", "hidden": "yes"}),
+            "INVALID_ARGUMENTS",
+        ),
+        (json!(["Home"]), "INVALID_ARGUMENTS"),
+    ] {
+        let outcome = ask(&commands, "net.wifi.set", args.clone()).await;
+        assert_eq!(error_code(&outcome), code, "{args}");
+    }
+    let outcome = ask(&commands, "net.wifi.remove", json!({})).await;
+    assert_eq!(error_code(&outcome), "INVALID_SSID");
+    let outcome = ask(&commands, "net.wifi.scan", json!({})).await;
+    assert_eq!(error_code(&outcome), "UNKNOWN_COMMAND");
+
+    let removed = ask(&commands, "net.wifi.remove", json!({"ssid": "Cafe"})).await;
+    assert_eq!(
+        removed,
+        crate::router::Outcome::Ok(json!({"removed": true}))
+    );
+    let report = next_report(&mut reports).await;
+    assert_eq!(report["wifi"]["networks"].as_array().unwrap().len(), 1);
+    let again = ask(&commands, "net.wifi.remove", json!({"ssid": "Cafe"})).await;
+    assert_eq!(again, crate::router::Outcome::Ok(json!({"removed": false})));
+
+    // A store Helios can't read is an internal error, and so reported.
+    std::fs::write(wifi_dir.path().join("networks.json"), "{").unwrap();
+    for (name, args) in [
+        ("net.wifi.list", json!(null)),
+        ("net.wifi.remove", json!({"ssid": "Cafe"})),
+        ("net.wifi.set", json!({"ssid": "Cafe"})),
+    ] {
+        let outcome = ask(&commands, name, args).await;
+        assert_eq!(error_code(&outcome), "INTERNAL", "{name}");
+    }
+
+    drop(commands);
+    cancel.cancel();
+    assert_eq!(running.await.unwrap(), Ok(()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuses_wifi_without_an_adapter() {
+    let sysfs = Sysfs::new();
+    let wifi_dir = tempfile::tempdir().unwrap();
+    let (kernel, _changes) = FakeKernel::new(board_tables());
+    let (mut ctx, mut reports, _requests) = context(sysfs.path());
+    let (commands, receiver) = mpsc::channel(1);
+    ctx.commands = receiver;
+    let cancel = ctx.cancel.clone();
+    let module = NetModule::with_kernel(NetSettings::default(), kernel, wifi_dir.path());
+    let running = tokio::spawn(async move { module.run(ctx).await });
+    next_report(&mut reports).await;
+    let outcome = ask(&commands, "net.wifi.set", json!({"ssid": "Cafe"})).await;
+    assert_eq!(error_code(&outcome), "NO_ADAPTER");
+    // The module keeps going once nothing can send it commands.
+    drop(commands);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.cancel();
+    assert_eq!(running.await.unwrap(), Ok(()));
 }

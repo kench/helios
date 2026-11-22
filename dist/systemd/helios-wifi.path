@@ -1,0 +1,13 @@
+# Helios Wi-Fi: applies the networks Helios keeps (`helios wifi`, or the Control API's
+# SetWifiNetwork) whenever its store changes, by starting helios-wifi.service (LLD 3, section 10).
+# Helios writes the store unprivileged; the service applies it as root.
+
+[Unit]
+Description=Watch Helios's Wi-Fi networks
+
+[Path]
+PathChanged=/var/lib/helios/wifi/networks.json
+Unit=helios-wifi.service
+
+[Install]
+WantedBy=paths.target

@@ -12,6 +12,9 @@ User=helios
 # unit fails to start if the group doesn't exist. The scanner's autorun.sh sets it itself.
 #SupplementaryGroups=video
 ExecStart=/usr/bin/helios
+# /var/lib/helios: the Wi-Fi networks Helios keeps (wifi/networks.json), read by helios-wifi.service.
+StateDirectory=helios
+StateDirectoryMode=0700
 Restart=on-failure
 # Exit code 78 (EX_CONFIG) means a wrong or locked PIN, or a certificate that doesn't match the
 # key. Restarting would spend another PIN try, so don't.
