@@ -246,9 +246,9 @@ impl NetModule {
     async fn command(&self, mut pending: PendingCommand, reporter: &Reporter) -> bool {
         let args = std::mem::take(&mut pending.command.args);
         let (outcome, changed) = match pending.command.name.as_str() {
-            "net.wifi.set" => self.wifi_set(args, reporter).await,
-            "net.wifi.remove" => self.wifi_remove(&args),
-            "net.wifi.list" => (self.wifi_list(), false),
+            "wifi.set" => self.wifi_set(args, reporter).await,
+            "wifi.remove" => self.wifi_remove(&args),
+            "wifi.list" => (self.wifi_list(), false),
             other => (
                 Outcome::error(codes::UNKNOWN_COMMAND, format!("no command {other}")),
                 false,

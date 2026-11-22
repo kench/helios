@@ -719,7 +719,7 @@ async fn sets_removes_and_lists_wifi_networks() {
 
     let saved = ask(
         &commands,
-        "net.wifi.set",
+        "wifi.set",
         json!({"ssid": "Venue / Media", "passphrase": "correct horse battery", "hidden": true}),
     )
     .await;
@@ -741,10 +741,10 @@ async fn sets_removes_and_lists_wifi_networks() {
     let stored = std::fs::read_to_string(wifi_dir.path().join("networks.json")).unwrap();
     assert!(stored.contains("correct horse battery"));
 
-    let open = ask(&commands, "net.wifi.set", json!({"ssid": "Cafe"})).await;
+    let open = ask(&commands, "wifi.set", json!({"ssid": "Cafe"})).await;
     assert!(matches!(open, crate::router::Outcome::Ok(_)));
     next_report(&mut reports).await;
-    let listed = ask(&commands, "net.wifi.list", json!(null)).await;
+    let listed = ask(&commands, "wifi.list", json!(null)).await;
     assert_eq!(
         listed,
         crate::router::Outcome::Ok(json!({"networks": [
@@ -773,30 +773,30 @@ async fn sets_removes_and_lists_wifi_networks() {
         ),
         (json!(["Home"]), "INVALID_ARGUMENTS"),
     ] {
-        let outcome = ask(&commands, "net.wifi.set", args.clone()).await;
+        let outcome = ask(&commands, "wifi.set", args.clone()).await;
         assert_eq!(error_code(&outcome), code, "{args}");
     }
-    let outcome = ask(&commands, "net.wifi.remove", json!({})).await;
+    let outcome = ask(&commands, "wifi.remove", json!({})).await;
     assert_eq!(error_code(&outcome), "INVALID_SSID");
-    let outcome = ask(&commands, "net.wifi.scan", json!({})).await;
+    let outcome = ask(&commands, "wifi.scan", json!({})).await;
     assert_eq!(error_code(&outcome), "UNKNOWN_COMMAND");
 
-    let removed = ask(&commands, "net.wifi.remove", json!({"ssid": "Cafe"})).await;
+    let removed = ask(&commands, "wifi.remove", json!({"ssid": "Cafe"})).await;
     assert_eq!(
         removed,
         crate::router::Outcome::Ok(json!({"removed": true}))
     );
     let report = next_report(&mut reports).await;
     assert_eq!(report["wifi"]["networks"].as_array().unwrap().len(), 1);
-    let again = ask(&commands, "net.wifi.remove", json!({"ssid": "Cafe"})).await;
+    let again = ask(&commands, "wifi.remove", json!({"ssid": "Cafe"})).await;
     assert_eq!(again, crate::router::Outcome::Ok(json!({"removed": false})));
 
     // A store Helios can't read is an internal error, and so reported.
     std::fs::write(wifi_dir.path().join("networks.json"), "{").unwrap();
     for (name, args) in [
-        ("net.wifi.list", json!(null)),
-        ("net.wifi.remove", json!({"ssid": "Cafe"})),
-        ("net.wifi.set", json!({"ssid": "Cafe"})),
+        ("wifi.list", json!(null)),
+        ("wifi.remove", json!({"ssid": "Cafe"})),
+        ("wifi.set", json!({"ssid": "Cafe"})),
     ] {
         let outcome = ask(&commands, name, args).await;
         assert_eq!(error_code(&outcome), "INTERNAL", "{name}");
@@ -819,7 +819,7 @@ async fn refuses_wifi_without_an_adapter() {
     let module = NetModule::with_kernel(NetSettings::default(), kernel, wifi_dir.path());
     let running = tokio::spawn(async move { module.run(ctx).await });
     next_report(&mut reports).await;
-    let outcome = ask(&commands, "net.wifi.set", json!({"ssid": "Cafe"})).await;
+    let outcome = ask(&commands, "wifi.set", json!({"ssid": "Cafe"})).await;
     assert_eq!(error_code(&outcome), "NO_ADAPTER");
     // The module keeps going once nothing can send it commands.
     drop(commands);
@@ -873,7 +873,7 @@ async fn opens_a_passphrase_sealed_to_the_device() {
 
     let saved = ask(
         &commands,
-        "net.wifi.set",
+        "wifi.set",
         json!({"ssid": "Home", "passphrase": seal("Home", "correct horse battery")}),
     )
     .await;
@@ -894,7 +894,7 @@ async fn opens_a_passphrase_sealed_to_the_device() {
     ] {
         let outcome = ask(
             &commands,
-            "net.wifi.set",
+            "wifi.set",
             json!({"ssid": "Home", "passphrase": passphrase}),
         )
         .await;
@@ -924,11 +924,51 @@ async fn a_sealed_passphrase_needs_a_ready_identity() {
     next_report(&mut reports).await;
     let outcome = ask(
         &commands,
-        "net.wifi.set",
+        "wifi.set",
         json!({"ssid": "Home", "passphrase": {"sealed": {"enc": "AAAA", "ct": "AAAA"}}}),
     )
     .await;
     assert_eq!(error_code(&outcome), "SECRET_UNREADABLE");
+    drop(commands);
+    cancel.cancel();
+    assert_eq!(running.await.unwrap(), Ok(()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answers_commands_as_the_custom_topics_decode_them() {
+    use crate::router::CommandTransport;
+    use crate::router::topics::TopicsTransport;
+
+    let sysfs = board_sysfs();
+    let wifi_dir = tempfile::tempdir().unwrap();
+    let (kernel, _changes) = FakeKernel::new(board_tables());
+    let (mut ctx, mut reports, _requests) = context(sysfs.path());
+    let (commands, receiver) = mpsc::channel(4);
+    ctx.commands = receiver;
+    let cancel = ctx.cancel.clone();
+    let module = NetModule::with_kernel(NetSettings::default(), kernel, wifi_dir.path());
+    let running = tokio::spawn(async move { module.run(ctx).await });
+    next_report(&mut reports).await;
+
+    let envelope = json!({
+        "v": 1, "id": "c1", "correlation_id": null, "ts": "2026-11-22T20:00:00.000Z",
+        "thing": "t-1", "module": "net", "type": "net.wifi.set",
+        "payload": {"ssid": "Cafe"},
+    });
+    let command = TopicsTransport
+        .decode("t-1", "helios/t-1/cmd/net", envelope.to_string().as_bytes())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (command.module.as_str(), command.name.as_str()),
+        ("net", "wifi.set")
+    );
+    let outcome = ask(&commands, &command.name, command.args).await;
+    assert!(
+        matches!(outcome, crate::router::Outcome::Ok(_)),
+        "{outcome:?}"
+    );
+
     drop(commands);
     cancel.cancel();
     assert_eq!(running.await.unwrap(), Ok(()));
