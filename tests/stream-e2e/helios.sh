@@ -1,8 +1,10 @@
 #!/bin/bash
-# Stage 2 of the stream harness: Helios's stream module itself, with the real ffmpeg and
-# srtla_send it starts, through srtla_rec to irl-srt-server. Two dummy interfaces are the uplinks
-# (up0 10.10.1.2, up1 10.10.2.2) and the receiving side listens on rx0 (10.10.0.1); the test
-# (src/modules/stream/e2e.rs) drops and restores an uplink on the way. Run setup.sh first.
+# Stage 2 of the stream harness: `helios stream-daemon` as its own process, with the real ffmpeg
+# and srtla_send it starts, through srtla_rec to irl-srt-server, and the test as Helios (the
+# daemon's client). Two dummy interfaces are the uplinks (up0 10.10.1.2, up1 10.10.2.2) and the
+# receiving side listens on rx0 (10.10.0.1). The test (src/modules/stream/e2e.rs) stops Helios
+# mid-stream and checks the stream carries on, then drops and restores an uplink. Run setup.sh
+# first.
 #
 # Usage: tests/stream-e2e/helios.sh
 set -euo pipefail
@@ -12,7 +14,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 TOP=$(cd "$HERE/../.." && pwd)
 if [ "${HELIOS_E2E_INSIDE:-}" != 1 ]; then
     # Build first, outside the namespace: it has no network.
-    (cd "$TOP" && cargo test --locked --features module-stream --lib --no-run -q)
+    (cd "$TOP" && cargo build --locked --features module-stream -q &&
+        cargo test --locked --features module-stream --lib --no-run -q)
     exec env HELIOS_E2E_INSIDE=1 unshare --map-root-user --net "$0" "$@"
 fi
 export PATH=$PATH:/usr/sbin:/sbin
@@ -73,7 +76,7 @@ sleep 1
 echo "== Helios's stream module (src/modules/stream/e2e.rs)"
 cd "$TOP"
 status=0
-HELIOS_E2E_DIR=$E2E HELIOS_E2E_RUN=$RUN cargo test --offline --locked --features module-stream \
+HELIOS_E2E_DIR=$E2E HELIOS_E2E_RUN=$RUN HELIOS_E2E_BIN=$TOP/target/debug/helios cargo test --offline --locked --features module-stream \
     --lib -q modules::stream::e2e -- --ignored --nocapture --test-threads=1 \
     >"$RUN/test.log" 2>&1 || status=$?
 grep -E "^HELIOS|test result|panicked|left:|right:" "$RUN/test.log" || true

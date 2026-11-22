@@ -75,6 +75,9 @@ version rather than moving the tag.
 - Modules are Cargo features, off by default; a module's config section is ignored in builds
   without it. The scanner build needs `--features module-display,module-usb`, the boards'
   package `--features module-usb,module-stream` (`FEATURES` in `release.yml`).
+- Streams run in `helios stream-daemon` (`helios-stream.service`); Helios's `stream` module is
+  only its client (`src/modules/stream/client.rs`, protocol in `control.rs`). Engine changes go
+  in the daemon side; anything that must survive a Helios restart belongs there.
 - Stream module changes run through `tests/stream-e2e/` before their PR (`setup.sh`, then
   `external.sh` and `helios.sh`; no root needed), with the result in the PR.
 - A module implements `Module` (`src/modules/mod.rs`) and runs under the supervisor, which gives

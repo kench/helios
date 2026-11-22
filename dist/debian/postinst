@@ -1,7 +1,9 @@
 #!/bin/sh
-# helios postinst: the helios system user, and a restart on upgrade if Helios is running.
-# The service isn't enabled or started on install: a device needs its config and token first
-# (provisioning), and then enables helios.service itself.
+# helios postinst: the helios and helios-stream system users, and a restart on upgrade if Helios
+# is running. The services aren't enabled or started on install: a device needs its config and
+# token first (provisioning), and then enables helios.service (and helios-stream.service where
+# it streams) itself. The stream daemon isn't restarted here: it's told an upgrade is waiting,
+# and restarts itself once no stream is live (LLD 4, section 15).
 set -e
 
 if [ "$1" = configure ]; then
@@ -9,10 +11,20 @@ if [ "$1" = configure ]; then
         adduser --system --group --home /nonexistent --no-create-home \
             --gecos "Helios agent" helios
     fi
+    if ! getent passwd helios-stream >/dev/null; then
+        adduser --system --ingroup helios --home /nonexistent --no-create-home \
+            --gecos "Helios stream daemon" helios-stream
+    fi
+    if getent group video >/dev/null; then
+        adduser helios-stream video >/dev/null || true
+    fi
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
         # Upgrades restart a running Helios; installs and stopped services are left alone.
         systemctl try-restart helios.service || true
+        if systemctl is-active --quiet helios-stream.service; then
+            touch /run/helios-stream/restart-pending || true
+        fi
     fi
 fi
 

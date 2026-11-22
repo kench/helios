@@ -59,6 +59,10 @@ enum Command {
     Usb(usb::Command),
     /// Set up and inspect the device's token.
     Provision(ProvisionArgs),
+    /// Run the stream daemon (helios-stream.service): video streams that outlive Helios's
+    /// restarts (LLD 4, section 15).
+    #[cfg(feature = "module-stream")]
+    StreamDaemon,
 }
 
 #[derive(Debug, clap::Args)]
@@ -318,6 +322,8 @@ pub fn run(args: impl IntoIterator<Item = OsString>, console: &mut dyn Console) 
         Some(Command::Provision(args)) => provision(&args, console),
         #[cfg(feature = "module-usb")]
         Some(Command::Usb(command)) => usb::run(command, console.out()),
+        #[cfg(feature = "module-stream")]
+        Some(Command::StreamDaemon) => return crate::modules::stream::daemon::main(&cli.config),
     };
     match result {
         Ok(()) => EXIT_OK,

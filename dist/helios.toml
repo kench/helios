@@ -65,12 +65,17 @@ mp_sd_mount = "/init/efad/mp_sd" # scanner: where the platform mounts the PROXdo
 
 [modules.stream]
 # Video streams through ffmpeg to SRT listeners (LLD 4): directly, or bonded over several uplinks
-# by srtla_send. Needs a build with the module-stream Cargo feature and [modules.usb] for
-# cameras. Commands: stream.start, stream.stop, stream.status. No streams are configured here.
+# by srtla_send. Needs a build with the module-stream Cargo feature. Streams run in the stream
+# daemon, helios-stream.service (`helios stream-daemon`, which reads this section too), so they
+# keep going while Helios restarts; Helios is its client. Enable both services where it streams.
+# Commands: stream.start, stream.stop, stream.status. No streams are configured here.
 enabled = false
 ffmpeg = "/usr/lib/helios-ffmpeg/bin/ffmpeg"
 srtla_send = "/usr/bin/srtla_send"
-runtime_dir = "/run/helios"        # senders' IP files and control sockets go in <runtime_dir>/srtla
+control_socket = "/run/helios-stream/control.sock"  # the daemon's; Helios connects here
+state_dir = "/var/lib/helios-stream"  # the daemon saves the desired state here
+client_user = "helios"             # who may use the control socket (besides root)
+runtime_dir = "/run/helios-stream" # senders' IP files and control sockets go in <runtime_dir>/srtla
 srtla_port_base = 6000             # srtla outputs get local ports from here, in name order
 sender_idle_s = 60                 # 1 to 3600: how long a sender outlives its last stream
 stats_interval_s = 30              # 5 to 3600: stream.stats while live

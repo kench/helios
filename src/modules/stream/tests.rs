@@ -49,7 +49,7 @@ output = "main"
 streamid = "publish/live/backpack"
 "#;
 
-fn settings(text: &str) -> StreamSettings {
+pub(super) fn settings(text: &str) -> StreamSettings {
     toml::from_str::<StreamSettings>(text)
         .expect("settings")
         .check()
@@ -307,23 +307,23 @@ async fn the_system_spawner_runs_and_stops_a_process_group() {
 }
 
 /// A job started by the fake spawner.
-struct Started {
-    spec: JobSpec,
+pub(super) struct Started {
+    pub(super) spec: JobSpec,
     job: u64,
     events: mpsc::UnboundedSender<Tagged>,
-    stopped: Arc<AtomicBool>,
+    pub(super) stopped: Arc<AtomicBool>,
     reloads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Started {
-    fn send(&self, event: JobEvent) {
+    pub(super) fn send(&self, event: JobEvent) {
         let _ = self.events.send(Tagged {
             job: self.job,
             event,
         });
     }
 
-    fn progress(&self, out_time_us: i64) {
+    pub(super) fn progress(&self, out_time_us: i64) {
         for line in [
             format!("fps=30\nout_time_us={out_time_us}"),
             "progress=continue".into(),
@@ -357,10 +357,10 @@ impl Job for FakeJob {
     }
 }
 
-struct FakeSpawner {
-    started: mpsc::UnboundedSender<Started>,
-    encoders: Option<BTreeSet<String>>,
-    refuse: AtomicBool,
+pub(super) struct FakeSpawner {
+    pub(super) started: mpsc::UnboundedSender<Started>,
+    pub(super) encoders: Option<BTreeSet<String>>,
+    pub(super) refuse: AtomicBool,
 }
 
 impl Spawner for FakeSpawner {

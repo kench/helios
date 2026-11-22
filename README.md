@@ -90,11 +90,17 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   `stream.stats`; the `stream` shadow has each stream's and each bonded output's state, with
   per-link statistics. ffmpeg's arguments come only from the local profiles.
 
+  Streams run in the stream daemon, `helios stream-daemon` (`helios-stream.service`, user
+  `helios-stream`), so they keep going while Helios restarts or is upgraded; Helios's `stream`
+  module is its client over `/run/helios-stream/control.sock` (JSON-RPC lines). The daemon saves
+  the desired state in `/var/lib/helios-stream`, and after an upgrade restarts itself only once no
+  stream is live.
+
   `tests/stream-e2e/` runs it end to end without root: `setup.sh` builds nginx's RTMP module,
   `srtla_send`, `srtla_rec` and irl-srt-server (pinned) into `~/.cache/helios-stream-e2e`;
-  `external.sh` checks the external pieces together; `helios.sh` runs this module with the real
-  ffmpeg and `srtla_send` through `srtla_rec` to irl-srt-server, dropping and restoring an uplink
-  on the way.
+  `external.sh` checks the external pieces together; `helios.sh` runs the daemon as its own
+  process with the real ffmpeg and `srtla_send` through `srtla_rec` to irl-srt-server, stops
+  Helios mid-stream (the stream carries on, same processes), and drops and restores an uplink.
 
 The other modules come later.
 
