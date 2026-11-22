@@ -13,6 +13,9 @@ use super::netlink::{
     IFA_F_DADFAILED, IFA_F_DEPRECATED, IFA_F_TEMPORARY, IFA_F_TENTATIVE, IFF_LOOPBACK, IFF_UP,
     Link, Tables,
 };
+#[cfg(test)]
+use super::nl80211::NoWireless;
+use super::nl80211::Wireless;
 use crate::sysfs::read_attr;
 
 /// At most this many interfaces are reported.
@@ -30,7 +33,19 @@ pub(crate) struct Snapshot {
 }
 
 /// Builds the snapshot from `tables`, reading `sysfs` (normally `/sys`) for each interface.
+#[cfg(test)]
 pub(crate) fn build(tables: &Tables, sysfs: &Path, settings: &NetSettings) -> Snapshot {
+    build_with(tables, sysfs, settings, &NoWireless)
+}
+
+/// [`build`], asking `wireless` what each Wi-Fi interface is joined to (`wifi`: SSID, the access
+/// point's MAC, frequency and signal, or `null` when it isn't joined).
+pub(crate) fn build_with(
+    tables: &Tables,
+    sysfs: &Path,
+    settings: &NetSettings,
+    wireless: &dyn Wireless,
+) -> Snapshot {
     let mut truncated = false;
     let mut links: Vec<(&Link, Device)> = tables
         .links
@@ -94,6 +109,21 @@ pub(crate) fn build(tables: &Tables, sysfs: &Path, settings: &NetSettings) -> Sn
             .filter(|p| Some(*p) != link.mac.as_ref())
         {
             interface["permanent_mac"] = json!(hex(permanent));
+        }
+        if device.kind == "wifi" {
+            interface["wifi"] = match wireless.link(link.index) {
+                Ok(Some(joined)) => json!({
+                    "ssid": joined.ssid,
+                    "bssid": joined.bssid.map(|bssid| hex(&bssid)),
+                    "frequency_mhz": joined.frequency_mhz,
+                    "signal_dbm": joined.signal_dbm,
+                }),
+                Ok(None) => Value::Null,
+                Err(error) => {
+                    tracing::debug!(%error, interface = %link.name, "nl80211 not read");
+                    Value::Null
+                }
+            };
         }
         interfaces.insert(link.name.clone(), interface);
     }

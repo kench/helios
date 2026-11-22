@@ -150,6 +150,11 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   with a `net.changed` event naming the interfaces added and removed and the fields that
   changed. Loopback and `exclude` (default `veth*`) are left out; at most 16 interfaces and 8
   addresses of each family, else `truncated`. Read-only, no extra permissions, no `unsafe`.
+  A Wi-Fi interface also has `wifi`: the joined network's `ssid`, the access point's `bssid`,
+  `frequency_mhz` and `signal_dbm` (the driver's average), read over nl80211 (generic netlink,
+  parsed in Helios), or `null` when it isn't joined. The signal is reported in 5 dB steps that
+  move only when the reading has moved a whole step, so it doesn't rewrite the shadow all the
+  time; it's read with everything else (link changes, and every minute).
   `helios net list` prints the same snapshot. `tests/net.rs` checks it against a real kernel
   in a user network namespace (`unshare -rn`).
 

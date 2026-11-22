@@ -239,7 +239,13 @@ impl Watch for FakeWatch {
 fn read_board() -> (Value, bool) {
     let (kernel, _changes) = FakeKernel::new(board_tables());
     let sysfs = board_sysfs();
-    let snapshot = super::current(kernel.as_ref(), sysfs.path(), &NetSettings::default()).unwrap();
+    let snapshot = super::current(
+        kernel.as_ref(),
+        &super::nl80211::NoWireless,
+        sysfs.path(),
+        &NetSettings::default(),
+    )
+    .unwrap();
     (Value::Object(snapshot.interfaces), snapshot.truncated)
 }
 
@@ -672,6 +678,7 @@ fn a_missing_nexthop_dump_is_fine_but_other_errors_are_not() {
     let (kernel, _changes) = FakeKernel::new(replies);
     let snapshot = super::current(
         kernel.as_ref(),
+        &super::nl80211::NoWireless,
         Path::new("/nonexistent"),
         &NetSettings::default(),
     )
@@ -970,6 +977,111 @@ async fn answers_commands_as_the_custom_topics_decode_them() {
     );
 
     drop(commands);
+    cancel.cancel();
+    assert_eq!(running.await.unwrap(), Ok(()));
+}
+
+/// Wi-Fi state a test sets.
+struct FakeWireless(Mutex<Option<io::Result<Option<super::nl80211::WifiLink>>>>);
+
+impl super::nl80211::Wireless for FakeWireless {
+    fn link(&self, index: u32) -> io::Result<Option<super::nl80211::WifiLink>> {
+        assert_eq!(index, 4, "only the Wi-Fi interface is asked");
+        match self.0.lock().unwrap().take() {
+            Some(answer) => answer,
+            None => Ok(None),
+        }
+    }
+}
+
+fn joined(signal: i32) -> super::nl80211::WifiLink {
+    super::nl80211::WifiLink {
+        ssid: "Home".into(),
+        bssid: Some([0x8a, 0x78, 0x48, 0xfe, 0x86, 0x5a]),
+        frequency_mhz: Some(5240),
+        signal_dbm: Some(signal),
+    }
+}
+
+#[test]
+fn reports_what_the_wifi_interface_is_joined_to() {
+    let sysfs = board_sysfs();
+    let (kernel, _changes) = FakeKernel::new(board_tables());
+    let tables = super::netlink::read(kernel.as_ref()).unwrap();
+    let wireless = FakeWireless(Mutex::new(Some(Ok(Some(joined(-47))))));
+    let snapshot =
+        super::snapshot::build_with(&tables, sysfs.path(), &NetSettings::default(), &wireless);
+    assert_eq!(
+        snapshot.interfaces["wlP2p33s0"]["wifi"],
+        json!({"ssid": "Home", "bssid": "8a:78:48:fe:86:5a", "frequency_mhz": 5240, "signal_dbm": -47})
+    );
+    assert!(
+        snapshot.interfaces["enP4p65s0"].get("wifi").is_none(),
+        "only Wi-Fi interfaces"
+    );
+    // Not joined, or nl80211 failing: null.
+    for answer in [Ok(None), Err(io::Error::other("no nl80211"))] {
+        let wireless = FakeWireless(Mutex::new(Some(answer)));
+        let snapshot =
+            super::snapshot::build_with(&tables, sysfs.path(), &NetSettings::default(), &wireless);
+        assert_eq!(snapshot.interfaces["wlP2p33s0"]["wifi"], Value::Null);
+    }
+}
+
+#[test]
+fn the_signal_moves_in_steps() {
+    let mut reporter = Reporter::default();
+    let now = SystemTime::now();
+    let report = |reporter: &mut Reporter, signal: i64, bssid: &str| {
+        let interfaces = json!({"wlan0": {"oper_state": "up", "wifi": {
+            "ssid": "Home", "bssid": bssid, "signal_dbm": signal,
+        }}});
+        reporter
+            .update(snapshot(interfaces, false), json!({}), now)
+            .map(|(reported, _)| reported["interfaces"]["wlan0"]["wifi"]["signal_dbm"].clone())
+    };
+    let ap = "8a:78:48:fe:86:5a";
+    assert_eq!(
+        report(&mut reporter, -47, ap),
+        Some(json!(-45)),
+        "nearest step"
+    );
+    for jitter in [-44, -46, -49, -41] {
+        assert_eq!(
+            report(&mut reporter, jitter, ap),
+            None,
+            "{jitter} isn't a step away"
+        );
+    }
+    assert_eq!(
+        report(&mut reporter, -50, ap),
+        Some(json!(-50)),
+        "a whole step"
+    );
+    assert_eq!(report(&mut reporter, -48, ap), None);
+    assert_eq!(report(&mut reporter, -63, ap), Some(json!(-65)));
+    // Another access point starts afresh.
+    assert_eq!(
+        report(&mut reporter, -62, "02:00:00:00:00:01"),
+        Some(json!(-60))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_module_reports_the_joined_network() {
+    let sysfs = board_sysfs();
+    let wifi_dir = tempfile::tempdir().unwrap();
+    let (kernel, _changes) = FakeKernel::new(board_tables());
+    let (ctx, mut reports, _requests) = context(sysfs.path());
+    let cancel = ctx.cancel.clone();
+    let module = NetModule::with_kernel(NetSettings::default(), kernel, wifi_dir.path())
+        .with_wireless(Arc::new(FakeWireless(Mutex::new(Some(Ok(Some(joined(
+            -71,
+        ))))))));
+    let running = tokio::spawn(async move { module.run(ctx).await });
+    let first = next_report(&mut reports).await;
+    assert_eq!(first["interfaces"]["wlP2p33s0"]["wifi"]["signal_dbm"], -70);
+    assert_eq!(first["interfaces"]["wlP2p33s0"]["wifi"]["ssid"], "Home");
     cancel.cancel();
     assert_eq!(running.await.unwrap(), Ok(()));
 }

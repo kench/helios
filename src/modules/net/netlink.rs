@@ -13,16 +13,16 @@ use rustix::net::netlink::SocketAddrNetlink;
 use rustix::net::sockopt::{self, Timeout};
 use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketType};
 
-const NLMSG_HDR_LEN: usize = 16;
+pub(super) const NLMSG_HDR_LEN: usize = 16;
 const IFINFOMSG_LEN: usize = 16;
 const IFADDRMSG_LEN: usize = 8;
 const RTMSG_LEN: usize = 12;
 const NHMSG_LEN: usize = 8;
-const RTA_HDR_LEN: usize = 4;
+pub(super) const RTA_HDR_LEN: usize = 4;
 const RTNEXTHOP_LEN: usize = 8;
 
-const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
+pub(super) const NLMSG_ERROR: u16 = 2;
+pub(super) const NLMSG_DONE: u16 = 3;
 const NLMSG_OVERRUN: u16 = 4;
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
@@ -33,9 +33,9 @@ const RTM_GETROUTE: u16 = 26;
 const RTM_NEWNEXTHOP: u16 = 104;
 const RTM_GETNEXTHOP: u16 = 106;
 
-const NLM_F_REQUEST: u16 = 0x1;
+pub(super) const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_DUMP_INTR: u16 = 0x10;
-const NLM_F_DUMP: u16 = 0x300;
+pub(super) const NLM_F_DUMP: u16 = 0x300;
 /// The attribute type's low bits; the top two are the nested and byte-order flags.
 const NLA_TYPE_MASK: u16 = 0x3fff;
 
@@ -327,7 +327,7 @@ impl Watch for Changes {
     }
 }
 
-fn receive(socket: &OwnedFd) -> io::Result<Vec<u8>> {
+pub(super) fn receive(socket: &OwnedFd) -> io::Result<Vec<u8>> {
     let mut buffer = vec![0u8; 64 * 1024];
     let (read, full) = rustix::net::recv(socket, &mut buffer[..], RecvFlags::empty())?;
     if full > read {
@@ -351,13 +351,13 @@ fn request(kind: u16, header: usize) -> Vec<u8> {
 }
 
 /// One netlink message in a datagram.
-struct Message<'a> {
-    kind: u16,
-    flags: u16,
-    payload: &'a [u8],
+pub(super) struct Message<'a> {
+    pub(super) kind: u16,
+    pub(super) flags: u16,
+    pub(super) payload: &'a [u8],
 }
 
-fn messages(datagram: &[u8]) -> io::Result<Vec<Message<'_>>> {
+pub(super) fn messages(datagram: &[u8]) -> io::Result<Vec<Message<'_>>> {
     let mut messages = Vec::new();
     let mut rest = datagram;
     while !rest.is_empty() {
@@ -591,7 +591,7 @@ fn nexthop(payload: &[u8]) -> io::Result<Option<Nexthop>> {
     }))
 }
 
-fn attributes(mut bytes: &[u8]) -> io::Result<Vec<(u16, &[u8])>> {
+pub(super) fn attributes(mut bytes: &[u8]) -> io::Result<Vec<(u16, &[u8])>> {
     let mut attributes = Vec::new();
     while bytes.len() >= RTA_HDR_LEN {
         let len = usize::from(u16_at(bytes, 0));
@@ -616,11 +616,11 @@ fn ip(family: u8, value: &[u8]) -> Option<IpAddr> {
     }
 }
 
-fn u32_of(value: &[u8]) -> Option<u32> {
+pub(super) fn u32_of(value: &[u8]) -> Option<u32> {
     <[u8; 4]>::try_from(value).ok().map(u32::from_ne_bytes)
 }
 
-const fn align(len: usize) -> usize {
+pub(super) const fn align(len: usize) -> usize {
     (len + 3) & !3
 }
 
@@ -637,7 +637,7 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
-fn invalid(what: &str) -> io::Error {
+pub(super) fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("rtnetlink: {what}"))
 }
 
