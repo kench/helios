@@ -92,6 +92,17 @@ jobs:
       - name: Clippy without features
         run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
+      # Each device builds only some modules, so each module must also build on its own.
+      - name: Clippy with each module alone
+        run: |
+          set -eu
+          for feature in $(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].features | keys[] | select(startswith("module-"))'); do
+            echo "== $feature"
+            cargo clippy --locked --all-targets --no-default-features --features "$feature" \
+              -- -D warnings
+          done
+
   test:
     name: Test and coverage
     runs-on: ubuntu-latest

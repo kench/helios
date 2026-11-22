@@ -28,6 +28,8 @@ env:
   # The oldest glibc the boards may run (Debian 11, Ubuntu 22.04); matches the package's
   # libc6 dependency.
   GLIBC: "2.31"
+  # The device modules the boards (relay, transcoder) use. The scanner is built separately.
+  FEATURES: module-usb
   ZIG_VERSION: 0.14.1
   CARGO_ZIGBUILD_VERSION: 0.24.1
   CARGO_DEB_VERSION: 3.6.3
@@ -69,7 +71,7 @@ jobs:
           cargo install --locked cargo-deb --version "$CARGO_DEB_VERSION"
 
       - name: Build
-        run: cargo zigbuild --locked --release --target "$TARGET.$GLIBC"
+        run: cargo zigbuild --locked --release --target "$TARGET.$GLIBC" --features "$FEATURES"
 
       - name: Package
         # The release profile already strips (Cargo.toml); the runner has no arm64 strip.

@@ -27,13 +27,13 @@ set, as in CI. Each run uses its own temporary token directory.
 clock reading when it checks certificate dates. Set `SOURCE_DATE_EPOCH` for reproducible builds.
 
 Device modules are Cargo features, off by default, so each device's build carries only the
-modules it uses. There's one so far, `module-display` (the display module, with its fonts and the
-`fontdue` and `jiff` crates). Builds by device:
+modules it uses: `module-display` (the display module, with its fonts and the `fontdue` and
+`jiff` crates) and `module-usb` (the usb module, no extra crates). Builds by device:
 
 | Device | Build |
 | --- | --- |
-| Scanner (PROXmobil3) | `cargo zigbuild --release --target armv7-unknown-linux-gnueabihf.2.28 --features module-display` |
-| Relay, transcoder (Raspberry Pi 5) | no module features yet |
+| Scanner (PROXmobil3) | `cargo zigbuild --release --target armv7-unknown-linux-gnueabihf.2.28 --features module-display,module-usb` |
+| Relay (Raspberry Pi 5), transcoder (Orange Pi 5 Plus) | the release workflow's package: `--features module-usb` |
 
 The checks below use `--all-features`; CI also runs Clippy and the tests with
 `--no-default-features`.
