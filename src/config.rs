@@ -83,6 +83,8 @@ pub struct Config {
     pub certificate: CertificateSource,
     /// `identity.allow_final_pin_try`.
     pub allow_final_pin_try: bool,
+    /// `identity.token_copy` (LLD 1, section 4.12).
+    pub token_copy: crate::identity::token_copy::TokenCopy,
     /// `identity.sign_timeout_ms`.
     pub sign_timeout: Duration,
     /// The root CAs for AWS IoT Core and the credentials provider (`aws.root_ca`).
@@ -210,6 +212,8 @@ struct IdentitySection {
     #[serde(default)]
     allow_final_pin_try: bool,
     sign_timeout_ms: Option<u64>,
+    #[serde(default)]
+    token_copy: crate::identity::token_copy::TokenCopy,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -325,6 +329,7 @@ impl File {
             thing_name,
             certificate: certificate(self.identity.certificate.as_deref())?,
             allow_final_pin_try: self.identity.allow_final_pin_try,
+            token_copy: self.identity.token_copy,
             sign_timeout: self
                 .identity
                 .sign_timeout_ms

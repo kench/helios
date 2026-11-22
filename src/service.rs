@@ -232,6 +232,7 @@ impl Service {
             IdentityManager::start(manager, backend, pin, config.roots, cancel.clone())?;
         let local_endpoint = config.aws.as_ref().map(|aws| aws.iot_endpoint.clone());
         let helios_shadow_interval = config.mqtt.helios_shadow_interval;
+        let token_report = token_report(config.token_copy);
         let local = config.aws.map(|aws| LocalSettings {
             credentials_endpoint: aws.credentials_endpoint,
             role_alias: aws.role_alias,
@@ -339,6 +340,7 @@ impl Service {
                 modules: module_states,
                 boot_id: platform.boot_id.clone(),
                 started_at,
+                token: token_report,
             },
             shadows.clone(),
             helios_shadow_interval,
@@ -544,10 +546,14 @@ pub fn main(config_path: &Path) -> u8 {
                 return EXIT_ERROR;
             }
         };
-        let backend = Box::new(CryptokiToken::new(
+        let mut backend = CryptokiToken::new(
             &config.pkcs11_module,
             config.token_label.as_deref().unwrap_or(DEFAULT_TOKEN_LABEL),
-        ));
+        );
+        if let Some(state) = token_copy_state(&config) {
+            backend = backend.persist_to(state.working, state.master);
+        }
+        let backend = Box::new(backend);
         match Service::start(config, backend, &Platform::system(), Timing::default()) {
             Ok(service) => service.run_until(shutdown).await,
             Err(failure) => {
@@ -560,3 +566,39 @@ pub fn main(config_path: &Path) -> u8 {
 
 #[cfg(test)]
 mod tests;
+
+/// With `identity.token_copy = "tmpfs"`, what `helios token prepare` did (LLD 1, section 4.12).
+/// Warns when it's missing: the unit's `ExecStartPre` didn't run, so changes to the token
+/// wouldn't be saved.
+pub fn token_copy_state(config: &Config) -> Option<crate::identity::token_copy::State> {
+    use crate::identity::token_copy::{RUNTIME_DIR, TokenCopy, read_state};
+    if config.token_copy != TokenCopy::Tmpfs {
+        return None;
+    }
+    let state =
+        read_state(std::path::Path::new(RUNTIME_DIR)).filter(|s| s.copy == TokenCopy::Tmpfs);
+    if state.is_none() {
+        tracing::warn!(
+            "identity.token_copy = \"tmpfs\", but `helios token prepare` didn't run: changes to the \
+             token won't be saved"
+        );
+    }
+    state
+}
+
+/// The `helios` shadow's `token`: what `helios token prepare` did, with `"tmpfs"`.
+fn token_report(copy: crate::identity::token_copy::TokenCopy) -> serde_json::Value {
+    use crate::identity::token_copy::{RUNTIME_DIR, TokenCopy, read_state};
+    if copy != TokenCopy::Tmpfs {
+        return serde_json::Value::Null;
+    }
+    match read_state(std::path::Path::new(RUNTIME_DIR)) {
+        Some(state) if state.copy == TokenCopy::Tmpfs => serde_json::json!({
+            "copy": "tmpfs",
+            "restored_from": state.restored_from,
+            "restored_at": state.restored_at,
+            "lost": state.lost,
+        }),
+        _ => serde_json::json!({"copy": "tmpfs", "prepared": false}),
+    }
+}
