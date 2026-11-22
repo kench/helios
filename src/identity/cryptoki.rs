@@ -19,6 +19,27 @@ use crate::identity::token::{
     raw_signature,
 };
 
+/// Whether `module` has an initialized token labelled `label`, without opening a session or
+/// logging in: what `helios token check` asks of a copy (LLD 1, section 4.12). SoftHSM shows a
+/// token that fails its integrity check as an empty, uninitialized slot.
+///
+/// # Errors
+///
+/// [`TokenError`] if the module can't be loaded or initialized.
+pub fn token_present(module: &Path, label: &str) -> Result<bool, TokenError> {
+    let pkcs11 = Pkcs11::new(module).map_err(map_error)?;
+    pkcs11
+        .initialize(CInitializeArgs::OsThreads)
+        .map_err(map_error)?;
+    for slot in pkcs11.get_slots_with_token().map_err(map_error)? {
+        let info = pkcs11.get_token_info(slot).map_err(map_error)?;
+        if info.label().trim_end() == label && info.token_initialized() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A PKCS#11 token reached through a module such as `libsofthsm2.so`.
 #[derive(Debug)]
 pub struct CryptokiToken {
@@ -26,6 +47,9 @@ pub struct CryptokiToken {
     token_label: String,
     generation: u64,
     open: Option<OpenToken>,
+    /// With `identity.token_copy = "tmpfs"`: the working copy and the master to save it to after
+    /// a deliberate change (LLD 1, section 4.12).
+    persist: Option<(PathBuf, PathBuf)>,
 }
 
 /// State that exists only while the token is open. The session is dropped before the
@@ -48,6 +72,29 @@ impl CryptokiToken {
             token_label: token_label.into(),
             generation: 0,
             open: None,
+            persist: None,
+        }
+    }
+
+    /// Saves the working copy `working` to `master` after each deliberate change to the token
+    /// (creating `helios-secrets`), as `identity.token_copy = "tmpfs"` needs.
+    #[must_use]
+    pub fn persist_to(mut self, working: PathBuf, master: PathBuf) -> Self {
+        self.persist = Some((working, master));
+        self
+    }
+
+    /// Saves the working copy, if this token is a tmpfs copy. A failure is logged: the change
+    /// is in effect until Helios restarts, then lost (and made again).
+    fn persist(&self) {
+        let Some((working, master)) = &self.persist else {
+            return;
+        };
+        match crate::identity::token_copy::save(working, master) {
+            Ok(()) => tracing::info!(master = %master.display(), "token saved"),
+            Err(error) => {
+                tracing::warn!(%error, "can't save the token; the change is lost when Helios restarts");
+            }
         }
     }
 
@@ -329,6 +376,7 @@ impl TokenBackend for CryptokiToken {
     fn secrets_key(&mut self, label: &str) -> Result<Vec<u8>, TokenError> {
         if self.find_one(ObjectClass::PRIVATE_KEY, label)?.is_none() {
             self.generate_secrets_key(label)?;
+            self.persist();
         }
         let public = self
             .find_one(ObjectClass::PUBLIC_KEY, label)?

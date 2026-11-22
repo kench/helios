@@ -46,6 +46,7 @@ struct Cli {
 
 #[cfg(feature = "module-net")]
 mod net;
+mod token;
 #[cfg(feature = "module-usb")]
 mod usb;
 #[cfg(feature = "module-net")]
@@ -75,6 +76,9 @@ enum Command {
     WifiApply,
     /// Set up and inspect the device's token.
     Provision(ProvisionArgs),
+    /// The token's working copy (LLD 1, section 4.12): helios.service runs `token prepare`.
+    #[command(subcommand)]
+    Token(token::Command),
     /// Run the stream daemon (helios-stream.service): video streams that outlive Helios's
     /// restarts (LLD 4, section 15).
     #[cfg(feature = "module-stream")]
@@ -336,6 +340,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>, console: &mut dyn Console) 
     let result = match cli.command {
         None => return crate::service::main(&cli.config),
         Some(Command::Provision(args)) => provision(&args, console),
+        Some(Command::Token(command)) => token::run(command, &cli.config, console),
         #[cfg(feature = "module-usb")]
         Some(Command::Usb(command)) => usb::run(command, console.out()),
         #[cfg(feature = "module-net")]

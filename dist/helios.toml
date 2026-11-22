@@ -24,6 +24,13 @@ certificate   = "token"          # "token" or a path to a PEM file
 pin           = "bootstrap"      # "bootstrap", "credential:<name>" or "file:<path>"
 allow_final_pin_try = false
 sign_timeout_ms     = 5000
+# "tmpfs": SoftHSM works on a copy of the token in /run/helios/token, made by `helios token
+# prepare` (helios.service's ExecStartPre), and the master on disk is written only when Helios
+# changes the token, through tokens.new with the previous master kept as tokens.old. SoftHSM
+# rewrites token.object at every login, so on disk a power cut can destroy the token (LLD 1,
+# section 4.12). "direct" (the default): SoftHSM uses the master. Boards only; the scanner already
+# runs its token from tmpfs (autorun.sh).
+# token_copy = "tmpfs"
 
 [aws]
 # Local PIN: all four required. With bootstrap, supplied by the service; if set here, the
