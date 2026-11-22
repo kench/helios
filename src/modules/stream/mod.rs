@@ -89,6 +89,9 @@ enum BitrateChange {
 #[derive(Debug, Clone)]
 struct Publisher {
     address: String,
+    /// Its video bitrate from the statistics page, smoothed (half the last reading, half the
+    /// new one); `None` until nginx has measured one.
+    video_kbps: Option<f64>,
     /// When the hook accepted it; `None` if it was found on the statistics page.
     accepted: Option<Instant>,
 }
@@ -216,6 +219,10 @@ struct Entry {
     /// A bitrate set by `stream.start` or the desired state, which outlasts restarts; `None`
     /// follows the profile, so a changed `bitrate_kbps` in the config applies.
     bitrate_override: Option<u32>,
+    /// An adaptive RTMP stream's ceiling from its camera's bitrate, once known.
+    source_ceiling: Option<u32>,
+    /// The camera's video bitrate (smoothed), for the shadow.
+    source_kbps: Option<u32>,
     state: State,
     since: SystemTime,
     nodes: Option<CameraNodes>,
@@ -273,6 +280,8 @@ impl Entry {
             "profile": self.config.profile,
             "bitrate_kbps": self.bitrate_kbps,
             "bitrate_override_kbps": self.bitrate_override,
+            "source_kbps": self.source_kbps,
+            "bitrate_ceiling_kbps": self.source_ceiling,
             "encoder": self.encoder(),
             "output": self.config.output,
             "last_error": self.last_error.as_ref().or(self.unusable.as_ref()),
@@ -317,6 +326,8 @@ impl<'a> Streams<'a> {
                     .get(&config.profile)
                     .map_or(0, |profile| profile.bitrate_kbps),
                 bitrate_override: None,
+                source_ceiling: None,
+                source_kbps: None,
                 config: config.clone(),
                 state: State::Stopped,
                 since: SystemTime::now(),
@@ -394,6 +405,7 @@ impl<'a> Streams<'a> {
                             key,
                             Publisher {
                                 address,
+                                video_kbps: None,
                                 accepted: Some(now),
                             },
                         );
@@ -423,27 +435,84 @@ impl<'a> Streams<'a> {
                     }
                     keep
                 });
-                for (key, address) in found {
+                for (key, seen) in found {
+                    let sample = seen.video_kbps.map(f64::from);
+                    if let Some(publisher) = self.ingest.publishers.get_mut(&key) {
+                        if let Some(sample) = sample {
+                            publisher.video_kbps = Some(
+                                publisher
+                                    .video_kbps
+                                    .map_or(sample, |smoothed| (smoothed + sample) / 2.0),
+                            );
+                        }
+                        continue;
+                    }
                     let known = self.entries.iter().any(|entry| {
                         entry.config.source.rtmp_key().as_deref() == Some(key.as_str())
                     });
-                    if known && !self.ingest.publishers.contains_key(&key) {
+                    if known {
+                        let address = seen.address;
                         tracing::info!(%key, %address, "RTMP publisher found (statistics page)");
                         self.ingest.publishers.insert(
                             key,
                             Publisher {
                                 address,
+                                video_kbps: sample,
                                 accepted: None,
                             },
                         );
                     }
                 }
+                self.follow_sources();
             }
             IngestEvent::Publishers(Err(error)) | IngestEvent::HookFailed(error) => {
                 if self.ingest.last_error.as_ref() != Some(&error) {
                     tracing::warn!(%error, "rtmp-ingest");
                 }
                 self.ingest.last_error = Some(error);
+            }
+        }
+    }
+
+    /// Adaptive RTMP streams' ceilings, from their cameras' bitrates: a change of more than 10%
+    /// reaches a running encoder as a new range (SIGHUP), so the ceiling doesn't chase noise.
+    fn follow_sources(&mut self) {
+        for index in 0..self.entries.len() {
+            let entry = &self.entries[index];
+            let Some(profile) = self.module.settings.profiles.get(&entry.config.profile) else {
+                continue;
+            };
+            let source = entry
+                .config
+                .source
+                .rtmp_key()
+                .and_then(|key| self.ingest.publishers.get(&key))
+                .and_then(|publisher| publisher.video_kbps);
+            let Some(source_kbps) = source else {
+                continue;
+            };
+            let target = encoder::source_ceiling(profile, entry.bitrate_kbps, source_kbps);
+            let entry = &mut self.entries[index];
+            // Rounded to whole kbps, for the shadow.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let reported = source_kbps.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+            entry.source_kbps = Some(reported);
+            let Some(target) = target else {
+                continue;
+            };
+            let moved = entry.source_ceiling.is_none_or(|current| {
+                u64::from(target.abs_diff(current)) * 10 > u64::from(current)
+            });
+            if !moved {
+                continue;
+            }
+            tracing::info!(
+                stream = %entry.id, source_kbps = reported, ceiling_kbps = target,
+                "bitrate ceiling follows the camera"
+            );
+            entry.source_ceiling = Some(target);
+            if entry.job.is_some() {
+                self.reload_bitrate(index);
             }
         }
     }
@@ -587,6 +656,9 @@ impl<'a> Streams<'a> {
             self.disconnect(index, reason, ctx);
             let entry = &mut self.entries[index];
             entry.restart_at = None;
+            // The next camera starts from the stream's own ceiling until it's measured.
+            entry.source_ceiling = None;
+            entry.source_kbps = None;
             entry.set_state(State::WaitingForInput);
             return;
         }
@@ -705,7 +777,7 @@ impl<'a> Streams<'a> {
             (Source::Rtmp { .. }, _, Some(url)) => encoder::Input::Rtmp(url),
             _ => return,
         };
-        let range = encoder::Range::new(profile, entry.bitrate_kbps);
+        let range = encoder::Range::new(profile, entry.bitrate_kbps, entry.source_ceiling);
         let plan = encoder::plan(settings, &entry.id, profile, target, input, range);
         let backend = profile.encoder;
         if let Err(error) = write_files(&plan.files) {
@@ -1027,7 +1099,7 @@ impl<'a> Streams<'a> {
         if !running.backend.reloads() {
             return false;
         }
-        let range = encoder::Range::new(profile, entry.bitrate_kbps);
+        let range = encoder::Range::new(profile, entry.bitrate_kbps, entry.source_ceiling);
         let file = encoder::range_file(
             settings,
             running.backend,

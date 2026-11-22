@@ -93,7 +93,10 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   a fixed bitrate) or a GStreamer encoder, belacoder or ceracoder, which sends over SRT itself
   and, with `bitrate_mode = "adaptive"`, adapts the bitrate to the link between
   `min_bitrate_kbps` and the stream's bitrate; a new bitrate reaches it by SIGHUP, without a
-  restart. `stream.start`, `stream.stop` and
+  restart. For an RTMP camera the ceiling follows the camera's own video bitrate (nginx's
+  `bw_video`, read every 10 s, smoothed, applied on a change of more than 10%), times the
+  profile's `source_ceiling_percent` (default 100), so an encoder never spends more than its
+  source carries. `stream.start`, `stream.stop` and
   `stream.status`; events `stream.connected`, `stream.live`, `stream.disconnected` and
   `stream.stats`; the `stream` shadow has each stream's and each bonded output's state, with
   per-link statistics. ffmpeg's arguments come only from the local profiles.

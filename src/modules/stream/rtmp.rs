@@ -7,9 +7,10 @@
 //!   publish (200) if its key belongs to a stream and isn't already publishing, or refuses it (403,
 //!   and nginx drops the camera). No token: the hook is on loopback, and local processes are
 //!   trusted (owner, 2026-11-21).
-//! - **The statistics page:** at start and every 30 s (2 s after a failure) the daemon reads
-//!   nginx's `rtmp_stat`, so it learns about cameras already publishing when it (re)starts, and
-//!   notices a `publish_done` it missed.
+//! - **The statistics page:** at start and every 10 s (2 s after a failure) the daemon reads
+//!   nginx's `rtmp_stat`, so it learns about cameras already publishing when it (re)starts,
+//!   notices a `publish_done` it missed, and follows each camera's video bitrate (`bw_video`),
+//!   which sets an adaptive stream's ceiling.
 //!
 //! nginx's requests are small and fixed, so the HTTP here is a minimal HTTP/1.x parser over a
 //! loopback socket rather than a server library.
@@ -23,7 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 /// How often the statistics page is read (a second in tests, which run on real sockets).
-const STAT_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
+const STAT_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 /// How soon a failed read is tried again: at boot the daemon starts before nginx listens.
 const STAT_RETRY: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 2 });
 /// How long one hook request or statistics read may take.
@@ -46,7 +47,7 @@ pub(crate) enum IngestEvent {
     /// The camera publishing `key` stopped.
     PublishDone { key: String },
     /// Who is publishing, by key, from the statistics page; or why it couldn't be read.
-    Publishers(Result<BTreeMap<String, String>, String>),
+    Publishers(Result<BTreeMap<String, Seen>, String>),
     /// The hook couldn't listen.
     HookFailed(String),
 }
@@ -242,7 +243,7 @@ fn decode(text: &str) -> Option<String> {
 }
 
 /// Reads the statistics page (`http://127.0.0.1:<port><path>`) and returns who is publishing.
-async fn read_stat(url: &str) -> Result<BTreeMap<String, String>, String> {
+async fn read_stat(url: &str) -> Result<BTreeMap<String, Seen>, String> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("{url}: not an http:// URL"))?;
@@ -282,9 +283,18 @@ async fn read_stat(url: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(publishers(body))
 }
 
-/// The keys being published to the `live` application, with each publisher's address, from
-/// the RTMP module's statistics XML.
-pub(crate) fn publishers(xml: &str) -> BTreeMap<String, String> {
+/// A publisher on the statistics page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Seen {
+    pub address: String,
+    /// The stream's incoming video bitrate (nginx's `bw_video`, averaged over its bandwidth
+    /// window), if it has measured one yet.
+    pub video_kbps: Option<u32>,
+}
+
+/// The keys being published to the `live` application, with each publisher, from the RTMP
+/// module's statistics XML.
+pub(crate) fn publishers(xml: &str) -> BTreeMap<String, Seen> {
     let mut found = BTreeMap::new();
     for application in blocks(xml, "application") {
         if text_of(application, "name").as_deref() != Some(APP) {
@@ -297,7 +307,18 @@ pub(crate) fn publishers(xml: &str) -> BTreeMap<String, String> {
             if let Some(publisher) =
                 blocks(stream, "client").find(|client| client.contains("<publishing/>"))
             {
-                found.insert(name, text_of(publisher, "address").unwrap_or_default());
+                let video_kbps = text_of(stream, "bw_video")
+                    .and_then(|bps| bps.parse::<u64>().ok())
+                    .filter(|&bps| bps > 0)
+                    .map(|bps| u32::try_from(bps.div_ceil(1000)).unwrap_or(u32::MAX));
+                let address = text_of(publisher, "address").unwrap_or_default();
+                found.insert(
+                    name,
+                    Seen {
+                        address,
+                        video_kbps,
+                    },
+                );
             }
         }
     }
@@ -351,7 +372,22 @@ mod tests {
             </server></rtmp>";
         let found = publishers(xml);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found["ingest"], "192.168.8.20");
+        assert_eq!(found["ingest"].address, "192.168.8.20");
+        assert_eq!(found["ingest"].video_kbps, None, "no bw_video yet");
+        let measured = xml.replace(
+            "<stream><name>ingest</name>",
+            "<stream><name>ingest</name><bw_in>3950000</bw_in><bw_video>3812345</bw_video>",
+        );
+        assert_eq!(publishers(&measured)["ingest"].video_kbps, Some(3813));
+        let warming = xml.replace(
+            "<stream><name>ingest</name>",
+            "<stream><name>ingest</name><bw_video>0</bw_video>",
+        );
+        assert_eq!(
+            publishers(&warming)["ingest"].video_kbps,
+            None,
+            "0: still warming up"
+        );
     }
 
     async fn answer_with(accept: bool, path: &str, body: &str) -> (u16, Option<String>) {
