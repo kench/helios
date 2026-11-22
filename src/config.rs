@@ -102,6 +102,9 @@ pub struct Config {
     /// Enabled USB monitoring settings.
     #[cfg(feature = "module-usb")]
     pub usb: Option<crate::modules::usb::UsbSettings>,
+    /// The `[modules.stream]` settings, when it's enabled (LLD 4).
+    #[cfg(feature = "module-stream")]
+    pub stream: Option<crate::modules::stream::StreamSettings>,
     /// Sections this version doesn't use: modules as `modules.<name>`, then top-level sections.
     pub ignored_sections: Vec<String>,
 }
@@ -145,6 +148,8 @@ struct File {
 struct ModulesSection {
     #[cfg(feature = "module-usb")]
     usb: Option<crate::modules::usb::UsbSettings>,
+    #[cfg(feature = "module-stream")]
+    stream: Option<crate::modules::stream::StreamSettings>,
     #[cfg(feature = "module-display")]
     display: Option<DisplaySection>,
     #[serde(flatten)]
@@ -328,6 +333,13 @@ impl File {
                 .modules
                 .usb
                 .map(crate::modules::usb::UsbSettings::check)
+                .transpose()?
+                .flatten(),
+            #[cfg(feature = "module-stream")]
+            stream: self
+                .modules
+                .stream
+                .map(crate::modules::stream::StreamSettings::check)
                 .transpose()?
                 .flatten(),
             ignored_sections: self

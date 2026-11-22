@@ -306,6 +306,19 @@ impl Service {
             )));
             handle
         });
+        #[cfg(feature = "module-stream")]
+        if let Some(settings) = config.stream {
+            // Cameras come from the usb module, so it must run too.
+            let Some(usb) = usb.clone() else {
+                return Err(StartFailure {
+                    message: "[modules.stream] needs [modules.usb] enabled, for its cameras".into(),
+                    config: true,
+                });
+            };
+            enabled.push(Arc::new(crate::modules::stream::StreamModule::new(
+                settings, usb,
+            )));
+        }
         let (module_states, modules) = supervisor::start(
             enabled,
             &supervisor::Deps {

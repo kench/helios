@@ -72,6 +72,8 @@ default = []
 # The display module (LLD 9): screens on a framebuffer.
 module-display = ["dep:fontdue", "dep:jiff"]
 module-usb = []
+# The stream module (LLD 4): video streams through ffmpeg. Cameras come from the usb module.
+module-stream = ["module-usb", "tokio/process", "tokio/io-util"]
 
 [dev-dependencies]
 bytes = "1.12.1"
