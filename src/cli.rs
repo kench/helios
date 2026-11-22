@@ -48,6 +48,8 @@ struct Cli {
 mod net;
 #[cfg(feature = "module-usb")]
 mod usb;
+#[cfg(feature = "module-net")]
+mod wifi;
 
 #[derive(Debug, Subcommand)]
 #[allow(
@@ -63,6 +65,14 @@ enum Command {
     #[cfg(feature = "module-net")]
     #[command(subcommand)]
     Net(net::Command),
+    /// Set the Wi-Fi networks the WLAN adapter joins.
+    #[cfg(feature = "module-net")]
+    #[command(subcommand)]
+    Wifi(wifi::Command),
+    /// Apply the Wi-Fi networks to netplan or NetworkManager, as root (helios-wifi.service runs
+    /// this when they change).
+    #[cfg(feature = "module-net")]
+    WifiApply,
     /// Set up and inspect the device's token.
     Provision(ProvisionArgs),
     /// Run the stream daemon (helios-stream.service): video streams that outlive Helios's
@@ -330,6 +340,10 @@ pub fn run(args: impl IntoIterator<Item = OsString>, console: &mut dyn Console) 
         Some(Command::Usb(command)) => usb::run(command, console.out()),
         #[cfg(feature = "module-net")]
         Some(Command::Net(command)) => net::run(command, console.out()),
+        #[cfg(feature = "module-net")]
+        Some(Command::Wifi(command)) => wifi::run(command, console),
+        #[cfg(feature = "module-net")]
+        Some(Command::WifiApply) => wifi::apply(console.out()),
         #[cfg(feature = "module-stream")]
         Some(Command::StreamDaemon) => return crate::modules::stream::daemon::main(&cli.config),
     };

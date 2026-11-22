@@ -13,6 +13,7 @@
 
 pub(crate) mod netlink;
 pub(crate) mod snapshot;
+pub(crate) mod wifi;
 
 use std::collections::BTreeMap;
 use std::future::pending;
@@ -27,7 +28,9 @@ use tokio::time::Instant;
 
 use super::{Module, ModuleContext, ModuleError, ModuleFuture};
 use crate::mqtt::envelope::timestamp;
+use crate::router::{Outcome, PendingCommand, codes};
 use netlink::{Kernel, Rtnetlink, Watch};
+use wifi::{Network, Passphrase, Refused, Store, StoreError};
 
 const MODULE: &str = "net";
 /// How long the tables must be quiet after a change before they're read.
@@ -102,6 +105,10 @@ pub(crate) fn current(
 pub struct NetModule {
     settings: NetSettings,
     kernel: Arc<dyn Kernel>,
+    /// The Wi-Fi networks Helios wants (section 10).
+    wifi: Store,
+    /// What `helios wifi-apply` last did.
+    wifi_status: PathBuf,
 }
 
 impl NetModule {
@@ -111,12 +118,23 @@ impl NetModule {
         Self {
             settings,
             kernel: Arc::new(Rtnetlink),
+            wifi: Store::new(wifi::STORE),
+            wifi_status: wifi::STATUS.into(),
         }
     }
 
     #[cfg(test)]
-    fn with_kernel(settings: NetSettings, kernel: Arc<dyn Kernel>) -> Self {
-        Self { settings, kernel }
+    fn with_kernel(
+        settings: NetSettings,
+        kernel: Arc<dyn Kernel>,
+        wifi_dir: &std::path::Path,
+    ) -> Self {
+        Self {
+            settings,
+            kernel,
+            wifi: Store::new(wifi_dir.join("networks.json")),
+            wifi_status: wifi_dir.join("status.json"),
+        }
     }
 }
 
@@ -131,7 +149,7 @@ impl Module for NetModule {
 }
 
 impl NetModule {
-    async fn watch(&self, ctx: ModuleContext) -> Result<(), ModuleError> {
+    async fn watch(&self, mut ctx: ModuleContext) -> Result<(), ModuleError> {
         let watch = self
             .kernel
             .watch()
@@ -146,10 +164,20 @@ impl NetModule {
         let mut first_change: Option<Instant> = None;
         let mut quiet_until = Instant::now();
         let mut resync_at = Instant::now() + RESYNC;
+        let mut commands_open = true;
         loop {
             let due = first_change.map(|first| quiet_until.min(first + MAX_DELAY));
             tokio::select! {
                 () = ctx.cancel.cancelled() => return Ok(()),
+                command = ctx.commands.recv(), if commands_open => match command {
+                    Some(command) => {
+                        let changed = self.command(command, &reporter);
+                        if changed {
+                            self.refresh(&ctx, &mut reporter).await?;
+                        }
+                    }
+                    None => commands_open = false,
+                },
                 change = changes.recv() => {
                     if change.is_none() {
                         return Err(ModuleError("the network change listener stopped".into()));
@@ -180,12 +208,15 @@ impl NetModule {
         let kernel = Arc::clone(&self.kernel);
         let sysfs: PathBuf = ctx.sysfs.clone();
         let settings = self.settings.clone();
-        let snapshot =
-            tokio::task::spawn_blocking(move || current(kernel.as_ref(), &sysfs, &settings))
-                .await
-                .map_err(|error| ModuleError(format!("reading the network tables: {error}")))?
-                .map_err(|error| ModuleError(format!("reading the network tables: {error}")))?;
-        if let Some((reported, event)) = reporter.update(snapshot, SystemTime::now()) {
+        let (store, status) = (self.wifi.clone(), self.wifi_status.clone());
+        let (snapshot, wifi) = tokio::task::spawn_blocking(move || {
+            current(kernel.as_ref(), &sysfs, &settings)
+                .map(|snapshot| (snapshot, wifi::report(&store, &status)))
+        })
+        .await
+        .map_err(|error| ModuleError(format!("reading the network tables: {error}")))?
+        .map_err(|error| ModuleError(format!("reading the network tables: {error}")))?;
+        if let Some((reported, event)) = reporter.update(snapshot, wifi, SystemTime::now()) {
             ctx.shadows.report(MODULE, reported);
             if let Some(event) = event {
                 ctx.mqtt.publish_event(MODULE, "net.changed", event);
@@ -193,6 +224,107 @@ impl NetModule {
         }
         Ok(())
     }
+}
+
+impl NetModule {
+    /// Answers a command. `true` if the Wi-Fi networks changed, so the shadow is reported again.
+    fn command(&self, mut pending: PendingCommand, reporter: &Reporter) -> bool {
+        let args = std::mem::take(&mut pending.command.args);
+        let (outcome, changed) = match pending.command.name.as_str() {
+            "net.wifi.set" => self.wifi_set(args, reporter),
+            "net.wifi.remove" => self.wifi_remove(&args),
+            "net.wifi.list" => (self.wifi_list(), false),
+            other => (
+                Outcome::error(codes::UNKNOWN_COMMAND, format!("no command {other}")),
+                false,
+            ),
+        };
+        pending.respond(outcome);
+        changed
+    }
+
+    /// `net.wifi.set {ssid, passphrase?, hidden?}`: adds or replaces a network.
+    fn wifi_set(&self, args: Value, reporter: &Reporter) -> (Outcome, bool) {
+        let Value::Object(mut args) = args else {
+            return (
+                invalid_args("net.wifi.set takes {ssid, passphrase?, hidden?}"),
+                false,
+            );
+        };
+        // Take the passphrase out first, so it's wiped whatever happens next.
+        let passphrase = match args.remove("passphrase") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => match Passphrase::new(text) {
+                Ok(passphrase) => Some(passphrase),
+                Err(refused) => return (refusal(&refused), false),
+            },
+            Some(_) => return (refusal(&Refused::InvalidPassphrase), false),
+        };
+        let Some(ssid) = args.get("ssid").and_then(Value::as_str).map(str::to_owned) else {
+            return (refusal(&Refused::InvalidSsid), false);
+        };
+        let hidden = match args.get("hidden") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(hidden)) => *hidden,
+            Some(_) => return (invalid_args("hidden must be true or false"), false),
+        };
+        if !reporter.has_wifi() {
+            return (refusal(&Refused::NoAdapter), false);
+        }
+        let network = Network {
+            ssid,
+            passphrase,
+            hidden,
+        };
+        let summary = network.summary();
+        match self.wifi.set(network) {
+            Ok(()) => {
+                tracing::info!(ssid = %summary["ssid"], "Wi-Fi network saved");
+                (Outcome::Ok(json!({"network": summary})), true)
+            }
+            Err(StoreError::Refused(refused)) => (refusal(&refused), false),
+            Err(StoreError::Io(error)) => (store_failed(&error), false),
+        }
+    }
+
+    /// `net.wifi.remove {ssid}`.
+    fn wifi_remove(&self, args: &Value) -> (Outcome, bool) {
+        let Some(ssid) = args.get("ssid").and_then(Value::as_str) else {
+            return (refusal(&Refused::InvalidSsid), false);
+        };
+        match self.wifi.remove(ssid) {
+            Ok(removed) => {
+                if removed {
+                    tracing::info!(%ssid, "Wi-Fi network removed");
+                }
+                (Outcome::Ok(json!({"removed": removed})), removed)
+            }
+            Err(error) => (store_failed(&error), false),
+        }
+    }
+
+    /// `net.wifi.list`: the networks, without passphrases.
+    fn wifi_list(&self) -> Outcome {
+        match self.wifi.load() {
+            Ok(networks) => Outcome::Ok(json!({
+                "networks": networks.iter().map(Network::summary).collect::<Vec<_>>(),
+            })),
+            Err(error) => store_failed(&error),
+        }
+    }
+}
+
+fn refusal(refused: &Refused) -> Outcome {
+    Outcome::error(refused.code(), refused.to_string())
+}
+
+fn invalid_args(message: &str) -> Outcome {
+    Outcome::error("INVALID_ARGUMENTS", message)
+}
+
+fn store_failed(error: &std::io::Error) -> Outcome {
+    tracing::warn!(%error, "the Wi-Fi store can't be read or written");
+    Outcome::error(codes::INTERNAL, format!("the Wi-Fi store: {error}"))
 }
 
 /// The listener thread: tells the module about each change, until the module stops listening
@@ -234,6 +366,7 @@ impl Reporter {
     fn update(
         &mut self,
         snapshot: snapshot::Snapshot,
+        wifi: Value,
         now: SystemTime,
     ) -> Option<(Map<String, Value>, Option<Value>)> {
         if snapshot.truncated && !self.warned_truncated {
@@ -257,12 +390,28 @@ impl Reporter {
         let mut reported = Map::new();
         reported.insert("interfaces".into(), Value::Object(interfaces));
         reported.insert("truncated".into(), json!(snapshot.truncated));
+        reported.insert("wifi".into(), wifi);
         if self.last.as_ref() == Some(&reported) {
             return None;
         }
         let event = self.last.as_ref().and_then(|last| changes(last, &reported));
         self.last = Some(reported.clone());
         Some((reported, event))
+    }
+}
+
+impl Reporter {
+    /// Whether the last report had a Wi-Fi interface.
+    fn has_wifi(&self) -> bool {
+        self.last
+            .as_ref()
+            .and_then(|last| last.get("interfaces"))
+            .and_then(Value::as_object)
+            .is_some_and(|interfaces| {
+                interfaces
+                    .values()
+                    .any(|interface| interface["kind"] == "wifi")
+            })
     }
 }
 
