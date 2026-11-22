@@ -827,3 +827,109 @@ async fn refuses_wifi_without_an_adapter() {
     cancel.cancel();
     assert_eq!(running.await.unwrap(), Ok(()));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opens_a_passphrase_sealed_to_the_device() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    use crate::identity::secrets::{self, POINT_LEN};
+    use crate::identity::testing::{THING_NAME, ca, ready_identity};
+
+    let device_ca = ca("net-test");
+    let (identity, _token, identity_cancel) =
+        ready_identity(&device_ca, rustls::RootCertStore::empty()).await;
+    let public: [u8; POINT_LEN] = match &*identity.watch().borrow() {
+        crate::identity::manager::IdentityState::Ready(ready) => URL_SAFE_NO_PAD
+            .decode(ready.secrets.as_ref().unwrap().public_base64())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        other => panic!("not ready: {other:?}"),
+    };
+    let seal = |ssid: &str, passphrase: &str| {
+        let ephemeral = p256::SecretKey::from_slice(&[0x33; 32]).unwrap();
+        let (enc, ct) = secrets::seal(
+            &public,
+            &ephemeral,
+            &secrets::info(THING_NAME),
+            format!("wifi.passphrase {ssid}").as_bytes(),
+            passphrase.as_bytes(),
+        );
+        json!({"sealed": {"enc": URL_SAFE_NO_PAD.encode(enc), "ct": URL_SAFE_NO_PAD.encode(ct)}})
+    };
+
+    let sysfs = board_sysfs();
+    let wifi_dir = tempfile::tempdir().unwrap();
+    let (kernel, _changes) = FakeKernel::new(board_tables());
+    let (mut ctx, mut reports, _requests) = context(sysfs.path());
+    let (commands, receiver) = mpsc::channel(4);
+    ctx.commands = receiver;
+    let cancel = ctx.cancel.clone();
+    let module = NetModule::with_kernel(NetSettings::default(), kernel, wifi_dir.path())
+        .with_identity(identity.watch());
+    let running = tokio::spawn(async move { module.run(ctx).await });
+    next_report(&mut reports).await;
+
+    let saved = ask(
+        &commands,
+        "net.wifi.set",
+        json!({"ssid": "Home", "passphrase": seal("Home", "correct horse battery")}),
+    )
+    .await;
+    assert!(matches!(saved, crate::router::Outcome::Ok(_)), "{saved:?}");
+    let stored = std::fs::read_to_string(wifi_dir.path().join("networks.json")).unwrap();
+    assert!(stored.contains("correct horse battery"), "opened and saved");
+
+    for (passphrase, code) in [
+        (seal("Cafe", "correct horse battery"), "SECRET_UNREADABLE"),
+        (
+            json!({"sealed": {"enc": "AAAA", "ct": "AAAA"}}),
+            "SECRET_UNREADABLE",
+        ),
+        (json!({"sealed": {"enc": "AAAA"}}), "SECRET_UNREADABLE"),
+        (json!({"sealed": "AAAA"}), "INVALID_PASSPHRASE"),
+        (json!({"other": {}}), "INVALID_PASSPHRASE"),
+        (seal("Home", "short"), "INVALID_PASSPHRASE"),
+    ] {
+        let outcome = ask(
+            &commands,
+            "net.wifi.set",
+            json!({"ssid": "Home", "passphrase": passphrase}),
+        )
+        .await;
+        assert_eq!(error_code(&outcome), code, "{passphrase}");
+    }
+
+    drop(commands);
+    cancel.cancel();
+    identity_cancel.cancel();
+    assert_eq!(running.await.unwrap(), Ok(()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sealed_passphrase_needs_a_ready_identity() {
+    let sysfs = board_sysfs();
+    let wifi_dir = tempfile::tempdir().unwrap();
+    let (kernel, _changes) = FakeKernel::new(board_tables());
+    let (mut ctx, mut reports, _requests) = context(sysfs.path());
+    let (commands, receiver) = mpsc::channel(1);
+    ctx.commands = receiver;
+    let cancel = ctx.cancel.clone();
+    let (_state, watch) =
+        tokio::sync::watch::channel(crate::identity::manager::IdentityState::Starting);
+    let module = NetModule::with_kernel(NetSettings::default(), kernel, wifi_dir.path())
+        .with_identity(watch);
+    let running = tokio::spawn(async move { module.run(ctx).await });
+    next_report(&mut reports).await;
+    let outcome = ask(
+        &commands,
+        "net.wifi.set",
+        json!({"ssid": "Home", "passphrase": {"sealed": {"enc": "AAAA", "ct": "AAAA"}}}),
+    )
+    .await;
+    assert_eq!(error_code(&outcome), "SECRET_UNREADABLE");
+    drop(commands);
+    cancel.cancel();
+    assert_eq!(running.await.unwrap(), Ok(()));
+}

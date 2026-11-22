@@ -27,6 +27,8 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::{Module, ModuleContext, ModuleError, ModuleFuture};
+use crate::identity::manager::IdentityState;
+use crate::identity::secrets::{Sealed, SecretError};
 use crate::mqtt::envelope::timestamp;
 use crate::router::{Outcome, PendingCommand, codes};
 use netlink::{Kernel, Rtnetlink, Watch};
@@ -109,17 +111,23 @@ pub struct NetModule {
     wifi: Store,
     /// What `helios wifi-apply` last did.
     wifi_status: PathBuf,
+    /// The identity, for opening passphrases sealed to the device.
+    identity: Option<tokio::sync::watch::Receiver<IdentityState>>,
 }
 
 impl NetModule {
     /// The module, reading the real kernel.
     #[must_use]
-    pub fn new(settings: NetSettings) -> Self {
+    pub fn new(
+        settings: NetSettings,
+        identity: tokio::sync::watch::Receiver<IdentityState>,
+    ) -> Self {
         Self {
             settings,
             kernel: Arc::new(Rtnetlink),
             wifi: Store::new(wifi::STORE),
             wifi_status: wifi::STATUS.into(),
+            identity: Some(identity),
         }
     }
 
@@ -134,7 +142,14 @@ impl NetModule {
             kernel,
             wifi: Store::new(wifi_dir.join("networks.json")),
             wifi_status: wifi_dir.join("status.json"),
+            identity: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_identity(mut self, identity: tokio::sync::watch::Receiver<IdentityState>) -> Self {
+        self.identity = Some(identity);
+        self
     }
 }
 
@@ -171,7 +186,7 @@ impl NetModule {
                 () = ctx.cancel.cancelled() => return Ok(()),
                 command = ctx.commands.recv(), if commands_open => match command {
                     Some(command) => {
-                        let changed = self.command(command, &reporter);
+                        let changed = self.command(command, &reporter).await;
                         if changed {
                             self.refresh(&ctx, &mut reporter).await?;
                         }
@@ -228,10 +243,10 @@ impl NetModule {
 
 impl NetModule {
     /// Answers a command. `true` if the Wi-Fi networks changed, so the shadow is reported again.
-    fn command(&self, mut pending: PendingCommand, reporter: &Reporter) -> bool {
+    async fn command(&self, mut pending: PendingCommand, reporter: &Reporter) -> bool {
         let args = std::mem::take(&mut pending.command.args);
         let (outcome, changed) = match pending.command.name.as_str() {
-            "net.wifi.set" => self.wifi_set(args, reporter),
+            "net.wifi.set" => self.wifi_set(args, reporter).await,
             "net.wifi.remove" => self.wifi_remove(&args),
             "net.wifi.list" => (self.wifi_list(), false),
             other => (
@@ -243,8 +258,10 @@ impl NetModule {
         changed
     }
 
-    /// `net.wifi.set {ssid, passphrase?, hidden?}`: adds or replaces a network.
-    fn wifi_set(&self, args: Value, reporter: &Reporter) -> (Outcome, bool) {
+    /// `net.wifi.set {ssid, passphrase?, hidden?}`: adds or replaces a network. The passphrase
+    /// is a string, or `{"sealed": {"enc", "ct"}}` sealed to the device for this SSID (LLD 3,
+    /// section 10.7), as the Control API sends it.
+    async fn wifi_set(&self, args: Value, reporter: &Reporter) -> (Outcome, bool) {
         let Value::Object(mut args) = args else {
             return (
                 invalid_args("net.wifi.set takes {ssid, passphrase?, hidden?}"),
@@ -252,16 +269,26 @@ impl NetModule {
             );
         };
         // Take the passphrase out first, so it's wiped whatever happens next.
-        let passphrase = match args.remove("passphrase") {
+        let passphrase = args.remove("passphrase");
+        let Some(ssid) = args.get("ssid").and_then(Value::as_str).map(str::to_owned) else {
+            return (refusal(&Refused::InvalidSsid), false);
+        };
+        let passphrase = match passphrase {
             None | Some(Value::Null) => None,
             Some(Value::String(text)) => match Passphrase::new(text) {
                 Ok(passphrase) => Some(passphrase),
                 Err(refused) => return (refusal(&refused), false),
             },
+            Some(Value::Object(mut wrapper)) => match wrapper.remove("sealed") {
+                Some(sealed) if sealed.is_object() => {
+                    match self.open_passphrase(&ssid, sealed).await {
+                        Ok(passphrase) => Some(passphrase),
+                        Err(outcome) => return (outcome, false),
+                    }
+                }
+                _ => return (refusal(&Refused::InvalidPassphrase), false),
+            },
             Some(_) => return (refusal(&Refused::InvalidPassphrase), false),
-        };
-        let Some(ssid) = args.get("ssid").and_then(Value::as_str).map(str::to_owned) else {
-            return (refusal(&Refused::InvalidSsid), false);
         };
         let hidden = match args.get("hidden") {
             None | Some(Value::Null) => false,
@@ -285,6 +312,35 @@ impl NetModule {
             Err(StoreError::Refused(refused)) => (refusal(&refused), false),
             Err(StoreError::Io(error)) => (store_failed(&error), false),
         }
+    }
+
+    /// Opens a passphrase sealed to the device for `ssid`.
+    async fn open_passphrase(&self, ssid: &str, sealed: Value) -> Result<Passphrase, Outcome> {
+        let unreadable = |error: &SecretError| {
+            tracing::warn!(%error, %ssid, "sealed Wi-Fi passphrase not opened");
+            Outcome::error(error.code(), error.to_string())
+        };
+        let sealed: Sealed = serde_json::from_value(sealed)
+            .map_err(|_| unreadable(&SecretError::Malformed("sealed is {enc, ct}")))?;
+        let ready = self
+            .identity
+            .as_ref()
+            .and_then(|identity| match &*identity.borrow() {
+                IdentityState::Ready(ready) => Some(Arc::clone(ready)),
+                _ => None,
+            });
+        let (thing, key) = ready
+            .as_ref()
+            .and_then(|ready| Some((ready.device.thing_name.clone(), ready.secrets.clone()?)))
+            .ok_or_else(|| unreadable(&SecretError::NoKey))?;
+        let aad = format!("wifi.passphrase {ssid}");
+        let opened = key
+            .open(&thing, aad.as_bytes(), &sealed)
+            .await
+            .map_err(|error| unreadable(&error))?;
+        let text =
+            String::from_utf8(opened.to_vec()).map_err(|_| refusal(&Refused::InvalidPassphrase))?;
+        Passphrase::new(text).map_err(|refused| refusal(&refused))
     }
 
     /// `net.wifi.remove {ssid}`.
