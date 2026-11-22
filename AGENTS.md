@@ -56,8 +56,11 @@ in `/run/helios/bin` on the scanner.
 
 ## Releases
 
-Set `version` in `Cargo.toml` in a PR; once merged, the owner tags the merge commit
-`v<version>` and pushes it (a ruleset allows only admins to create `v*` tags). The workflow
+Set `version` in `Cargo.toml` in a PR; once merged, the merge commit is tagged `v<version>` and
+pushed (a ruleset allows only admins to create `v*` tags): by the owner, or by an agent the owner
+has OK'd for that release, which first checks that the commit is the release PR's merge on
+`origin/main`, that its version matches, that CI passed on it and that the tag doesn't exist, then
+pushes only that tag and watches the workflow. The workflow
 checks the tag, builds the arm64 package and publishes it to the Helios APT repository. A tag's
 workflow runs as it was at the tagged commit: if a release fails, fix it and release the next
 version rather than moving the tag.
@@ -85,4 +88,5 @@ version rather than moving the tag.
   shadow's `modules`.
 - Licensed fonts (Roobert TW Bold) are loaded at run time from the device and are never committed
   or compiled in. Nothing from INIT's vendor software goes into this repository.
-- Don't push tags or change repository settings without the owner's OK.
+- Don't push tags or change repository settings without the owner's OK; an OK for a release
+  covers that one tag (see Releases).
