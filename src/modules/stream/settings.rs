@@ -1,9 +1,8 @@
 //! `[modules.stream]` (LLD 4, section 6.2): outputs, profiles and streams, checked at start-up.
 //!
-//! This version runs USB-camera and test-pattern streams to `direct` or `srtla` SRT outputs. RTMP
-//! sources (`rtmp-ingest`) come in a later version; a config that uses them is refused with a
-//! message saying so, rather than ignored. SRT URLs, passphrases included, aren't secrets (owner,
-//! 2026-11-21), so the passphrase is set here.
+//! Streams read USB cameras, RTMP from `rtmp-ingest` (nginx under systemd, `helios-rtmp.service`)
+//! or a test pattern, and go to `direct` or `srtla` SRT outputs. SRT URLs, passphrases included,
+//! aren't secrets (owner, 2026-11-21), so the passphrase is set here.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -37,9 +36,35 @@ pub struct StreamSettings {
     sender_idle_s: u64,
     /// How often `stream.stats` goes out while a stream is live.
     stats_interval_s: u64,
+    pub(crate) rtmp_ingest: RtmpIngest,
     pub(crate) outputs: BTreeMap<String, Output>,
     pub(crate) profiles: BTreeMap<String, Profile>,
     pub(crate) streams: BTreeMap<String, Stream>,
+}
+
+/// `[modules.stream.rtmp_ingest]` (LLD 4, section 4): the nginx `helios-rtmp.service` runs. The
+/// ports and URL must match `/etc/helios/rtmp/nginx.conf`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RtmpIngest {
+    pub(crate) enabled: bool,
+    /// nginx's RTMP port, which jobs read streams back from on loopback.
+    pub(crate) port: u16,
+    /// Where Helios listens for nginx's `on_publish` / `on_publish_done`, on 127.0.0.1.
+    pub(crate) hook_port: u16,
+    /// The RTMP module's statistics page, read at start and every 30 s.
+    pub(crate) stat_url: String,
+}
+
+impl Default for RtmpIngest {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 1935,
+            hook_port: 1936,
+            stat_url: "http://127.0.0.1:1937/stat".into(),
+        }
+    }
 }
 
 impl Default for StreamSettings {
@@ -57,6 +82,7 @@ impl Default for StreamSettings {
             stats_interval_s: 30,
             outputs: BTreeMap::new(),
             profiles: BTreeMap::new(),
+            rtmp_ingest: RtmpIngest::default(),
             streams: BTreeMap::new(),
         }
     }
@@ -151,7 +177,7 @@ pub enum Source {
         #[serde(default)]
         audio: Option<String>,
     },
-    /// RTMP from `rtmp-ingest`: key `ingest`, or `ingest-<camera>`. Not supported yet.
+    /// RTMP from `rtmp-ingest`: key `ingest`, or `ingest-<camera>` for additional cameras.
     Rtmp {
         #[serde(default)]
         camera: Option<u32>,
@@ -163,6 +189,18 @@ pub enum Source {
         #[serde(default = "default_test_fps")]
         fps: u32,
     },
+}
+
+impl Source {
+    /// The RTMP stream key: `ingest` for the first camera, `ingest-<n>` for the others (owner,
+    /// 2026-11-21: not secret, the same on every device).
+    pub(crate) fn rtmp_key(&self) -> Option<String> {
+        match self {
+            Self::Rtmp { camera: None } => Some("ingest".into()),
+            Self::Rtmp { camera: Some(n) } => Some(format!("ingest-{n}")),
+            _ => None,
+        }
+    }
 }
 
 fn default_test_size() -> String {
@@ -209,6 +247,19 @@ impl StreamSettings {
     pub(crate) fn check(self) -> Result<Option<Self>, String> {
         if !(5..=3600).contains(&self.stats_interval_s) {
             return Err("modules.stream.stats_interval_s must be 5 to 3600".into());
+        }
+        let ingest = &self.rtmp_ingest;
+        if ingest.enabled
+            && (ingest.port == 0
+                || ingest.hook_port == 0
+                || ingest.port == ingest.hook_port
+                || !ingest.stat_url.starts_with("http://127.0.0.1:"))
+        {
+            return Err(
+                "modules.stream.rtmp_ingest: port and hook_port must be distinct, and stat_url \
+                 an http://127.0.0.1:<port>/... URL"
+                    .into(),
+            );
         }
         if !(1..=3600).contains(&self.sender_idle_s) {
             return Err("modules.stream.sender_idle_s must be 1 to 3600".into());
@@ -325,8 +376,26 @@ impl StreamSettings {
                 return Err(format!("{at}.output: no output {:?}", stream.output));
             }
             match &stream.source {
-                Source::Rtmp { .. } => {
-                    return Err(format!("{at}: RTMP sources aren't supported yet"));
+                Source::Rtmp { camera } => {
+                    if !self.rtmp_ingest.enabled {
+                        return Err(format!(
+                            "{at}: RTMP sources need [modules.stream.rtmp_ingest] enabled"
+                        ));
+                    }
+                    if camera.is_some_and(|camera| camera == 0) {
+                        return Err(format!("{at}.source.camera counts from 1 (ingest-1)"));
+                    }
+                    let key = stream.source.rtmp_key();
+                    if let Some((other, _)) = self
+                        .streams
+                        .iter()
+                        .find(|(other, s)| *other < name && s.source.rtmp_key() == key)
+                    {
+                        return Err(format!(
+                            "{at}: stream {other} already takes RTMP key {:?}",
+                            key.unwrap_or_default()
+                        ));
+                    }
                 }
                 Source::Test { size, fps } => {
                     if parse_size(size).is_none() || !(1..=120).contains(fps) {

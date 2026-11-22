@@ -1,0 +1,43 @@
+#!/usr/sbin/nft -f
+# Helios's firewall rules (LLD 4, sections 4 and 5.1), loaded by helios-firewall.service as their
+# own table, alongside any other rules on the board.
+#
+# - srtla_send binds its local SRT port on every interface ([::]:<srtla_port_base + n>), but only
+#   the stream daemon's ffmpeg, on loopback, should reach it. The range must cover
+#   [modules.stream] srtla_port_base and one port per srtla output.
+# - RTMP publishing (nginx, helios-rtmp.service, port 1935) is open to private networks only: the
+#   cameras are on the travel router's LAN, which is trusted (owner, 2026-11-21), and nothing on
+#   an uplink's public side may publish.
+#
+# The counters show what was dropped: nft list counters table inet helios
+
+# Replace the table as one transaction, whether or not it's loaded already.
+table inet helios
+delete table inet helios
+
+table inet helios {
+    counter srtla_outside {
+    }
+    counter rtmp_refused {
+    }
+
+    set rtmp_publishers4 {
+        type ipv4_addr
+        flags interval
+        elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }
+    }
+    set rtmp_publishers6 {
+        type ipv6_addr
+        flags interval
+        elements = { fc00::/7, fe80::/10 }
+    }
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+        iifname "lo" accept
+        udp dport 6000-6099 counter name srtla_outside drop
+        tcp dport 1935 ip saddr @rtmp_publishers4 accept
+        tcp dport 1935 ip6 saddr @rtmp_publishers6 accept
+        tcp dport 1935 counter name rtmp_refused drop
+    }
+}

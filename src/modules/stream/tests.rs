@@ -94,7 +94,7 @@ fn refuses_what_this_version_cannot_run_and_bad_values() {
         (
             "type = \"camera\", video = \"usb:1-1.3\", audio = \"usb:1-1.3\"",
             "type = \"rtmp\"",
-            "RTMP sources aren't supported yet",
+            "RTMP sources need [modules.stream.rtmp_ingest] enabled",
         ),
         ("not-a-secret-123", "short", "passphrase must be 10 to 79"),
         ("not-a-secret-123", "has space in it", "passphrase must be"),
@@ -1254,5 +1254,242 @@ async fn no_uplink_addresses_leave_the_output_waiting() {
     );
     harness.next_start().await;
     harness.output_state("bond", "no_uplinks").await;
+    harness.stop().await;
+}
+
+const RTMP: &str = r#"
+ffmpeg = "/opt/ffmpeg"
+
+[rtmp_ingest]
+enabled = true
+hook_port = HOOK
+stat_url = "http://127.0.0.1:STAT/stat"
+
+[outputs.main]
+mode = "direct"
+host = "ingest.example.com"
+port = 4001
+
+[profiles.pocket]
+video = "hevc_rkmpp"
+bitrate_kbps = 6000
+audio = "copy"
+
+[streams.pocket]
+source = { type = "rtmp" }
+profile = "pocket"
+output = "main"
+streamid = "publish/live/pocket"
+
+[streams.second]
+source = { type = "rtmp", camera = 1 }
+profile = "pocket"
+output = "main"
+streamid = "publish/live/second"
+"#;
+
+#[test]
+fn checks_rtmp_sources_and_their_keys() {
+    let config = RTMP.replace("HOOK", "1936").replace("STAT", "1937");
+    let parsed = settings(&config);
+    let keys: Vec<_> = parsed
+        .streams
+        .values()
+        .map(|stream| stream.source.rtmp_key())
+        .collect();
+    assert_eq!(
+        keys,
+        [Some("ingest".to_owned()), Some("ingest-1".to_owned())]
+    );
+    for (from, to, message) in [
+        ("camera = 1", "camera = 0", "counts from 1"),
+        (
+            "{ type = \"rtmp\", camera = 1 }",
+            "{ type = \"rtmp\" }",
+            "already takes RTMP key \"ingest\"",
+        ),
+        ("hook_port = 1936", "hook_port = 1935", "must be distinct"),
+        (
+            "http://127.0.0.1:1937/stat",
+            "http://10.0.0.1:1937/stat",
+            "http://127.0.0.1",
+        ),
+        (
+            "enabled = true",
+            "enabled = false",
+            "need [modules.stream.rtmp_ingest] enabled",
+        ),
+    ] {
+        let error = refused(&config.replacen(from, to, 1));
+        assert!(error.contains(message), "{to}: {error}");
+    }
+}
+
+#[test]
+fn builds_rtmp_arguments_with_hardware_decoding_for_rockchip() {
+    let config = RTMP.replace("HOOK", "1936").replace("STAT", "1937");
+    let settings = settings(&config);
+    let output = &settings.outputs["main"];
+    let url = "rtmp://127.0.0.1:1935/live/ingest";
+    let mut profile = settings.profiles["pocket"].clone();
+    profile.scale = "1280x720".into();
+    let args = ffmpeg::rtmp_args(&profile, target(output, "s"), url, 6000).join(" ");
+    assert!(
+        args.contains("-hwaccel rkmpp -hwaccel_output_format drm_prime -rw_timeout 10000000 -i rtmp://127.0.0.1:1935/live/ingest"),
+        "{args}"
+    );
+    assert!(
+        args.contains("-map 0:v:0 -map 0:a:0? -c:v hevc_rkmpp -rc_mode CBR -b:v 6000k"),
+        "{args}"
+    );
+    assert!(
+        args.contains("-vf scale_rkrga=w=1280:h=720 -c:a copy"),
+        "{args}"
+    );
+    // H.264 passed through (the relay): no decoding, no encoder options.
+    profile.video = "copy".into();
+    profile.scale = String::new();
+    let args = ffmpeg::rtmp_args(&profile, target(output, "s"), url, 6000).join(" ");
+    assert!(!args.contains("hwaccel"), "{args}");
+    assert!(args.contains("-c:v copy -c:a copy -f mpegts"), "{args}");
+    assert!(!args.contains("-b:v"), "{args}");
+}
+
+/// A free loopback port (nothing listens on it once this returns).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("address")
+        .port()
+}
+
+/// nginx's statistics page, serving whatever `page` holds.
+async fn stat_server(page: Arc<std::sync::Mutex<String>>) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let body = page.lock().expect("page").clone();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n\r\n{body}");
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    port
+}
+
+fn stat_page(publishing: &[(&str, &str)]) -> String {
+    let streams: String = publishing
+        .iter()
+        .map(|(key, address)| {
+            format!("<stream><name>{key}</name><client><address>{address}</address><publishing/></client></stream>")
+        })
+        .collect();
+    format!(
+        "<rtmp><server><application><name>live</name><live>{streams}</live></application></server></rtmp>"
+    )
+}
+
+/// nginx's `on_publish` / `on_publish_done`; the hook's status code.
+async fn hook(port: u16, call: &str, key: &str, address: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let body = format!("call={call}&app=live&name={key}&addr={address}&clientid=1");
+    for _ in 0..100 {
+        if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            let request = format!(
+                "POST /rtmp/{call} HTTP/1.0\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.expect("send");
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.expect("reply");
+            return reply[9..12].parse().expect("status");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the hook never listened");
+}
+
+#[tokio::test]
+async fn rtmp_streams_follow_the_hook_and_the_statistics_page() {
+    let page = Arc::new(std::sync::Mutex::new(stat_page(&[(
+        "ingest",
+        "192.168.8.20",
+    )])));
+    let stat = stat_server(page.clone()).await;
+    let hook_port = free_port();
+    let config = RTMP
+        .replace("HOOK", &hook_port.to_string())
+        .replace("STAT", &stat.to_string());
+    let mut harness = harness(&config, None, false);
+
+    // Already publishing when the daemon starts: found on the statistics page.
+    let job = harness.next_start().await;
+    let args = job.spec.args.join(" ");
+    assert!(
+        args.contains("-i rtmp://127.0.0.1:1935/live/ingest"),
+        "{args}"
+    );
+    let connected = harness.event("stream.connected").await;
+    assert!(connected.contains("192.168.8.20"), "{connected}");
+    harness.state_of("second", "waiting_for_input").await;
+
+    // Gone from the page (a publish_done the daemon missed): the stream waits again.
+    *page.lock().expect("page") = stat_page(&[]);
+    let disconnected = harness.event("stream.disconnected").await;
+    assert!(disconnected.contains("publish_done"), "{disconnected}");
+    harness.state_of("pocket", "waiting_for_input").await;
+    assert!(job.stopped.load(Ordering::SeqCst));
+
+    // A camera publishes through the hook; nginx lists it a moment later.
+    assert_eq!(
+        hook(hook_port, "publish", "ingest-1", "192.168.8.21").await,
+        200
+    );
+    let job = harness.next_start().await;
+    assert!(job.spec.args.join(" ").contains("/live/ingest-1"));
+    *page.lock().expect("page") = stat_page(&[("ingest-1", "192.168.8.21")]);
+    // A second publisher on the same key, and a key no stream takes, are refused.
+    assert_eq!(
+        hook(hook_port, "publish", "ingest-1", "192.168.8.22").await,
+        403
+    );
+    assert_eq!(
+        hook(hook_port, "publish", "ingest-7", "192.168.8.22").await,
+        403
+    );
+    // Past the grace period, the page keeps it.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!job.stopped.load(Ordering::SeqCst));
+    let reported = loop {
+        let (shadow, reported) = tokio::time::timeout(WAIT, harness.reports.recv())
+            .await
+            .expect("a report")
+            .expect("shadow");
+        if shadow == "stream" && reported["rtmp_ingest"]["publishers"]["ingest-1"].is_object() {
+            break reported;
+        }
+    };
+    assert_eq!(reported["rtmp_ingest"]["state"], "ok");
+    assert_eq!(
+        reported["rtmp_ingest"]["publishers"]["ingest-1"]["address"],
+        "192.168.8.21"
+    );
+    assert_eq!(
+        reported["streams"]["second"]["source"]["publisher"],
+        "192.168.8.21"
+    );
+
+    // The camera stops.
+    assert_eq!(
+        hook(hook_port, "publish_done", "ingest-1", "192.168.8.21").await,
+        200
+    );
+    *page.lock().expect("page") = stat_page(&[]);
+    harness.state_of("second", "waiting_for_input").await;
+    assert!(job.stopped.load(Ordering::SeqCst));
     harness.stop().await;
 }

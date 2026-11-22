@@ -1,0 +1,37 @@
+# rtmp-ingest (LLD 4, section 4): nginx with the RTMP module, for cameras that publish RTMP (the
+# Osmo Pocket 3). Its own nginx and config (/etc/helios/rtmp/nginx.conf), not nginx.service. It
+# asks the Helios stream daemon about each publish, so start it with helios-stream.service. Needs
+# the nginx and libnginx-mod-rtmp packages. Enable it where [modules.stream.rtmp_ingest] is on.
+
+[Unit]
+Description=Helios RTMP ingest (nginx)
+Wants=network-online.target helios-firewall.service
+After=network-online.target helios-stream.service helios-firewall.service
+
+[Service]
+Type=exec
+User=helios-rtmp
+Group=helios-rtmp
+ExecStartPre=/usr/sbin/nginx -t -q -e stderr -c /etc/helios/rtmp/nginx.conf
+ExecStart=/usr/sbin/nginx -e stderr -c /etc/helios/rtmp/nginx.conf -g "daemon off;"
+ExecReload=/usr/sbin/nginx -t -q -e stderr -c /etc/helios/rtmp/nginx.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+RuntimeDirectory=helios-rtmp
+RuntimeDirectoryMode=0750
+StateDirectory=helios-rtmp
+StateDirectoryMode=0750
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

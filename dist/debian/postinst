@@ -1,5 +1,5 @@
 #!/bin/sh
-# helios postinst: the helios and helios-stream system users, and a restart on upgrade if Helios
+# helios postinst: the helios, helios-stream and helios-rtmp system users, and a restart on upgrade if Helios
 # is running. The services aren't enabled or started on install: a device needs its config and
 # token first (provisioning), and then enables helios.service (and helios-stream.service where
 # it streams) itself. The stream daemon isn't restarted here: it's told an upgrade is waiting,
@@ -15,6 +15,10 @@ if [ "$1" = configure ]; then
         adduser --system --ingroup helios --home /nonexistent --no-create-home \
             --gecos "Helios stream daemon" helios-stream
     fi
+    if ! getent passwd helios-rtmp >/dev/null; then
+        adduser --system --group --home /nonexistent --no-create-home \
+            --gecos "Helios RTMP ingest (nginx)" helios-rtmp
+    fi
     if getent group video >/dev/null; then
         adduser helios-stream video >/dev/null || true
     fi
@@ -22,6 +26,9 @@ if [ "$1" = configure ]; then
         systemctl daemon-reload || true
         # Upgrades restart a running Helios; installs and stopped services are left alone.
         systemctl try-restart helios.service || true
+        # New firewall rules apply at once; nginx reloads a changed config without dropping cameras.
+        systemctl try-reload-or-restart helios-firewall.service || true
+        systemctl try-reload-or-restart helios-rtmp.service || true
         if systemctl is-active --quiet helios-stream.service; then
             touch /run/helios-stream/restart-pending || true
         fi

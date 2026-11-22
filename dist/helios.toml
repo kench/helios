@@ -80,6 +80,16 @@ srtla_port_base = 6000             # srtla outputs get local ports from here, in
 sender_idle_s = 60                 # 1 to 3600: how long a sender outlives its last stream
 stats_interval_s = 30              # 5 to 3600: stream.stats while live
 
+[modules.stream.rtmp_ingest]
+# Cameras that publish RTMP (the Osmo Pocket 3) to rtmp://<board>:1935/live/ingest, or ingest-1,
+# ingest-2... for more cameras: nginx in helios-rtmp.service (config /etc/helios/rtmp/nginx.conf,
+# packages nginx and libnginx-mod-rtmp) asks the daemon about each publish. The keys aren't
+# secret. These must match that nginx.conf.
+enabled = false
+port = 1935                        # nginx's RTMP port; jobs read streams back on loopback
+hook_port = 1936                   # on_publish / on_publish_done, on 127.0.0.1
+stat_url = "http://127.0.0.1:1937/stat"  # rtmp_stat, read at start and every 30 s
+
 # [modules.stream.outputs.bonded]
 # mode = "srtla"                   # srtla (to srtla_rec) or direct (to an SRT listener)
 # host = "ingest.example.com"
@@ -103,6 +113,12 @@ stats_interval_s = 30              # 5 to 3600: stream.stats while live
 # output = "bonded"
 # streamid = "publish/live/backpack"
 # desired = "live"
+#
+# [modules.stream.streams.pocket]
+# source = { type = "rtmp" }       # key ingest; { type = "rtmp", camera = 1 } is ingest-1
+# profile = "hevc"                 # with audio = "copy"; video = "copy" passes H.264 through
+# output = "bonded"
+# streamid = "publish/live/pocket"
 
 [modules.display]
 # Screens on a framebuffer (LLD 9): the scanner's 800x480 screen. Needs a build with the

@@ -2,9 +2,11 @@
 # Stage 2 of the stream harness: `helios stream-daemon` as its own process, with the real ffmpeg
 # and srtla_send it starts, through srtla_rec to irl-srt-server, and the test as Helios (the
 # daemon's client). Two dummy interfaces are the uplinks (up0 10.10.1.2, up1 10.10.2.2) and the
-# receiving side listens on rx0 (10.10.0.1). The test (src/modules/stream/e2e.rs) stops Helios
-# mid-stream and checks the stream carries on, then drops and restores an uplink. Run setup.sh
-# first.
+# receiving side listens on rx0 (10.10.0.1). nginx runs the shipped dist/rtmp/nginx.conf, with
+# only its paths changed, and the shipped firewall rules are loaded and probed from a second
+# namespace. The tests (src/modules/stream/e2e.rs) stop Helios mid-stream and check
+# the stream carries on, drop and restore an uplink, and take RTMP cameras through nginx and the
+# daemon (HEVC, and H.264 passed through), across a daemon restart. Run setup.sh first.
 #
 # Usage: tests/stream-e2e/helios.sh
 set -euo pipefail
@@ -71,7 +73,60 @@ CONF
 PIDS+=($!)
 "$BIN/srtla_rec" --srtla_port 5000 --srt_hostname 127.0.0.1 --srt_port 4002 >"$RUN/srtla_rec.log" 2>&1 &
 PIDS+=($!)
+
+# rtmp-ingest: the shipped config, with this run's paths. In the namespace nginx is root and
+# would switch workers to nobody, which isn't mapped, so it stays root here.
+mkdir -p "$RUN/nginx"
+sed -e "s|/usr/lib/nginx/modules/|$E2E/sysroot/usr/lib/nginx/modules/|" \
+    -e "s|/run/helios-rtmp/|$RUN/nginx/|" -e "s|/var/lib/helios-rtmp/|$RUN/nginx/|" \
+    -e "s|^worker_processes|user root root;\nworker_processes|" \
+    "$TOP/dist/rtmp/nginx.conf" >"$RUN/nginx/nginx.conf"
+"$BIN/nginx" -t -q -e stderr -p "$RUN/nginx/" -c "$RUN/nginx/nginx.conf"
+"$BIN/nginx" -e stderr -p "$RUN/nginx/" -c "$RUN/nginx/nginx.conf" -g 'daemon off;' >"$RUN/nginx.log" 2>&1 &
+PIDS+=($!)
 sleep 1
+echo "== nginx from dist/rtmp/nginx.conf: RTMP :1935, statistics on 127.0.0.1:1937"
+
+# The shipped firewall rules, loaded twice (they replace themselves), then probed from a second
+# namespace standing for other hosts: a camera on a private network, and one outside.
+nft -f "$TOP/dist/nftables/helios.nft"
+nft -f "$TOP/dist/nftables/helios.nft"
+unshare --net sleep 600 &
+OTHER=$!
+PIDS+=("$OTHER")
+sleep 0.5
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns "$OTHER"
+ip addr add 192.168.77.1/24 dev veth0
+ip addr add 203.0.113.1/24 dev veth0
+ip link set veth0 up
+nsenter -t "$OTHER" -n sh -c 'ip link set lo up; ip link set veth1 up
+    ip addr add 192.168.77.2/24 dev veth1; ip addr add 203.0.113.2/24 dev veth1'
+connects_from() {
+    nsenter -t "$OTHER" -n python3 -I -c '
+import socket, sys
+s = socket.create_connection((sys.argv[2], 1935), timeout=2, source_address=(sys.argv[1], 0))
+s.close()' "$@" 2>/dev/null
+}
+counter() { nft list counter inet helios "$1" | awk '/packets/{print $2}'; }
+fw_failed=0
+if connects_from 192.168.77.2 192.168.77.1; then
+    echo "   firewall: a private address can publish to 1935"
+else
+    echo "   FAIL firewall: 192.168.77.2 can't reach 1935"; fw_failed=1
+fi
+if connects_from 203.0.113.2 203.0.113.1; then
+    echo "   FAIL firewall: 203.0.113.2 reached 1935"; fw_failed=1
+else
+    echo "   firewall: a public address can't publish (rtmp_refused $(counter rtmp_refused))"
+fi
+nsenter -t "$OTHER" -n python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);[s.sendto(b"x",("192.168.77.1",6000)) for _ in range(5)]'
+sleep 0.3
+if [ "$(counter srtla_outside)" -ge 5 ]; then
+    echo "   firewall: srtla_send's ports are closed to other hosts (srtla_outside $(counter srtla_outside))"
+else
+    echo "   FAIL firewall: srtla_outside counted $(counter srtla_outside)"; fw_failed=1
+fi
 
 echo "== Helios's stream module (src/modules/stream/e2e.rs)"
 cd "$TOP"
@@ -80,7 +135,8 @@ HELIOS_E2E_DIR=$E2E HELIOS_E2E_RUN=$RUN HELIOS_E2E_BIN=$TOP/target/debug/helios 
     --lib -q modules::stream::e2e -- --ignored --nocapture --test-threads=1 \
     >"$RUN/test.log" 2>&1 || status=$?
 grep -E "^HELIOS|test result|panicked|left:|right:" "$RUN/test.log" || true
-grep -q "test result: ok. 1 passed" "$RUN/test.log" || status=1
+grep -q "test result: ok. 2 passed" "$RUN/test.log" || status=1
+[ "$fw_failed" = 0 ] || status=1
 if [ "$status" = 0 ]; then
     echo "== passed"
 else

@@ -74,7 +74,43 @@ pub(crate) fn test_args(
     if profile.audio != "none" {
         args.extend(["-map".into(), "1:a:0".into()]);
     }
-    args.extend(video_args(profile, bitrate_kbps));
+    args.extend(video_args(profile, bitrate_kbps, false));
+    if profile.audio == "none" {
+        args.push("-an".into());
+    } else {
+        args.extend(audio_args(&profile.audio));
+    }
+    args.extend(output_args(target));
+    args
+}
+
+/// The arguments for an RTMP stream read back from nginx on loopback (`rtmp-ingest`). With a
+/// Rockchip encoder the input is decoded by MPP and scaled by RGA, so frames stay in DMA buffers
+/// (tested on the Orange Pi 5 Plus: 1080p60 to HEVC at 7.5x real time). Audio is optional: a
+/// camera that sends none still streams.
+pub(crate) fn rtmp_args(
+    profile: &Profile,
+    target: Target<'_>,
+    url: &str,
+    bitrate_kbps: u32,
+) -> Vec<String> {
+    let mut args: Vec<String> = COMMON.map(String::from).into();
+    let hardware = profile.video.ends_with("_rkmpp");
+    if hardware {
+        args.extend(["-hwaccel", "rkmpp", "-hwaccel_output_format", "drm_prime"].map(String::from));
+    }
+    // A publisher that stops sending ends the read after 10 s (in microseconds).
+    args.extend([
+        "-rw_timeout".into(),
+        "10000000".into(),
+        "-i".into(),
+        url.to_owned(),
+    ]);
+    args.extend(["-map".into(), "0:v:0".into()]);
+    if profile.audio != "none" {
+        args.extend(["-map".into(), "0:a:0?".into()]);
+    }
+    args.extend(video_args(profile, bitrate_kbps, hardware));
     if profile.audio == "none" {
         args.push("-an".into());
     } else {
@@ -112,7 +148,7 @@ pub(crate) fn camera_args(
     if audio.is_some() {
         args.extend(["-map".into(), "1:a:0".into()]);
     }
-    args.extend(video_args(profile, bitrate_kbps));
+    args.extend(video_args(profile, bitrate_kbps, false));
     if audio.is_some() {
         args.extend(audio_args(&profile.audio));
     } else {
@@ -122,7 +158,8 @@ pub(crate) fn camera_args(
     args
 }
 
-fn video_args(profile: &Profile, bitrate_kbps: u32) -> Vec<String> {
+/// `hardware`: the frames are MPP-decoded DRM PRIME buffers, so scaling is RGA's.
+fn video_args(profile: &Profile, bitrate_kbps: u32, hardware: bool) -> Vec<String> {
     let bitrate = format!("{bitrate_kbps}k");
     let mut args = vec!["-c:v".to_owned(), profile.video.clone()];
     match profile.video.as_str() {
@@ -163,7 +200,12 @@ fn video_args(profile: &Profile, bitrate_kbps: u32) -> Vec<String> {
         format!("expr:gte(t,n_forced*{})", profile.gop_s),
     ]);
     if let Some((width, height)) = parse_size(&profile.scale) {
-        args.extend(["-vf".into(), format!("scale={width}:{height}")]);
+        let filter = if hardware {
+            format!("scale_rkrga=w={width}:h={height}")
+        } else {
+            format!("scale={width}:{height}")
+        };
+        args.extend(["-vf".into(), filter]);
     }
     args
 }

@@ -85,7 +85,11 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   licensed fonts that mustn't be compiled into Helios; the scanner keeps it on the USB drive.
 - `stream` (LLD 4, Cargo feature `module-stream`): video streams through ffmpeg to SRT listeners,
   directly or bonded over several uplinks by `srtla_send`. Sources: USB cameras (from the usb
-  module) and a generated test pattern; RTMP ingest comes next. `stream.start`, `stream.stop` and
+  module), RTMP cameras such as the Osmo Pocket 3 (`rtmp-ingest`: nginx with the RTMP module in
+  `helios-rtmp.service`, config `/etc/helios/rtmp/nginx.conf`, keys `ingest`, `ingest-1`...;
+  the daemon answers nginx's publish hook and reads its statistics page, so it picks up cameras
+  already publishing after a restart), and a generated test pattern. With a Rockchip encoder,
+  RTMP input is decoded by MPP and scaled by RGA. `stream.start`, `stream.stop` and
   `stream.status`; events `stream.connected`, `stream.live`, `stream.disconnected` and
   `stream.stats`; the `stream` shadow has each stream's and each bonded output's state, with
   per-link statistics. ffmpeg's arguments come only from the local profiles.
@@ -100,7 +104,10 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   `srtla_send`, `srtla_rec` and irl-srt-server (pinned) into `~/.cache/helios-stream-e2e`;
   `external.sh` checks the external pieces together; `helios.sh` runs the daemon as its own
   process with the real ffmpeg and `srtla_send` through `srtla_rec` to irl-srt-server, stops
-  Helios mid-stream (the stream carries on, same processes), and drops and restores an uplink.
+  Helios mid-stream (the stream carries on, same processes), and drops and restores an uplink;
+  with nginx running the shipped `dist/rtmp/nginx.conf`, it takes RTMP cameras through to the
+  player (HEVC, and H.264 passed through), refuses an unknown key, and restarts the daemon while
+  cameras publish.
 
 The other modules come later.
 
