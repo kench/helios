@@ -82,6 +82,8 @@ module-display = ["dep:fontdue", "dep:jiff"]
 module-usb = []
 # The stream module (LLD 4): video streams through ffmpeg. Cameras come from the usb module.
 module-stream = ["module-usb", "tokio/process", "tokio/io-util"]
+# The net module (LLD 3): network interfaces, addresses and default routes, over rtnetlink.
+module-net = []
 
 [dev-dependencies]
 bytes = "1.12.1"

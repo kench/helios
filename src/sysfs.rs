@@ -11,7 +11,26 @@ pub(crate) fn on_usb(device: &Path) -> bool {
     })
 }
 
-#[cfg(feature = "module-usb")]
+/// Whether `port` is a USB port name: `<bus>-<port>[.<port>…]` (`1-1.3`).
+#[cfg(any(feature = "module-usb", feature = "module-net"))]
+pub(crate) fn is_port(port: &str) -> bool {
+    let digits = |segment: &str| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit());
+    port.split_once('-')
+        .is_some_and(|(bus, chain)| digits(bus) && chain.split('.').all(digits))
+}
+
+/// The USB port a sysfs device path is below: its last component that names one.
+#[cfg(feature = "module-net")]
+pub(crate) fn usb_port(device: &Path) -> Option<String> {
+    device
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .rfind(|name| is_port(name))
+        .map(str::to_owned)
+}
+
+/// A sysfs attribute's text, trimmed (at most 256 bytes).
+#[cfg(any(feature = "module-usb", feature = "module-net"))]
 pub(crate) fn read_attr(path: &Path) -> Option<String> {
     use std::io::Read;
     let mut bytes = Vec::with_capacity(256);

@@ -541,6 +541,33 @@ fn the_shipped_example_parses() {
             .expect("valid usb settings")
             .is_some()
     );
+    #[cfg(feature = "module-net")]
+    assert_eq!(
+        file.modules
+            .net
+            .expect("the net section")
+            .check()
+            .expect("valid net settings"),
+        Some(crate::modules::net::NetSettings::default())
+    );
+}
+
+#[cfg(feature = "module-net")]
+#[test]
+fn reads_and_checks_the_net_settings() {
+    let files = Files::new();
+    let config = files
+        .load(&files.local("\n[modules.net]\nexclude = [\"docker*\"]\n"))
+        .unwrap();
+    assert!(config.net.expect("enabled").excludes("docker0"));
+    let config = files
+        .load(&files.local("\n[modules.net]\nenabled = false\n"))
+        .unwrap();
+    assert_eq!(config.net, None);
+    let error = files
+        .load(&files.local("\n[modules.net]\nexclude = [\"a b\"]\n"))
+        .unwrap_err();
+    assert!(error.to_string().contains("modules.net.exclude"), "{error}");
 }
 
 #[test]
