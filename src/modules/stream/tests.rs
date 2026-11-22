@@ -1842,3 +1842,429 @@ async fn an_adaptive_rtmp_streams_ceiling_follows_the_camera() {
     assert_eq!(waiting["source_kbps"], Value::Null);
     harness.stop().await;
 }
+
+// --- Settings from the desired state (HLD section 7.3.7) ---------------------------------------
+
+const REMOTE: &str = r#"
+ffmpeg = "/opt/ffmpeg"
+srtla_send = "/opt/srtla_send"
+runtime_dir = "RUNTIME"
+srtla_uplinks = ["wlan0"]
+
+[outputs.main]
+mode = "direct"
+host = "ingest.example.com"
+port = 4001
+latency_ms = 1500
+passphrase = "not-a-secret-123"
+
+[profiles.big]
+video = "libx264"
+bitrate_kbps = 4000
+min_bitrate_kbps = 1000
+max_bitrate_kbps = 8000
+
+[profiles.small]
+video = "libx264"
+bitrate_kbps = 2000
+min_bitrate_kbps = 500
+max_bitrate_kbps = 3000
+
+[profiles.hevc]
+video = "libx265"
+
+[profiles.passthrough]
+video = "copy"
+audio = "copy"
+
+[streams.pattern]
+source = { type = "test", size = "1280x720", fps = 30 }
+profile = "big"
+output = "main"
+streamid = "publish/live/pattern"
+"#;
+
+const CONFIGURED: &str = "srt://ingest.example.com:4001?streamid=publish/live/pattern&latency=1500&passphrase=not-a-secret-123";
+
+impl Harness {
+    /// The next `stream` report that `matches`.
+    async fn report_where(&mut self, matches: impl Fn(&Value) -> bool) -> Value {
+        loop {
+            let (shadow, reported) = tokio::time::timeout(WAIT, self.reports.recv())
+                .await
+                .expect("a report in time")
+                .expect("shadow");
+            let reported = Value::Object(reported);
+            if shadow == "stream" && matches(&reported) {
+                return reported;
+            }
+        }
+    }
+
+    async fn status_of(&self, id: &str) -> Value {
+        match self.command("status", json!({"stream_id": id})).await {
+            Outcome::Ok(status) => status,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn desire(&self, desired: Value) {
+        self.desired
+            .send(json!({"streams": {"pattern": desired}}))
+            .expect("module running");
+    }
+}
+
+fn settings_of(rejected: &Value) -> Vec<&str> {
+    rejected
+        .as_array()
+        .expect("rejected")
+        .iter()
+        .map(|r| r["setting"].as_str().expect("setting"))
+        .collect()
+}
+
+#[test]
+fn checks_srtla_uplinks_and_leaves_a_sender_port_per_stream() {
+    let config = REMOTE.replace("RUNTIME", "/run/helios");
+    let parsed = settings(&config);
+    assert_eq!(parsed.stream_sender_port("pattern"), Some(6001));
+    assert_eq!(parsed.stream_sender_port("nope"), None);
+    assert_eq!(
+        settings(&config.replace("srtla_uplinks = [\"wlan0\"]\n", "")).srtla_uplinks,
+        ["usb:ethernet", "usb:cellular", "usb:wifi"]
+    );
+    assert!(
+        refused(&config.replace("[\"wlan0\"]", "[\"usb:modem\"]"))
+            .contains("srtla_uplinks: \"usb:modem\" must be")
+    );
+    // The last port must leave one for the stream too.
+    let full = format!("srtla_port_base = 65534\n{config}");
+    assert!(refused(&full).contains("a port per output and per stream"));
+    settings(&full.replace("65534", "65533"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_desired_state_sets_a_streams_profile_source_and_destination() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
+    let first = harness.next_start().await;
+    let args = first.spec.args.join(" ");
+    assert!(args.contains("-b:v 4000k"), "{args}");
+    assert!(args.contains("srt://ingest.example.com:4001?"), "{args}");
+    let status = harness.state_of("pattern", "starting").await;
+    assert_eq!(status["destination"], CONFIGURED);
+    assert_eq!(status["source_ceiling_percent"], 100);
+    assert_eq!(status["rejected"], json!([]));
+    assert_eq!(
+        status["overrides"],
+        json!({"source": null, "profile": null, "destination": null, "source_ceiling_percent": null})
+    );
+
+    // A new profile and destination together: one restart with both.
+    harness.desire(json!({
+        "profile": "small", "destination": "srt://other.example.com:4000?streamid=x/y",
+    }));
+    let second = harness.next_start().await;
+    assert!(first.stopped.load(Ordering::SeqCst));
+    let args = second.spec.args.join(" ");
+    assert!(args.contains("-b:v 2000k"), "{args}");
+    assert!(
+        args.contains("srt://other.example.com:4000?mode=caller&latency=1500000&streamid=x/y"),
+        "the configured latency, the URL's stream ID: {args}"
+    );
+    assert!(
+        !args.contains("passphrase"),
+        "the passphrase is the server's: {args}"
+    );
+    let reported = harness
+        .report_where(|r| r["streams"]["pattern"]["profile"] == "small")
+        .await;
+    let status = &reported["streams"]["pattern"];
+    assert_eq!(
+        status["destination"],
+        "srt://other.example.com:4000?streamid=x/y"
+    );
+    assert_eq!(status["output"], "stream:pattern");
+    assert_eq!(status["bitrate_kbps"], 2000);
+    assert_eq!(status["overrides"]["profile"], "small");
+    assert_eq!(status["overrides"]["destination"], status["destination"]);
+    assert_eq!(
+        reported["outputs"]["stream:pattern"],
+        Value::Null,
+        "direct: no sender"
+    );
+
+    // Refusals change nothing, and each says why.
+    let refused = json!({
+        "profile": "hevc", "destination": "srt://h:1?mode=listener",
+        "source": {"type": "test", "size": "big"}, "source_ceiling_percent": 500,
+        "bitrate_kbps": 99_999, "state": "paused",
+    });
+    // (Commands go before desired state, so the report shows when it's applied.)
+    harness.desire(refused.clone());
+    let reported = harness
+        .report_where(|r| {
+            r["streams"]["pattern"]["rejected"]
+                .as_array()
+                .is_some_and(|rejected| rejected.len() == 6)
+        })
+        .await;
+    let status = reported["streams"]["pattern"].clone();
+    assert_eq!(status["profile"], "small");
+    assert_eq!(
+        status["destination"],
+        "srt://other.example.com:4000?streamid=x/y"
+    );
+    assert_eq!(
+        settings_of(&status["rejected"]),
+        [
+            "bitrate",
+            "destination",
+            "profile",
+            "source",
+            "source_ceiling_percent",
+            "state"
+        ]
+    );
+    let reasons: Vec<&str> = status["rejected"]
+        .as_array()
+        .expect("rejected")
+        .iter()
+        .map(|r| r["reason"].as_str().expect("reason"))
+        .collect();
+    for (reason, expected) in reasons.iter().zip([
+        "outside the profile's limits",
+        "mode: only streamid, latency and passphrase",
+        "has no libx265 encoder",
+        "a test pattern needs size WIDTHxHEIGHT",
+        "0 to 400",
+        "live or stopped",
+    ]) {
+        assert!(
+            reason.contains(expected),
+            "{reason:?} should say {expected:?}"
+        );
+    }
+    // The same values again keep their first time; a new value gets its own.
+    harness.desire(refused);
+    harness.desire(json!({"profile": "passthrough"}));
+    let reported = harness
+        .report_where(|r| {
+            r["streams"]["pattern"]["rejected"][2]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("pattern: a test pattern is generated"))
+        })
+        .await;
+    let rejected = &reported["streams"]["pattern"]["rejected"];
+    for index in [0, 1, 3, 4, 5] {
+        assert_eq!(rejected[index], status["rejected"][index]);
+    }
+    assert!(
+        harness.started.try_recv().is_err(),
+        "nothing restarted for refused values"
+    );
+
+    // null goes back to helios.toml's; a new source restarts too.
+    harness.desire(json!({
+        "profile": null, "destination": null, "source": {"type": "test", "size": "640x360", "fps": 25},
+    }));
+    let third = harness.next_start().await;
+    assert!(second.stopped.load(Ordering::SeqCst));
+    let args = third.spec.args.join(" ");
+    assert!(args.contains("-b:v 4000k"), "{args}");
+    assert!(args.contains("testsrc2=size=640x360:rate=25"), "{args}");
+    assert!(args.contains("srt://ingest.example.com:4001?"), "{args}");
+    let status = harness.status_of("pattern").await;
+    assert_eq!(status["destination"], CONFIGURED);
+    assert_eq!(status["output"], "main");
+    assert_eq!(
+        status["overrides"],
+        json!({
+            "source": {"type": "test", "size": "640x360", "fps": 25}, "profile": null,
+            "destination": null, "source_ceiling_percent": null,
+        })
+    );
+    assert_eq!(
+        settings_of(&status["rejected"]),
+        ["bitrate", "source_ceiling_percent", "state"],
+        "accepted settings clear their refusals"
+    );
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_srtla_destination_runs_its_own_sender() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(|| {
+            Ok(vec![
+                address("eth0", [10, 0, 1, 2]),
+                address("wlan0", [10, 0, 2, 2]),
+            ])
+        }),
+    );
+    let first = harness.next_start().await;
+
+    harness.desire(json!({"destination": "srtla://rec.example.com:5000?latency=800"}));
+    let sender = harness.next_start().await;
+    assert!(first.stopped.load(Ordering::SeqCst));
+    let dir = runtime.path().join("srtla");
+    assert_eq!(sender.spec.name, "srtla:stream:pattern");
+    assert_eq!(
+        sender.spec.args,
+        [
+            "--control-socket".to_owned(),
+            dir.join("stream:pattern.sock").display().to_string(),
+            "--conn-timeout-ms".into(),
+            "5000".into(),
+            "6001".into(),
+            "rec.example.com".into(),
+            "5000".into(),
+            dir.join("stream:pattern.ips").display().to_string(),
+        ],
+        "the port after the outputs'"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("stream:pattern.ips")).expect("ips"),
+        "10.0.2.2\n",
+        "a direct output's stream bonds srtla_uplinks"
+    );
+    let reported = harness
+        .report_where(|r| r["outputs"]["stream:pattern"].is_object())
+        .await;
+    let status = &reported["streams"]["pattern"];
+    assert_eq!(status["output"], "stream:pattern");
+    assert_eq!(
+        status["destination"],
+        "srtla://rec.example.com:5000?latency=800"
+    );
+    assert!(
+        status["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("waiting for output stream:pattern")),
+        "{status}"
+    );
+
+    // The configured destination, written out in full, is no override: the sender goes.
+    harness.desire(json!({"destination": CONFIGURED}));
+    let job = harness.next_start().await;
+    assert_eq!(job.spec.name, "pattern");
+    assert!(
+        job.spec
+            .args
+            .join(" ")
+            .contains("srt://ingest.example.com:4001?")
+    );
+    let reported = harness
+        .report_where(|r| r["outputs"]["stream:pattern"].is_null())
+        .await;
+    assert!(sender.stopped.load(Ordering::SeqCst));
+    assert_eq!(
+        reported["streams"]["pattern"]["overrides"]["destination"],
+        Value::Null
+    );
+    assert_eq!(reported["streams"]["pattern"]["destination"], CONFIGURED);
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_saved_profile_applies_before_the_first_start() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, None, false);
+    // Queued before the module's first pass, as the daemon's saved state is.
+    harness.desire(json!({"state": "live", "profile": "small", "source_ceiling_percent": 80}));
+    let job = harness.next_start().await;
+    assert!(job.spec.args.join(" ").contains("-b:v 2000k"));
+    let status = harness.status_of("pattern").await;
+    assert_eq!(status["source_ceiling_percent"], 80);
+    assert_eq!(status["overrides"]["source_ceiling_percent"], 80);
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn refuses_a_taken_rtmp_key_an_unbondable_destination_and_wrong_types() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE
+        .replace("RUNTIME", &runtime.path().display().to_string())
+        .replace("srtla_uplinks = [\"wlan0\"]", "srtla_uplinks = []")
+        + &format!(
+            r#"
+[rtmp_ingest]
+enabled = true
+hook_port = {}
+stat_url = "http://127.0.0.1:{}/stat"
+
+[streams.pocket]
+source = {{ type = "rtmp" }}
+profile = "big"
+output = "main"
+streamid = "publish/live/pocket"
+desired = "stopped"
+"#,
+            free_port(),
+            free_port()
+        );
+    let mut harness = harness(&config, None, false);
+    harness.next_start().await;
+
+    // An override the new profile can't take goes back to the profile's bitrate.
+    harness.desire(json!({"bitrate_kbps": 7000}));
+    let job = harness.next_start().await;
+    assert!(job.spec.args.join(" ").contains("-b:v 7000k"));
+    harness.desire(json!({"profile": "small"}));
+    let job = harness.next_start().await;
+    assert!(job.spec.args.join(" ").contains("-b:v 2000k"));
+
+    harness.desire(json!({
+        "source": {"type": "rtmp"}, "destination": "srtla://rec.example.com:5000",
+        "profile": 7, "source_ceiling_percent": "high",
+    }));
+    let reported = harness
+        .report_where(|r| {
+            r["streams"]["pattern"]["rejected"]
+                .as_array()
+                .is_some_and(|rejected| rejected.len() == 4)
+        })
+        .await;
+    let status = &reported["streams"]["pattern"];
+    assert_eq!(status["bitrate_override_kbps"], Value::Null);
+    let rejected = &status["rejected"];
+    for (index, expected) in [
+        "srtla_uplinks is empty",
+        "profile must be a profile name",
+        "pattern: stream pocket already takes RTMP key \"ingest\"",
+        "0 to 400",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            rejected[index]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains(expected)),
+            "{rejected}"
+        );
+    }
+    harness.desire(json!({"source": {"type": "usb"}, "destination": 5}));
+    let reported = harness
+        .report_where(|r| {
+            r["streams"]["pattern"]["rejected"][0]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("must be an srt:// or srtla:// URL"))
+        })
+        .await;
+    assert!(
+        reported["streams"]["pattern"]["rejected"][2]["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("source: ")),
+        "{reported}"
+    );
+    harness.stop().await;
+}

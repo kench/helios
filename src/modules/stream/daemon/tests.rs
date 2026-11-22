@@ -99,6 +99,24 @@ fn reads_users_desired_state_and_activity() {
         // Only an override is saved: b follows its profile, even if the profile changes.
         json!({"streams": {"a": {"state": "live", "bitrate_kbps": 3000}, "b": {"state": "stopped", "bitrate_kbps": null}}})
     );
+    // Settings from the shadow are saved too, but only those set: the others follow helios.toml.
+    let overridden: Map<String, Value> = json!({"streams": {"a": {
+        "desired": "live", "bitrate_override_kbps": null,
+        "overrides": {
+            "source": {"type": "rtmp", "camera": 2}, "profile": null,
+            "destination": "srt://h.example:1", "source_ceiling_percent": 80,
+        },
+    }}})
+    .as_object()
+    .cloned()
+    .expect("object");
+    assert_eq!(
+        desired_state(&overridden),
+        json!({"streams": {"a": {
+            "state": "live", "bitrate_kbps": null, "source": {"type": "rtmp", "camera": 2},
+            "destination": "srt://h.example:1", "source_ceiling_percent": 80,
+        }}})
+    );
     assert!(busy(&shadow));
     assert!(!busy(&Map::new()));
     assert_eq!(desired_state(&Map::new()), Value::Null);

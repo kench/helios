@@ -108,20 +108,7 @@ impl Senders {
             .filter_map(|(name, output)| {
                 Some((
                     name.clone(),
-                    Sender {
-                        output: output.clone(),
-                        port: settings.sender_port(name)?,
-                        ips: Vec::new(),
-                        job: None,
-                        monitor: None,
-                        idle_since: None,
-                        restart_at: None,
-                        backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
-                        stats: None,
-                        active_at: None,
-                        last_error: None,
-                        lines: VecDeque::new(),
-                    },
+                    Sender::new(output.clone(), settings.sender_port(name)?),
                 ))
             })
             .collect();
@@ -131,6 +118,34 @@ impl Senders {
             program: settings.srtla_send.clone(),
             idle: settings.sender_idle(),
             stats_tx,
+        }
+    }
+
+    /// Sets, changes or removes the sender for a stream's SRTLA destination (`name` is its
+    /// output's, `stream:<id>`): a changed output stops the running sender, and the next
+    /// reconcile starts it again with the new one.
+    pub(crate) fn set_dynamic(&mut self, name: &str, sender: Option<(Output, u16)>) {
+        match sender {
+            None => {
+                if let Some(mut old) = self.senders.remove(name) {
+                    old.stop();
+                    let _ = std::fs::remove_file(self.dir.join(format!("{name}.ips")));
+                }
+            }
+            Some((output, port)) => {
+                if self
+                    .senders
+                    .get(name)
+                    .is_some_and(|old| old.output == output && old.port == port)
+                {
+                    return;
+                }
+                if let Some(mut old) = self.senders.remove(name) {
+                    old.stop();
+                }
+                self.senders
+                    .insert(name.to_owned(), Sender::new(output, port));
+            }
         }
     }
 
@@ -343,6 +358,23 @@ impl Senders {
 }
 
 impl Sender {
+    fn new(output: Output, port: u16) -> Self {
+        Self {
+            output,
+            port,
+            ips: Vec::new(),
+            job: None,
+            monitor: None,
+            idle_since: None,
+            restart_at: None,
+            backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
+            stats: None,
+            active_at: None,
+            last_error: None,
+            lines: VecDeque::new(),
+        }
+    }
+
     fn state(&self, now: Instant) -> OutputState {
         if self.job.is_none() {
             return if self.restart_at.is_some() {

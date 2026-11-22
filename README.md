@@ -101,6 +101,17 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   `stream.stats`; the `stream` shadow has each stream's and each bonded output's state, with
   per-link statistics. ffmpeg's arguments come only from the local profiles.
 
+  The shadow's desired state (written by the Control API, HLD section 7.3.7) starts and stops
+  streams and sets a bitrate override, and can also change a stream's `source`, `profile` (one
+  the device defines), `destination` (an `srt://` or `srtla://` URL) and
+  `source_ceiling_percent`; `null` goes back to `helios.toml`'s. Each is checked as
+  `helios.toml` is, and a refused value is reported in the stream's `rejected` with the reason.
+  A destination keeps the configured output's latency and the stream's `streamid` unless the URL
+  gives them, and its passphrase is only the URL's; it runs as output `stream:<id>`, and an SRTLA
+  one gets its own sender bonding the configured output's uplinks if that's an `srtla` output,
+  else `srtla_uplinks`. Each stream reports the `destination` in use and its `overrides`, which
+  the daemon saves with the rest of the desired state.
+
   Streams run in the stream daemon, `helios stream-daemon` (`helios-stream.service`, user
   `helios-stream`), so they keep going while Helios restarts or is upgraded; Helios's `stream`
   module is its client over `/run/helios-stream/control.sock` (JSON-RPC lines). The daemon saves

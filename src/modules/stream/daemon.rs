@@ -323,8 +323,10 @@ fn peer_allowed(stream: &UnixStream, allowed: &[u32]) -> Result<(), String> {
     }
 }
 
-/// The desired state in a `stream` shadow report: each stream's `desired` and bitrate override
-/// (`null`: the profile's, so a config change to the profile applies after a restart).
+/// The desired state in a `stream` shadow report: each stream's `desired`, bitrate override
+/// (`null`: the profile's, so a config change to the profile applies after a restart) and the
+/// source, profile, destination and ceiling percentage set through the shadow (only those set:
+/// the others follow `helios.toml`).
 pub(crate) fn desired_state(shadow: &Map<String, Value>) -> Value {
     let streams: Map<String, Value> = shadow
         .get("streams")
@@ -332,10 +334,18 @@ pub(crate) fn desired_state(shadow: &Map<String, Value>) -> Value {
         .into_iter()
         .flatten()
         .map(|(id, status)| {
-            (
-                id.clone(),
-                json!({"state": status["desired"], "bitrate_kbps": status["bitrate_override_kbps"]}),
-            )
+            let mut desired =
+                json!({"state": status["desired"], "bitrate_kbps": status["bitrate_override_kbps"]});
+            for (key, value) in status
+                .get("overrides")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter(|(_, value)| !value.is_null())
+            {
+                desired[key] = value.clone();
+            }
+            (id.clone(), desired)
         })
         .collect();
     if streams.is_empty() {

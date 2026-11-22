@@ -38,8 +38,12 @@ pub struct StreamSettings {
     /// Where senders' IP files and control sockets go (`<runtime_dir>/srtla/`): the daemon's
     /// `RuntimeDirectory`, and where the upgrade's `restart-pending` file appears.
     pub(crate) runtime_dir: PathBuf,
-    /// The first local UDP port for senders: outputs get consecutive ports in name order.
+    /// The first local UDP port for senders: outputs get consecutive ports in name order, then
+    /// each stream one for an SRTLA destination set through the shadow, in name order.
     pub(crate) srtla_port_base: u16,
+    /// The uplinks an `srtla://` destination set through the shadow bonds when the stream's
+    /// configured output is `direct` (an `srtla` output's own uplinks come first).
+    pub(crate) srtla_uplinks: Vec<String>,
     /// How long a sender stays up after its last stream stops, so a source that comes back
     /// keeps a warm bond.
     sender_idle_s: u64,
@@ -90,6 +94,11 @@ impl Default for StreamSettings {
             client_user: "helios".into(),
             runtime_dir: "/run/helios-stream".into(),
             srtla_port_base: 6000,
+            srtla_uplinks: vec![
+                "usb:ethernet".into(),
+                "usb:cellular".into(),
+                "usb:wifi".into(),
+            ],
             sender_idle_s: 60,
             stats_interval_s: 30,
             outputs: BTreeMap::new(),
@@ -293,12 +302,21 @@ impl StreamSettings {
         if !(1..=3600).contains(&self.sender_idle_s) {
             return Err("modules.stream.sender_idle_s must be 1 to 3600".into());
         }
-        let last_port = usize::from(self.srtla_port_base) + self.outputs.len();
+        let last_port = usize::from(self.srtla_port_base) + self.outputs.len() + self.streams.len();
         if self.srtla_port_base < 1024 || last_port > 65535 {
             return Err(
-                "modules.stream.srtla_port_base must leave a port per output in 1024 to 65535"
+                "modules.stream.srtla_port_base must leave a port per output and per stream in \
+                 1024 to 65535"
                     .into(),
             );
+        }
+        for uplink in &self.srtla_uplinks {
+            if !valid_uplink(uplink) {
+                return Err(format!(
+                    "modules.stream.srtla_uplinks: {uplink:?} must be usb:ethernet, \
+                     usb:cellular, usb:wifi or an interface name"
+                ));
+            }
         }
         for (name, output) in &self.outputs {
             let at = format!("modules.stream.outputs.{name}");
@@ -427,73 +445,20 @@ impl StreamSettings {
         for (name, stream) in &self.streams {
             let at = format!("modules.stream.streams.{name}");
             check_name(name, &at)?;
-            let Some(profile) = self.profiles.get(&stream.profile) else {
-                return Err(format!("{at}.profile: no profile {:?}", stream.profile));
-            };
             if !self.outputs.contains_key(&stream.output) {
                 return Err(format!("{at}.output: no output {:?}", stream.output));
             }
-            match &stream.source {
-                Source::Rtmp { camera } => {
-                    if !self.rtmp_ingest.enabled {
-                        return Err(format!(
-                            "{at}: RTMP sources need [modules.stream.rtmp_ingest] enabled"
-                        ));
-                    }
-                    if camera.is_some_and(|camera| camera == 0) {
-                        return Err(format!("{at}.source.camera counts from 1 (ingest-1)"));
-                    }
-                    let key = stream.source.rtmp_key();
-                    if let Some((other, _)) = self
-                        .streams
-                        .iter()
-                        .find(|(other, s)| *other < name && s.source.rtmp_key() == key)
-                    {
-                        return Err(format!(
-                            "{at}: stream {other} already takes RTMP key {:?}",
-                            key.unwrap_or_default()
-                        ));
-                    }
-                }
-                Source::Test { size, fps } => {
-                    if parse_size(size).is_none() || !(1..=120).contains(fps) {
-                        return Err(format!(
-                            "{at}.source: a test pattern needs size WIDTHxHEIGHT and fps 1 to 120"
-                        ));
-                    }
-                    if profile.video == "copy" || profile.audio == "copy" {
-                        return Err(format!(
-                            "{at}: a test pattern is generated, so its profile needs encoders, \
-                             not copy"
-                        ));
-                    }
-                }
-                Source::Camera { video, audio } => {
-                    for selector in std::iter::once(video).chain(audio) {
-                        if !valid_selector(selector) {
-                            return Err(format!(
-                                "{at}.source: {selector:?} must be usb:<port> or \
-                                 <vid>:<pid>:<serial>"
-                            ));
-                        }
-                    }
-                    if audio.is_some() && profile.audio == "copy" {
-                        return Err(format!(
-                            "{at}: camera audio is raw PCM, so its profile needs audio = \
-                             \"aac\" or \"none\""
-                        ));
-                    }
-                }
-            }
-            if stream.streamid.is_empty()
-                || stream.streamid.len() > 512
-                || !stream
-                    .streamid
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"/_.-:=,".contains(&b))
+            self.check_stream(&at, stream)?;
+            let key = stream.source.rtmp_key();
+            if key.is_some()
+                && let Some((other, _)) = self
+                    .streams
+                    .iter()
+                    .find(|(other, s)| *other < name && s.source.rtmp_key() == key)
             {
                 return Err(format!(
-                    "{at}.streamid must be letters, digits and / _ . - : = ,"
+                    "{at}: stream {other} already takes RTMP key {:?}",
+                    key.unwrap_or_default()
                 ));
             }
             if !["live", "stopped"].contains(&stream.desired.as_str()) {
@@ -503,6 +468,70 @@ impl StreamSettings {
         Ok(self.enabled.then_some(self))
     }
 
+    /// Checks one stream's source, profile and stream ID: at start-up, and for a source or
+    /// profile set through the shadow (`at` begins the message).
+    ///
+    /// # Errors
+    ///
+    /// What's wrong, after `at`.
+    pub(crate) fn check_stream(&self, at: &str, stream: &Stream) -> Result<(), String> {
+        let Some(profile) = self.profiles.get(&stream.profile) else {
+            return Err(format!("{at}.profile: no profile {:?}", stream.profile));
+        };
+        match &stream.source {
+            Source::Rtmp { camera } => {
+                if !self.rtmp_ingest.enabled {
+                    return Err(format!(
+                        "{at}: RTMP sources need [modules.stream.rtmp_ingest] enabled"
+                    ));
+                }
+                if camera.is_some_and(|camera| camera == 0) {
+                    return Err(format!("{at}.source.camera counts from 1 (ingest-1)"));
+                }
+            }
+            Source::Test { size, fps } => {
+                if parse_size(size).is_none() || !(1..=120).contains(fps) {
+                    return Err(format!(
+                        "{at}.source: a test pattern needs size WIDTHxHEIGHT and fps 1 to 120"
+                    ));
+                }
+                if profile.video == "copy" || profile.audio == "copy" {
+                    return Err(format!(
+                        "{at}: a test pattern is generated, so its profile needs encoders, not \
+                         copy"
+                    ));
+                }
+            }
+            Source::Camera { video, audio } => {
+                for selector in std::iter::once(video).chain(audio) {
+                    if !valid_selector(selector) {
+                        return Err(format!(
+                            "{at}.source: {selector:?} must be usb:<port> or <vid>:<pid>:<serial>"
+                        ));
+                    }
+                }
+                if audio.is_some() && profile.audio == "copy" {
+                    return Err(format!(
+                        "{at}: camera audio is raw PCM, so its profile needs audio = \"aac\" or \
+                         \"none\""
+                    ));
+                }
+            }
+        }
+        if stream.streamid.is_empty()
+            || stream.streamid.len() > 512
+            || !stream
+                .streamid
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/_.-:=,".contains(&b))
+        {
+            return Err(format!(
+                "{at}.streamid must be letters, digits and / _ . - : = ,"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn sender_idle(&self) -> Duration {
         Duration::from_secs(self.sender_idle_s)
     }
@@ -510,6 +539,13 @@ impl StreamSettings {
     /// Each `srtla` output's local port: consecutive from `srtla_port_base`, in name order.
     pub(crate) fn sender_port(&self, output: &str) -> Option<u16> {
         let index = self.outputs.keys().position(|name| name == output)?;
+        self.srtla_port_base.checked_add(u16::try_from(index).ok()?)
+    }
+
+    /// The local port of stream `id`'s SRTLA destination set through the shadow: after the
+    /// outputs', in stream name order.
+    pub(crate) fn stream_sender_port(&self, id: &str) -> Option<u16> {
+        let index = self.outputs.len() + self.streams.keys().position(|name| name == id)?;
         self.srtla_port_base.checked_add(u16::try_from(index).ok()?)
     }
 
