@@ -12,6 +12,7 @@
 //! needed.
 
 pub(crate) mod netlink;
+pub(crate) mod nl80211;
 pub(crate) mod snapshot;
 pub(crate) mod wifi;
 
@@ -32,6 +33,9 @@ use crate::identity::secrets::{Sealed, SecretError};
 use crate::mqtt::envelope::timestamp;
 use crate::router::{Outcome, PendingCommand, codes};
 use netlink::{Kernel, Rtnetlink, Watch};
+#[cfg(test)]
+use nl80211::NoWireless;
+use nl80211::{Nl80211, Wireless};
 use wifi::{Network, Passphrase, Refused, Store, StoreError};
 
 const MODULE: &str = "net";
@@ -41,6 +45,8 @@ const QUIET: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_secs(5);
 /// How often everything is read again, changes or not.
 const RESYNC: Duration = Duration::from_secs(60);
+/// The step the Wi-Fi signal is reported in, dB.
+const SIGNAL_STEP: i64 = 5;
 
 /// `[modules.net]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -96,17 +102,20 @@ impl NetSettings {
 /// Netlink errors.
 pub(crate) fn current(
     kernel: &dyn Kernel,
+    wireless: &dyn Wireless,
     sysfs: &std::path::Path,
     settings: &NetSettings,
 ) -> std::io::Result<snapshot::Snapshot> {
     let tables = netlink::read(kernel)?;
-    Ok(snapshot::build(&tables, sysfs, settings))
+    Ok(snapshot::build_with(&tables, sysfs, settings, wireless))
 }
 
 /// The supervised net module.
 pub struct NetModule {
     settings: NetSettings,
     kernel: Arc<dyn Kernel>,
+    /// What the Wi-Fi interfaces are joined to (section 10.5).
+    wireless: Arc<dyn Wireless>,
     /// The Wi-Fi networks Helios wants (section 10).
     wifi: Store,
     /// What `helios wifi-apply` last did.
@@ -125,6 +134,7 @@ impl NetModule {
         Self {
             settings,
             kernel: Arc::new(Rtnetlink),
+            wireless: Arc::new(Nl80211),
             wifi: Store::new(wifi::STORE),
             wifi_status: wifi::STATUS.into(),
             identity: Some(identity),
@@ -140,10 +150,17 @@ impl NetModule {
         Self {
             settings,
             kernel,
+            wireless: Arc::new(NoWireless),
             wifi: Store::new(wifi_dir.join("networks.json")),
             wifi_status: wifi_dir.join("status.json"),
             identity: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_wireless(mut self, wireless: Arc<dyn Wireless>) -> Self {
+        self.wireless = wireless;
+        self
     }
 
     #[cfg(test)]
@@ -221,11 +238,12 @@ impl NetModule {
         reporter: &mut Reporter,
     ) -> Result<(), ModuleError> {
         let kernel = Arc::clone(&self.kernel);
+        let wireless = Arc::clone(&self.wireless);
         let sysfs: PathBuf = ctx.sysfs.clone();
         let settings = self.settings.clone();
         let (store, status) = (self.wifi.clone(), self.wifi_status.clone());
         let (snapshot, wifi) = tokio::task::spawn_blocking(move || {
-            current(kernel.as_ref(), &sysfs, &settings)
+            current(kernel.as_ref(), wireless.as_ref(), &sysfs, &settings)
                 .map(|snapshot| (snapshot, wifi::report(&store, &status)))
         })
         .await
@@ -443,6 +461,7 @@ impl Reporter {
             since.insert(name.clone(), (state, at));
         }
         self.since = since;
+        self.steady_signals(&mut interfaces);
         let mut reported = Map::new();
         reported.insert("interfaces".into(), Value::Object(interfaces));
         reported.insert("truncated".into(), json!(snapshot.truncated));
@@ -457,6 +476,30 @@ impl Reporter {
 }
 
 impl Reporter {
+    /// Signal in 5 dB steps that only move when the reading has moved a whole step from the one
+    /// last reported for the same access point: it changes all the time, and every change would
+    /// rewrite the shadow.
+    fn steady_signals(&self, interfaces: &mut Map<String, Value>) {
+        for (name, interface) in interfaces.iter_mut() {
+            let Some(raw) = interface["wifi"]["signal_dbm"].as_i64() else {
+                continue;
+            };
+            let previous = self
+                .last
+                .as_ref()
+                .and_then(|last| last.get("interfaces"))
+                .and_then(|interfaces| interfaces.get(name))
+                .map(|before| &before["wifi"])
+                .filter(|before| before["bssid"] == interface["wifi"]["bssid"])
+                .and_then(|before| before["signal_dbm"].as_i64());
+            let steady = match previous {
+                Some(previous) if (raw - previous).abs() < SIGNAL_STEP => previous,
+                _ => (raw + SIGNAL_STEP / 2).div_euclid(SIGNAL_STEP) * SIGNAL_STEP,
+            };
+            interface["wifi"]["signal_dbm"] = json!(steady);
+        }
+    }
+
     /// Whether the last report had a Wi-Fi interface.
     fn has_wifi(&self) -> bool {
         self.last

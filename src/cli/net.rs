@@ -7,6 +7,7 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::modules::net::netlink::{Kernel, Rtnetlink};
+use crate::modules::net::nl80211::{Nl80211, Wireless};
 use crate::modules::net::{NetSettings, current};
 
 #[derive(Debug, clap::Subcommand)]
@@ -19,15 +20,20 @@ pub(super) enum Command {
 pub(super) fn run(command: Command, output: &mut dyn Write) -> Result<(), super::Failure> {
     match command {
         Command::List => {
-            list(&Rtnetlink, Path::new("/sys"), output)?;
+            list(&Rtnetlink, &Nl80211, Path::new("/sys"), output)?;
             Ok(())
         }
     }
 }
 
 /// Writes the snapshot of `kernel`'s interfaces, in JSON.
-fn list(kernel: &dyn Kernel, sysfs: &Path, output: &mut dyn Write) -> io::Result<()> {
-    let snapshot = current(kernel, sysfs, &NetSettings::default())?;
+fn list(
+    kernel: &dyn Kernel,
+    wireless: &dyn Wireless,
+    sysfs: &Path,
+    output: &mut dyn Write,
+) -> io::Result<()> {
+    let snapshot = current(kernel, wireless, sysfs, &NetSettings::default())?;
     let document = json!({
         "interfaces": snapshot.interfaces,
         "truncated": snapshot.truncated,
@@ -43,7 +49,7 @@ mod tests {
     #[test]
     fn lists_this_machines_interfaces_as_json() {
         let mut output = Vec::new();
-        list(&Rtnetlink, Path::new("/sys"), &mut output).unwrap();
+        list(&Rtnetlink, &Nl80211, Path::new("/sys"), &mut output).unwrap();
         let document: serde_json::Value = serde_json::from_slice(&output).unwrap();
         let interfaces = document["interfaces"].as_object().unwrap();
         assert!(!interfaces.contains_key("lo"), "loopback is left out");
