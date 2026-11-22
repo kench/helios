@@ -27,6 +27,7 @@ recommends = "unattended-upgrades"
 assets = [
     ["target/release/helios", "usr/bin/", "755"],
     ["dist/systemd/helios.service", "lib/systemd/system/", "644"],
+    ["dist/systemd/helios-stream.service", "lib/systemd/system/", "644"],
     ["dist/helios.toml", "usr/share/doc/helios/examples/", "644"],
     ["dist/debian/52helios-unattended-upgrades", "etc/apt/apt.conf.d/", "644"],
     ["README.md", "usr/share/doc/helios/", "644"],

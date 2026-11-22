@@ -20,8 +20,15 @@ pub struct StreamSettings {
     pub(crate) ffmpeg: PathBuf,
     /// The `srtla_send` to run for `srtla` outputs.
     pub(crate) srtla_send: PathBuf,
-    /// Where senders' IP files and control sockets go (`<runtime_dir>/srtla/`), normally the
-    /// unit's `RuntimeDirectory`.
+    /// The stream daemon's control socket (LLD 4, section 15), which Helios connects to.
+    pub(crate) control_socket: PathBuf,
+    /// Where the daemon keeps the desired state across its restarts.
+    pub(crate) state_dir: PathBuf,
+    /// The user whose processes may use the control socket (besides root and the daemon's
+    /// own user): Helios's.
+    pub(crate) client_user: String,
+    /// Where senders' IP files and control sockets go (`<runtime_dir>/srtla/`): the daemon's
+    /// `RuntimeDirectory`, and where the upgrade's `restart-pending` file appears.
     pub(crate) runtime_dir: PathBuf,
     /// The first local UDP port for senders: outputs get consecutive ports in name order.
     pub(crate) srtla_port_base: u16,
@@ -41,7 +48,10 @@ impl Default for StreamSettings {
             enabled: true,
             ffmpeg: "/usr/lib/helios-ffmpeg/bin/ffmpeg".into(),
             srtla_send: "/usr/bin/srtla_send".into(),
-            runtime_dir: "/run/helios".into(),
+            control_socket: "/run/helios-stream/control.sock".into(),
+            state_dir: "/var/lib/helios-stream".into(),
+            client_user: "helios".into(),
+            runtime_dir: "/run/helios-stream".into(),
             srtla_port_base: 6000,
             sender_idle_s: 60,
             stats_interval_s: 30,

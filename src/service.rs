@@ -306,17 +306,12 @@ impl Service {
             )));
             handle
         });
+        // Streams run in the stream daemon (helios-stream.service); here the module is its
+        // client, so streams outlive Helios's restarts (LLD 4, section 15).
         #[cfg(feature = "module-stream")]
         if let Some(settings) = config.stream {
-            // Cameras come from the usb module, so it must run too.
-            let Some(usb) = usb.clone() else {
-                return Err(StartFailure {
-                    message: "[modules.stream] needs [modules.usb] enabled, for its cameras".into(),
-                    config: true,
-                });
-            };
-            enabled.push(Arc::new(crate::modules::stream::StreamModule::new(
-                settings, usb,
+            enabled.push(Arc::new(crate::modules::stream::StreamClient::new(
+                settings.control_socket.clone(),
             )));
         }
         let (module_states, modules) = supervisor::start(

@@ -1,0 +1,39 @@
+# The Helios stream daemon (LLD 4, section 15): video streams through ffmpeg and srtla_send,
+# in their own service so they keep running while helios.service restarts. Helios connects to it
+# over /run/helios-stream/control.sock. Enable it where [modules.stream] is configured.
+
+[Unit]
+Description=Helios stream daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=helios-stream
+# Group helios: to read /etc/helios/helios.toml and to share the control socket with Helios.
+# video: the cameras and the RK3588's encoder devices.
+Group=helios
+SupplementaryGroups=video
+ExecStart=/usr/bin/helios stream-daemon
+# Exit 0 after an upgrade's idle restart, or 78 for a configuration problem; anything else is
+# restarted, and the saved desired state brings streams back.
+Restart=always
+RestartSec=2
+RestartPreventExitStatus=78
+RuntimeDirectory=helios-stream
+RuntimeDirectoryMode=0750
+# Kept across stops: an upgrade's restart-pending flag is written here.
+RuntimeDirectoryPreserve=yes
+StateDirectory=helios-stream
+StateDirectoryMode=0750
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

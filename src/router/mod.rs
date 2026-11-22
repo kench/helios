@@ -143,6 +143,26 @@ impl PendingCommand {
         let _ = self.reply.send(outcome);
     }
 
+    /// A command that didn't come through the router, such as one the stream daemon received
+    /// over its control socket, with the channel its answer arrives on.
+    #[cfg(feature = "module-stream")]
+    pub(crate) fn local(
+        id: String,
+        module: &str,
+        name: &str,
+        args: Value,
+    ) -> (Self, oneshot::Receiver<Outcome>) {
+        let (reply, answer) = oneshot::channel();
+        let command = Command {
+            id,
+            module: module.to_owned(),
+            name: name.to_owned(),
+            args,
+            deadline: None,
+        };
+        (Self { command, reply }, answer)
+    }
+
     /// A command for module tests, with the channel its answer arrives on.
     #[cfg(all(test, any(feature = "module-display", feature = "module-usb")))]
     pub(crate) fn for_test(

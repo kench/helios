@@ -115,6 +115,24 @@ pub(crate) struct PendingEvent {
     time: SystemTime,
 }
 
+#[cfg(feature = "module-stream")]
+impl PendingEvent {
+    /// The event's type, such as `stream.live`.
+    pub(crate) fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The event's payload.
+    pub(crate) fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    /// When it happened.
+    pub(crate) fn time(&self) -> SystemTime {
+        self.time
+    }
+}
+
 /// What [`MqttHandle`] sends the manager.
 #[derive(Debug)]
 pub(crate) enum Request {
@@ -159,6 +177,20 @@ impl MqttHandle {
 }
 
 impl MqttHandle {
+    #[cfg(any(test, feature = "module-stream"))]
+    /// A handle that isn't connected to a manager: its requests arrive on the returned
+    /// channel, and the caller sets its status. For components run outside the agent, such as
+    /// the stream daemon's engine, and for tests.
+    pub(crate) fn detached() -> (
+        Self,
+        mpsc::UnboundedReceiver<Request>,
+        watch::Sender<MqttStatus>,
+    ) {
+        let (events, requests) = mpsc::unbounded_channel();
+        let (status_tx, status) = watch::channel(MqttStatus::default());
+        (Self { events, status }, requests, status_tx)
+    }
+
     /// For tests of components built on MQTT: a handle whose requests and status the test
     /// controls.
     #[cfg(test)]
@@ -167,9 +199,7 @@ impl MqttHandle {
         mpsc::UnboundedReceiver<Request>,
         watch::Sender<MqttStatus>,
     ) {
-        let (events, requests) = mpsc::unbounded_channel();
-        let (status_tx, status) = watch::channel(MqttStatus::default());
-        (Self { events, status }, requests, status_tx)
+        Self::detached()
     }
 }
 

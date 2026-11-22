@@ -398,12 +398,23 @@ pub(crate) type TestReports = mpsc::UnboundedReceiver<(String, Map<String, Value
 #[cfg(test)]
 pub(crate) type TestDesired = mpsc::UnboundedReceiver<(String, mpsc::UnboundedSender<Value>)>;
 
-// Module and supervisor tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "module-stream"))]
+/// Reports from a detached handle: (shadow, reported).
+pub(crate) type DetachedReports = mpsc::UnboundedReceiver<(String, Map<String, Value>)>;
+#[cfg(any(test, feature = "module-stream"))]
+/// Desired-state subscriptions from a detached handle: (shadow, where deltas go).
+pub(crate) type DetachedDesired = mpsc::UnboundedReceiver<(String, mpsc::UnboundedSender<Value>)>;
+
 impl ShadowHandle {
-    /// A handle for module tests: reports arrive on the returned channel as (shadow, reported),
-    /// and each `desired` call gets the matching sender from the second channel.
-    pub(crate) fn for_test() -> (Self, TestReports, TestDesired) {
+    #[cfg(any(test, feature = "module-stream"))]
+    /// A handle that isn't connected to a shadow manager: reports arrive on the first channel
+    /// as (shadow, reported), and each `desired` call gets its sender from the second. For
+    /// components run outside the agent, such as the stream daemon's engine, and for tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
+    pub(crate) fn detached() -> (Self, DetachedReports, DetachedDesired) {
         let (requests, mut incoming) = mpsc::unbounded_channel();
         let (reports_tx, reports) = mpsc::unbounded_channel();
         let (desired_tx, desired) = mpsc::unbounded_channel();
@@ -420,6 +431,12 @@ impl ShadowHandle {
             }
         });
         (Self { requests }, reports, desired)
+    }
+
+    /// A handle for module tests: [`Self::detached`].
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, TestReports, TestDesired) {
+        Self::detached()
     }
 }
 

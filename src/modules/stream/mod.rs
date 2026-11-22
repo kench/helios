@@ -12,6 +12,9 @@
 //! Commands: `stream.start`, `stream.stop`, `stream.status`.
 
 mod addrs;
+mod client;
+mod control;
+pub mod daemon;
 #[cfg(test)]
 mod e2e;
 mod ffmpeg;
@@ -35,6 +38,7 @@ use crate::router::{Outcome, codes};
 
 use super::{Module, ModuleContext, ModuleError, ModuleFuture};
 use addrs::Address;
+pub use client::StreamClient;
 use ffmpeg::{CameraNodes, Progress, ProgressParser};
 use process::{Job, JobEvent, JobSpec, Spawner, Tagged};
 pub use settings::StreamSettings;
@@ -301,6 +305,11 @@ impl<'a> Streams<'a> {
         stats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut commands_open = true;
         let mut desired_open = true;
+        // Desired state queued before the start (the daemon's saved state) applies before the
+        // first pass, so a stream saved as stopped doesn't start for a moment.
+        while let Ok(state) = ctx.desired.try_recv() {
+            self.desired(&state);
+        }
         loop {
             let devices = snapshot.borrow_and_update().clone();
             let now = Instant::now();
