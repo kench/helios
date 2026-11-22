@@ -105,6 +105,9 @@ pub struct Config {
     /// The `[modules.stream]` settings, when it's enabled (LLD 4).
     #[cfg(feature = "module-stream")]
     pub stream: Option<crate::modules::stream::StreamSettings>,
+    /// The `[modules.net]` settings, when it's enabled (LLD 3).
+    #[cfg(feature = "module-net")]
+    pub net: Option<crate::modules::net::NetSettings>,
     /// Sections this version doesn't use: modules as `modules.<name>`, then top-level sections.
     pub ignored_sections: Vec<String>,
 }
@@ -150,6 +153,8 @@ struct ModulesSection {
     usb: Option<crate::modules::usb::UsbSettings>,
     #[cfg(feature = "module-stream")]
     stream: Option<crate::modules::stream::StreamSettings>,
+    #[cfg(feature = "module-net")]
+    net: Option<crate::modules::net::NetSettings>,
     #[cfg(feature = "module-display")]
     display: Option<DisplaySection>,
     #[serde(flatten)]
@@ -340,6 +345,13 @@ impl File {
                 .modules
                 .stream
                 .map(crate::modules::stream::StreamSettings::check)
+                .transpose()?
+                .flatten(),
+            #[cfg(feature = "module-net")]
+            net: self
+                .modules
+                .net
+                .map(crate::modules::net::NetSettings::check)
                 .transpose()?
                 .flatten(),
             ignored_sections: self

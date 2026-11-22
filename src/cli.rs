@@ -44,6 +44,8 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[cfg(feature = "module-net")]
+mod net;
 #[cfg(feature = "module-usb")]
 mod usb;
 
@@ -57,6 +59,10 @@ enum Command {
     #[cfg(feature = "module-usb")]
     #[command(subcommand)]
     Usb(usb::Command),
+    /// Inspect network interfaces, addresses and default routes.
+    #[cfg(feature = "module-net")]
+    #[command(subcommand)]
+    Net(net::Command),
     /// Set up and inspect the device's token.
     Provision(ProvisionArgs),
     /// Run the stream daemon (helios-stream.service): video streams that outlive Helios's
@@ -322,6 +328,8 @@ pub fn run(args: impl IntoIterator<Item = OsString>, console: &mut dyn Console) 
         Some(Command::Provision(args)) => provision(&args, console),
         #[cfg(feature = "module-usb")]
         Some(Command::Usb(command)) => usb::run(command, console.out()),
+        #[cfg(feature = "module-net")]
+        Some(Command::Net(command)) => net::run(command, console.out()),
         #[cfg(feature = "module-stream")]
         Some(Command::StreamDaemon) => return crate::modules::stream::daemon::main(&cli.config),
     };
