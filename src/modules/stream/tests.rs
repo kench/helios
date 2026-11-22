@@ -267,6 +267,7 @@ async fn the_system_spawner_runs_and_stops_a_process_group() {
         name: "test".into(),
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "echo out; echo err >&2; exec sleep 30".into()],
+        env: vec![("HELIOS_TEST".into(), "1".into())],
     };
     let mut job = process::System.spawn(&spec, 7, events).expect("spawned");
     let mut seen = Vec::new();
@@ -1572,5 +1573,154 @@ async fn rtmp_streams_follow_the_hook_and_the_statistics_page() {
     *page.lock().expect("page") = stat_page(&[]);
     harness.state_of("second", "waiting_for_input").await;
     assert!(job.stopped.load(Ordering::SeqCst));
+    harness.stop().await;
+}
+
+#[test]
+fn checks_encoder_backends_and_bitrate_modes() {
+    let gst = super::encoder::tests::GST;
+    settings(gst);
+    for (from, to, message) in [
+        (
+            "encoder = \"belacoder\"\nbitrate_mode",
+            "bitrate_mode",
+            "needs encoder = \"belacoder\"",
+        ),
+        (
+            "video = \"h264_rkmpp\"\nencoder = \"ceracoder\"",
+            "video = \"libx264\"\nencoder = \"ceracoder\"",
+            "takes video hevc_rkmpp, h264_rkmpp",
+        ),
+        (
+            "video = \"hevc_rkmpp\"\nencoder = \"belacoder\"",
+            "video = \"libx265\"\nencoder = \"belacoder\"",
+            "takes video",
+        ),
+        (
+            "format = \"mjpeg\"",
+            "format = \"h264\"",
+            "mjpeg or yuyv422",
+        ),
+        (
+            "encoder = \"belacoder\"\nbitrate_mode",
+            "encoder = \"gstreamer\"\nbitrate_mode",
+            "encoder",
+        ),
+    ] {
+        assert!(gst.contains(from), "{from}");
+        let text = gst.replacen(from, to, 1);
+        let error = toml::from_str::<StreamSettings>(&text)
+            .map_err(|e| e.to_string())
+            .and_then(|s| s.check().map(|_| ()))
+            .expect_err("refused");
+        assert!(error.contains(message), "{to}: {error}");
+    }
+}
+
+const BELACODER: &str = r#"
+belacoder = "/opt/belacoder"
+runtime_dir = "RUNTIME"
+
+[outputs.main]
+mode = "direct"
+host = "ingest.example.com"
+port = 4001
+
+[profiles.ada]
+video = "hevc_rkmpp"
+encoder = "belacoder"
+bitrate_mode = "adaptive"
+bitrate_kbps = 4000
+min_bitrate_kbps = 1000
+max_bitrate_kbps = 8000
+audio = "aac"
+
+[streams.pattern]
+source = { type = "test", size = "1280x720", fps = 30 }
+profile = "ada"
+output = "main"
+streamid = "publish/live/pattern"
+"#;
+
+#[tokio::test(start_paused = true)]
+async fn a_gstreamer_encoder_goes_live_on_connect_and_reloads_new_bitrates() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = BELACODER.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, None, false);
+    let bitrate_file = runtime.path().join("encoders/pattern.bitrate");
+
+    // It starts with its pipeline and range written, and goes live on its SRT connection.
+    let job = harness.next_start().await;
+    assert_eq!(job.spec.program, std::path::PathBuf::from("/opt/belacoder"));
+    assert!(runtime.path().join("encoders/pattern.pipeline").exists());
+    assert_eq!(
+        std::fs::read_to_string(&bitrate_file).expect("range"),
+        "1000000\n4000000\n"
+    );
+    harness.state_of("pattern", "starting").await;
+    job.send(JobEvent::Stderr(
+        "Gstreamer pipeline: videotestsrc ...".into(),
+    ));
+    job.send(JobEvent::Stderr(
+        "SRT connected to ingest.example.com:4001. Negotiated latency: 2000 ms".into(),
+    ));
+    harness.event("stream.live").await;
+    harness.state_of("pattern", "live").await;
+
+    // No progress output, and no stall: it watches its own pipeline.
+    tokio::time::advance(Duration::from_secs(120)).await;
+    let Outcome::Ok(status) = harness
+        .command("status", json!({"stream_id": "pattern"}))
+        .await
+    else {
+        panic!("status");
+    };
+    assert_eq!(status["state"], "live");
+    assert!(
+        status["log"].to_string().contains("SRT connected"),
+        "{status}"
+    );
+    assert!(!job.stopped.load(Ordering::SeqCst));
+
+    // A new ceiling is a rewritten range and a SIGHUP, not a restart.
+    let outcome = harness
+        .command(
+            "start",
+            json!({"stream_id": "pattern", "bitrate_kbps": 6000}),
+        )
+        .await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    assert_eq!(
+        std::fs::read_to_string(&bitrate_file).expect("range"),
+        "1000000\n6000000\n"
+    );
+    assert_eq!(job.reloads.load(Ordering::SeqCst), 1);
+    assert!(!job.stopped.load(Ordering::SeqCst));
+
+    // When it exits, the reason names it, with its last line.
+    job.send(JobEvent::Stderr(
+        "Pipeline stall detected. Will exit now".into(),
+    ));
+    job.send(JobEvent::Exited(Some(1)));
+    let status = harness.state_of("pattern", "reconnecting").await;
+    let error = status["last_error"].as_str().expect("error").to_owned();
+    assert!(
+        error.starts_with("belacoder exited (code 1): Pipeline stall"),
+        "{error}"
+    );
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gstreamer_encoder_that_never_connects_is_restarted() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = BELACODER.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, None, false);
+    let job = harness.next_start().await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let status = harness.state_of("pattern", "reconnecting").await;
+    assert!(job.stopped.load(Ordering::SeqCst));
+    let error = status["last_error"].as_str().expect("error").to_owned();
+    assert!(error.contains("didn't connect over SRT in time"), "{error}");
     harness.stop().await;
 }

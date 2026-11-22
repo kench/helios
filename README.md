@@ -89,7 +89,11 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   `helios-rtmp.service`, config `/etc/helios/rtmp/nginx.conf`, keys `ingest`, `ingest-1`...;
   the daemon answers nginx's publish hook and reads its statistics page, so it picks up cameras
   already publishing after a restart), and a generated test pattern. With a Rockchip encoder,
-  RTMP input is decoded by MPP and scaled by RGA. `stream.start`, `stream.stop` and
+  RTMP input is decoded by MPP and scaled by RGA. A profile's `encoder` is ffmpeg (the default:
+  a fixed bitrate) or a GStreamer encoder, belacoder or ceracoder, which sends over SRT itself
+  and, with `bitrate_mode = "adaptive"`, adapts the bitrate to the link between
+  `min_bitrate_kbps` and the stream's bitrate; a new bitrate reaches it by SIGHUP, without a
+  restart. `stream.start`, `stream.stop` and
   `stream.status`; events `stream.connected`, `stream.live`, `stream.disconnected` and
   `stream.stats`; the `stream` shadow has each stream's and each bonded output's state, with
   per-link statistics. ffmpeg's arguments come only from the local profiles.

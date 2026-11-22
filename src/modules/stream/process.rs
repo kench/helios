@@ -25,6 +25,8 @@ pub(crate) struct JobSpec {
     pub name: String,
     pub program: PathBuf,
     pub args: Vec<String>,
+    /// Environment variables to add.
+    pub env: Vec<(String, String)>,
 }
 
 /// Something a child did.
@@ -87,6 +89,7 @@ impl Spawner for System {
     ) -> io::Result<Box<dyn Job>> {
         let mut child = tokio::process::Command::new(&spec.program)
             .args(&spec.args)
+            .envs(spec.env.iter().map(|(name, value)| (name, value)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

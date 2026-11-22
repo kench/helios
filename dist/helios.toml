@@ -72,6 +72,9 @@ mp_sd_mount = "/init/efad/mp_sd" # scanner: where the platform mounts the PROXdo
 enabled = false
 ffmpeg = "/usr/lib/helios-ffmpeg/bin/ffmpeg"
 srtla_send = "/usr/bin/srtla_send"
+belacoder = "/usr/bin/belacoder"   # GStreamer encoders, for profiles with encoder = belacoder
+ceracoder = "/usr/bin/ceracoder"   # or ceracoder (adaptive bitrate)
+# gst_plugin_path = "/usr/lib/helios-gst"  # GST_PLUGIN_PATH for them (the Rockchip plugin)
 control_socket = "/run/helios-stream/control.sock"  # the daemon's; Helios connects here
 state_dir = "/var/lib/helios-stream"  # the daemon saves the desired state here
 client_user = "helios"             # who may use the control socket (besides root)
@@ -105,6 +108,11 @@ stat_url = "http://127.0.0.1:1937/stat"  # rtmp_stat, read at start and every 30
 # max_bitrate_kbps = 12000
 # gop_s = 2                        # keyframe interval in seconds
 # audio = "aac"                    # aac, none, or copy (RTMP sources)
+# encoder = "ffmpeg"               # ffmpeg (fixed bitrate; a new one restarts it), belacoder or
+#                                  # ceracoder (GStreamer: hevc_rkmpp, h264_rkmpp; belacoder
+#                                  # also libx264). Passphrases need helios-packages' builds.
+# bitrate_mode = "fixed"           # or adaptive (belacoder, ceracoder): min_bitrate_kbps up to
+#                                  # the stream's bitrate, as the link allows; SIGHUP, no restart
 # input = { format = "mjpeg", size = "1920x1080", fps = 30 }  # what to ask a camera for
 #
 # [modules.stream.streams.camera]
