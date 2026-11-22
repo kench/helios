@@ -98,11 +98,7 @@ impl UsbSettings {
     }
 }
 
-pub(crate) fn is_port(port: &str) -> bool {
-    let digits = |segment: &str| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit());
-    port.split_once('-')
-        .is_some_and(|(bus, chain)| digits(bus) && chain.split('.').all(digits))
-}
+pub(crate) use crate::sysfs::is_port;
 
 fn port_for_path(path: &str) -> Option<&str> {
     path.rsplit('/').find(|segment| is_port(segment))

@@ -47,7 +47,7 @@ the README); it isn't in CI yet.
 | Device | Command |
 | --- | --- |
 | Scanner (PROXmobil3, armv7, glibc 2.28) | `cargo zigbuild --release --target armv7-unknown-linux-gnueabihf.2.28 --features module-display,module-usb` (zig 0.14.1) |
-| Debian boards (arm64) | built and published by `.github/workflows/release.yml` on a `v*` tag: `aarch64-unknown-linux-gnu.2.31 --features module-usb,module-stream`, `cargo deb --no-strip` |
+| Debian boards (arm64) | built and published by `.github/workflows/release.yml` on a `v*` tag: `aarch64-unknown-linux-gnu.2.31 --features module-usb,module-stream,module-net`, `cargo deb --no-strip` |
 | Provisioning computer (x86-64) | `cargo build --release` (used by the provisioning scripts) |
 
 The scanner runs Helios from its USB drive (`~/workspace/helios/scanner-usb`, not in this
@@ -80,7 +80,7 @@ version rather than moving the tag.
 - Never log or print PINs, and never put them in process arguments.
 - Modules are Cargo features, off by default; a module's config section is ignored in builds
   without it. The scanner build needs `--features module-display,module-usb`, the boards'
-  package `--features module-usb,module-stream` (`FEATURES` in `release.yml`).
+  package `--features module-usb,module-stream,module-net` (`FEATURES` in `release.yml`).
 - Streams run in `helios stream-daemon` (`helios-stream.service`); Helios's `stream` module is
   only its client (`src/modules/stream/client.rs`, protocol in `control.rs`). Engine changes go
   in the daemon side; anything that must survive a Helios restart belongs there.

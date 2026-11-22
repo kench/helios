@@ -63,6 +63,14 @@ ignore = []                      # "vid:pid" or ports ("1-1.2"): tracked, not re
 max_events_per_port = 20         # attachments a minute before a port counts as flapping
 mp_sd_mount = "/init/efad/mp_sd" # scanner: where the platform mounts the PROXdongl3 drive
 
+[modules.net]
+# Network interfaces (LLD 3): each one's kind, MAC, driver, USB port, link state, IPv4 and IPv6
+# addresses and default routes, in the net shadow, kept current from rtnetlink; a net.changed
+# event on helios/<thing>/evt/net names what changed. Needs a build with the module-net Cargo
+# feature. Read-only, and needs no extra permissions. `helios net list` prints the same.
+enabled = true
+exclude = ["veth*"]              # interface names to leave out; a trailing * matches a prefix
+
 [modules.stream]
 # Video streams through ffmpeg to SRT listeners (LLD 4): directly, or bonded over several uplinks
 # by srtla_send. Needs a build with the module-stream Cargo feature. Streams run in the stream

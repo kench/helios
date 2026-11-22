@@ -306,6 +306,10 @@ impl Service {
             )));
             handle
         });
+        #[cfg(feature = "module-net")]
+        if let Some(settings) = config.net {
+            enabled.push(Arc::new(crate::modules::net::NetModule::new(settings)));
+        }
         // Streams run in the stream daemon (helios-stream.service); here the module is its
         // client, so streams outlive Helios's restarts (LLD 4, section 15).
         #[cfg(feature = "module-stream")]
