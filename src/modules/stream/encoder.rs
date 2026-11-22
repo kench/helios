@@ -81,19 +81,37 @@ pub(crate) struct Range {
 }
 
 impl Range {
-    /// The range for `profile` with the stream's bitrate `kbps` (an override or the profile's).
-    pub(crate) fn new(profile: &Profile, kbps: u32) -> Self {
+    /// The range for `profile` with the stream's bitrate `kbps` (an override or the profile's),
+    /// and for an adaptive stream the ceiling its source sets, if any (never above `kbps`).
+    pub(crate) fn new(profile: &Profile, kbps: u32, source_ceiling: Option<u32>) -> Self {
         match profile.bitrate_mode {
             BitrateMode::Fixed => Self {
                 min_kbps: kbps,
                 max_kbps: kbps,
             },
-            BitrateMode::Adaptive => Self {
-                min_kbps: profile.min_bitrate_kbps.min(kbps),
-                max_kbps: kbps,
-            },
+            BitrateMode::Adaptive => {
+                let max_kbps = source_ceiling.map_or(kbps, |ceiling| ceiling.min(kbps));
+                Self {
+                    min_kbps: profile.min_bitrate_kbps.min(max_kbps),
+                    max_kbps,
+                }
+            }
         }
     }
+}
+
+/// The ceiling an adaptive stream's source sets: its video bitrate times `percent`, within the
+/// profile's minimum and the stream's bitrate `kbps`. `None` when it doesn't follow its source.
+pub(crate) fn source_ceiling(profile: &Profile, kbps: u32, source_kbps: f64) -> Option<u32> {
+    if profile.bitrate_mode != BitrateMode::Adaptive || profile.source_ceiling_percent == 0 {
+        return None;
+    }
+    let target = source_kbps * f64::from(profile.source_ceiling_percent) / 100.0;
+    let floor = f64::from(profile.min_bitrate_kbps.min(kbps));
+    // In range of u32 after the clamp.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ceiling = target.clamp(floor, f64::from(kbps)).round() as u32;
+    Some(ceiling)
 }
 
 /// Where a stream's video comes from, as the encoder reads it.
@@ -477,13 +495,46 @@ streamid = "publish/live/pattern"
     #[test]
     fn ranges_follow_the_mode() {
         let settings = settings(GST);
-        let adaptive = Range::new(&settings.profiles["ada"], 4000);
+        let adaptive = Range::new(&settings.profiles["ada"], 4000, None);
         assert_eq!((adaptive.min_kbps, adaptive.max_kbps), (1000, 4000));
         // An override below the floor narrows the range rather than inverting it.
-        let low = Range::new(&settings.profiles["ada"], 600);
+        let low = Range::new(&settings.profiles["ada"], 600, None);
         assert_eq!((low.min_kbps, low.max_kbps), (600, 600));
-        let fixed = Range::new(&settings.profiles["cera"], 3000);
+        let fixed = Range::new(&settings.profiles["cera"], 3000, Some(2000));
         assert_eq!((fixed.min_kbps, fixed.max_kbps), (3000, 3000));
+        // A source's ceiling lowers an adaptive stream's top, never past its bitrate.
+        let followed = Range::new(&settings.profiles["ada"], 4000, Some(2500));
+        assert_eq!((followed.min_kbps, followed.max_kbps), (1000, 2500));
+        let capped = Range::new(&settings.profiles["ada"], 4000, Some(9000));
+        assert_eq!(capped.max_kbps, 4000);
+        let below_floor = Range::new(&settings.profiles["ada"], 4000, Some(600));
+        assert_eq!((below_floor.min_kbps, below_floor.max_kbps), (600, 600));
+    }
+
+    #[test]
+    fn the_ceiling_follows_the_source_within_the_profile() {
+        let settings = settings(GST);
+        let mut profile = settings.profiles["ada"].clone();
+        assert_eq!(source_ceiling(&profile, 4000, 3812.4), Some(3812));
+        assert_eq!(
+            source_ceiling(&profile, 4000, 9000.0),
+            Some(4000),
+            "capped at the bitrate"
+        );
+        assert_eq!(
+            source_ceiling(&profile, 4000, 300.0),
+            Some(1000),
+            "kept at the minimum"
+        );
+        profile.source_ceiling_percent = 70;
+        assert_eq!(source_ceiling(&profile, 4000, 3000.0), Some(2100));
+        profile.source_ceiling_percent = 0;
+        assert_eq!(source_ceiling(&profile, 4000, 3000.0), None, "off");
+        assert_eq!(
+            source_ceiling(&settings.profiles["cera"], 3000, 1000.0),
+            None,
+            "fixed"
+        );
     }
 
     #[test]
@@ -494,7 +545,7 @@ streamid = "publish/live/pattern"
             size: "1280x720",
             fps: 30,
         };
-        let range = Range::new(profile, 4000);
+        let range = Range::new(profile, 4000, None);
         let plan = plan(
             &settings,
             "pattern",
@@ -568,7 +619,7 @@ streamid = "publish/live/pattern"
             profile,
             target(&settings.outputs["open"], Some(6000)),
             Input::Rtmp(url),
-            Range::new(profile, 3000),
+            Range::new(profile, 3000, None),
         );
         assert_eq!(plan.program, PathBuf::from("/opt/ceracoder"));
         assert_eq!(

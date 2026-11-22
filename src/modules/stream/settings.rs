@@ -157,6 +157,15 @@ pub struct Profile {
     /// bitrate, as the link allows (belacoder and ceracoder only).
     #[serde(default)]
     pub(crate) bitrate_mode: BitrateMode,
+    /// Adaptive streams from RTMP: the ceiling follows the camera's video bitrate, as this
+    /// percentage of it (100: match it), within `min_bitrate_kbps` and the stream's bitrate; 0
+    /// keeps the stream's bitrate as the ceiling.
+    #[serde(default = "default_source_ceiling_percent")]
+    pub(crate) source_ceiling_percent: u32,
+}
+
+fn default_source_ceiling_percent() -> u32 {
+    100
 }
 
 fn default_bitrate() -> u32 {
@@ -384,6 +393,9 @@ impl StreamSettings {
             }
             if profile.video == "copy" && !profile.scale.is_empty() {
                 return Err(format!("{at}: scale needs an encoder, not copy"));
+            }
+            if profile.source_ceiling_percent > 400 {
+                return Err(format!("{at}.source_ceiling_percent must be 0 to 400"));
             }
             let backend = profile.encoder;
             if backend == Backend::Ffmpeg {

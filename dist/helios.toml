@@ -114,6 +114,8 @@ stat_url = "http://127.0.0.1:1937/stat"  # rtmp_stat, read at start and every 30
 #                                  # also libx264). Passphrases need helios-packages' builds.
 # bitrate_mode = "fixed"           # or adaptive (belacoder, ceracoder): min_bitrate_kbps up to
 #                                  # the stream's bitrate, as the link allows; SIGHUP, no restart
+# source_ceiling_percent = 100     # adaptive RTMP streams: the ceiling follows the camera's
+#                                  # video bitrate x this % (within min and the bitrate); 0: off
 # input = { format = "mjpeg", size = "1920x1080", fps = 30 }  # what to ask a camera for
 #
 # [modules.stream.streams.camera]

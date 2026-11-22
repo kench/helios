@@ -1606,6 +1606,11 @@ fn checks_encoder_backends_and_bitrate_modes() {
             "encoder = \"gstreamer\"\nbitrate_mode",
             "encoder",
         ),
+        (
+            "bitrate_mode = \"adaptive\"",
+            "bitrate_mode = \"adaptive\"\nsource_ceiling_percent = 500",
+            "source_ceiling_percent must be 0 to 400",
+        ),
     ] {
         assert!(gst.contains(from), "{from}");
         let text = gst.replacen(from, to, 1);
@@ -1722,5 +1727,118 @@ async fn a_gstreamer_encoder_that_never_connects_is_restarted() {
     assert!(job.stopped.load(Ordering::SeqCst));
     let error = status["last_error"].as_str().expect("error").to_owned();
     assert!(error.contains("didn't connect over SRT in time"), "{error}");
+    harness.stop().await;
+}
+
+const RTMP_ADAPTIVE: &str = r#"
+belacoder = "/opt/belacoder"
+runtime_dir = "RUNTIME"
+
+[rtmp_ingest]
+enabled = true
+hook_port = HOOK
+stat_url = "http://127.0.0.1:STAT/stat"
+
+[outputs.main]
+mode = "direct"
+host = "ingest.example.com"
+port = 4001
+
+[profiles.pocket]
+video = "hevc_rkmpp"
+encoder = "belacoder"
+bitrate_mode = "adaptive"
+bitrate_kbps = 6000
+min_bitrate_kbps = 1000
+max_bitrate_kbps = 8000
+audio = "copy"
+
+[streams.pocket]
+source = { type = "rtmp" }
+profile = "pocket"
+output = "main"
+streamid = "publish/live/pocket"
+"#;
+
+fn measured_page(video_bps: u64) -> String {
+    format!(
+        "<rtmp><server><application><name>live</name><live><stream><name>ingest</name>\
+         <bw_video>{video_bps}</bw_video><client><address>192.168.8.20</address><publishing/>\
+         </client></stream></live></application></server></rtmp>"
+    )
+}
+
+/// Waits until `file` holds `contents`.
+async fn file_becomes(file: &std::path::Path, contents: &str) {
+    let found = tokio::time::timeout(Duration::from_secs(20), async {
+        while std::fs::read_to_string(file).ok().as_deref() != Some(contents) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        found.is_ok(),
+        "{} never held {contents:?}: {:?}",
+        file.display(),
+        std::fs::read_to_string(file)
+    );
+}
+
+#[tokio::test]
+async fn an_adaptive_rtmp_streams_ceiling_follows_the_camera() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let page = Arc::new(std::sync::Mutex::new(measured_page(3_000_000)));
+    let stat = stat_server(page.clone()).await;
+    let config = RTMP_ADAPTIVE
+        .replace("RUNTIME", &runtime.path().display().to_string())
+        .replace("HOOK", &free_port().to_string())
+        .replace("STAT", &stat.to_string());
+    let mut harness = harness(&config, None, false);
+    let range = runtime.path().join("encoders/pocket.bitrate");
+
+    // The camera sends 3 Mbps: the encoder starts with that as its ceiling, not 6.
+    let job = harness.next_start().await;
+    assert_eq!(
+        std::fs::read_to_string(&range).expect("range"),
+        "1000000\n3000000\n"
+    );
+    job.send(JobEvent::Stderr(
+        "SRT connected to ingest.example.com:4001. Negotiated latency: 2000 ms".into(),
+    ));
+    harness.state_of("pocket", "live").await;
+
+    // A small change (smoothed 3.1 Mbps, 3%) leaves it alone.
+    *page.lock().expect("page") = measured_page(3_200_000);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(job.reloads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read_to_string(&range).expect("range"),
+        "1000000\n3000000\n"
+    );
+
+    // A big one moves it, by SIGHUP; never past the stream's 6 Mbps.
+    *page.lock().expect("page") = measured_page(9_000_000);
+    file_becomes(&range, "1000000\n6000000\n").await;
+    assert!(job.reloads.load(Ordering::SeqCst) >= 1);
+    assert!(!job.stopped.load(Ordering::SeqCst), "no restart");
+    let Outcome::Ok(status) = harness
+        .command("status", json!({"stream_id": "pocket"}))
+        .await
+    else {
+        panic!("status");
+    };
+    assert_eq!(status["bitrate_ceiling_kbps"], 6000);
+    assert!(
+        status["source_kbps"]
+            .as_u64()
+            .is_some_and(|kbps| kbps > 6000),
+        "{status}"
+    );
+
+    // The camera goes: the ceiling is forgotten, for the next one to set.
+    *page.lock().expect("page") = stat_page(&[]);
+    let waiting = harness.state_of("pocket", "waiting_for_input").await;
+    assert_eq!(waiting["bitrate_ceiling_kbps"], Value::Null);
+    assert_eq!(waiting["source_kbps"], Value::Null);
     harness.stop().await;
 }
