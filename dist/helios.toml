@@ -49,6 +49,20 @@ helios_shadow_interval_s = 60  # 10 to 86400: how often the helios shadow may be
 # sets it. The platform may write /run/helios/boot-clock before NTP runs, for the boot offset.
 warn_offset_s = 60           # warn when off from server time by more; error above 240 s
 
+[modules.usb]
+# USB devices arriving and leaving (LLD 5), from the kernel's uevents and sysfs: events
+# usb.attached, usb.changed and usb.detached on helios/<thing>/evt/usb, the usb shadow, and the
+# usb.status command. Needs a build with the module-usb Cargo feature; other builds log this
+# section as unused. Needs no extra permissions. Devices present at start are only in the shadow.
+enabled = true
+settle_ms = 500                  # 50 to 5000: quiet time after a device's last event before it's
+                                 # announced, so the event names its nodes (/dev/videoN, eth1, ...)
+max_settle_ms = 10000            # settle_ms to 60000: announced by then at the latest
+hubs = false                     # also report USB hubs
+ignore = []                      # "vid:pid" or ports ("1-1.2"): tracked, not reported
+max_events_per_port = 20         # attachments a minute before a port counts as flapping
+mp_sd_mount = "/init/efad/mp_sd" # scanner: where the platform mounts the PROXdongl3 drive
+
 [modules.display]
 # Screens on a framebuffer (LLD 9): the scanner's 800x480 screen. Needs a build with the
 # module-display Cargo feature; other builds log this section as unused. Needs the video group

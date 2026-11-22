@@ -532,6 +532,15 @@ fn the_shipped_example_parses() {
     assert_eq!(file.identity.pin, "bootstrap");
     assert!(file.bootstrap.is_some());
     assert!(file.other.is_empty());
+    #[cfg(feature = "module-usb")]
+    assert!(
+        file.modules
+            .usb
+            .expect("the usb section")
+            .check()
+            .expect("valid usb settings")
+            .is_some()
+    );
 }
 
 #[test]
