@@ -45,6 +45,13 @@ impl UsbHandle {
         self.events.subscribe()
     }
 
+    /// For other modules' tests (so far the stream module's): replaces the snapshot as if the
+    /// usb module had scanned.
+    #[cfg(all(test, feature = "module-stream"))]
+    pub(crate) fn set_for_test(&self, devices: UsbSnapshot) {
+        self.devices.send_replace(Arc::new(devices));
+    }
+
     /// Watch the current inventory, including devices present at startup.
     pub fn snapshot(&self) -> watch::Receiver<Arc<UsbSnapshot>> {
         self.devices.subscribe()
