@@ -23,10 +23,12 @@ mod destination;
 mod e2e;
 mod encoder;
 mod ffmpeg;
+mod inputs;
 mod process;
 mod rtmp;
 pub(crate) mod settings;
 mod srtla;
+mod v4l2;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -98,6 +100,23 @@ struct Publisher {
     video_kbps: Option<f64>,
     /// When the hook accepted it; `None` if it was found on the statistics page.
     accepted: Option<Instant>,
+    /// When it started publishing, for the shadow.
+    since: SystemTime,
+    /// From the statistics page's metadata, once nginx has it.
+    video_codec: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+impl Publisher {
+    /// Takes the statistics page's description of the stream, keeping what it doesn't give.
+    fn describe(&mut self, seen: &rtmp::Seen) {
+        if seen.video_codec.is_some() {
+            self.video_codec.clone_from(&seen.video_codec);
+        }
+        self.width = seen.width.or(self.width);
+        self.height = seen.height.or(self.height);
+    }
 }
 
 /// `rtmp-ingest` as the daemon sees it, for the shadow.
@@ -138,10 +157,17 @@ pub struct StreamModule {
     usb: UsbHandle,
     spawner: Arc<dyn Spawner>,
     addresses: Arc<Addresses>,
+    formats: Arc<FormatReader>,
 }
 
 /// Where uplink addresses come from: rtnetlink, or a fake in tests.
 type Addresses = dyn Fn() -> std::io::Result<Vec<Address>> + Send + Sync;
+
+/// Where a camera's formats come from: V4L2, or a fake in tests.
+type FormatReader = dyn Fn(&std::path::Path) -> std::io::Result<Vec<v4l2::Format>> + Send + Sync;
+
+/// The most a report may take of the shadow's 8 KB before the cameras' formats are left out.
+const REPORT_BUDGET: usize = 7 * 1024;
 
 /// How often uplink addresses are read again.
 const ADDRESS_REFRESH: Duration = Duration::from_secs(5);
@@ -155,6 +181,7 @@ impl StreamModule {
             usb,
             spawner: Arc::new(process::System),
             addresses: Arc::new(addrs::ipv4_addresses),
+            formats: Arc::new(v4l2::formats),
         }
     }
 
@@ -170,7 +197,14 @@ impl StreamModule {
             usb,
             spawner,
             addresses,
+            formats: Arc::new(|_| Ok(Vec::new())),
         }
+    }
+
+    #[cfg(test)]
+    fn with_formats(mut self, formats: Arc<FormatReader>) -> Self {
+        self.formats = formats;
+        self
     }
 }
 
@@ -378,6 +412,15 @@ struct Streams<'a> {
     ingest: Ingest,
     /// ffmpeg's encoders, once listed: a profile set through the shadow must find its own.
     encoders: Option<BTreeSet<String>>,
+    /// The usb module's latest snapshot, for `inputs`.
+    devices: Arc<UsbSnapshot>,
+    /// Attached cameras' formats, and the cameras being read.
+    formats: inputs::Formats,
+    formats_reading: BTreeSet<String>,
+    formats_tx: mpsc::UnboundedSender<(String, std::io::Result<Vec<v4l2::Format>>)>,
+    formats_rx: mpsc::UnboundedReceiver<(String, std::io::Result<Vec<v4l2::Format>>)>,
+    /// Whether the last report left the formats out (logged once, when that starts).
+    formats_left_out: bool,
 }
 
 impl<'a> Streams<'a> {
@@ -422,6 +465,7 @@ impl<'a> Streams<'a> {
             })
             .collect();
         let (stats_tx, sender_stats) = mpsc::unbounded_channel();
+        let (formats_tx, formats_rx) = mpsc::unbounded_channel();
         Self {
             module,
             entries,
@@ -436,7 +480,67 @@ impl<'a> Streams<'a> {
             addresses_at: None,
             ingest: Ingest::default(),
             encoders: None,
+            devices: Arc::default(),
+            formats: inputs::Formats::new(),
+            formats_reading: BTreeSet::new(),
+            formats_tx,
+            formats_rx,
+            formats_left_out: false,
         }
+    }
+
+    /// Reads the formats of each newly attached camera (off the async threads: opening a UVC
+    /// device can wake it), and forgets those of cameras gone.
+    fn read_formats(&mut self) {
+        let mut attached = BTreeSet::new();
+        for device in self.devices.values() {
+            let Some(node) = inputs::capture_node(device) else {
+                continue;
+            };
+            let key = inputs::format_key(device, node);
+            attached.insert(key.clone());
+            if self.formats.contains_key(&key) || self.formats_reading.contains(&key) {
+                continue;
+            }
+            self.formats_reading.insert(key.clone());
+            let read = Arc::clone(&self.module.formats);
+            let path = PathBuf::from("/dev").join(node);
+            let results = self.formats_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = results.send((key, read(&path)));
+            });
+        }
+        self.formats.retain(|key, _| attached.contains(key));
+    }
+
+    fn formats_read(&mut self, key: String, result: std::io::Result<Vec<v4l2::Format>>) {
+        self.formats_reading.remove(&key);
+        let attached = self.devices.values().any(|device| {
+            inputs::capture_node(device).is_some_and(|node| inputs::format_key(device, node) == key)
+        });
+        if !attached {
+            return;
+        }
+        let formats = match result {
+            Ok(formats) => Some(formats),
+            Err(error) => {
+                tracing::warn!(camera = %key, %error, "couldn't read the camera's formats");
+                None
+            }
+        };
+        self.formats.insert(key, formats);
+    }
+
+    /// The RTMP keys for `inputs`: `ingest`, every key a stream's configured or current source
+    /// takes, and every key publishing.
+    fn rtmp_keys(&self) -> BTreeSet<String> {
+        let mut keys = BTreeSet::from(["ingest".to_owned()]);
+        for entry in &self.entries {
+            keys.extend(entry.configured.source.rtmp_key());
+            keys.extend(entry.config.source.rtmp_key());
+        }
+        keys.extend(self.ingest.publishers.keys().cloned());
+        keys
     }
 
     /// Whether a stream's input is there: its camera attached, or its RTMP key publishing.
@@ -482,6 +586,10 @@ impl<'a> Streams<'a> {
                                 address,
                                 video_kbps: None,
                                 accepted: Some(now),
+                                since: SystemTime::now(),
+                                video_codec: None,
+                                width: None,
+                                height: None,
                             },
                         );
                     }
@@ -513,6 +621,7 @@ impl<'a> Streams<'a> {
                 for (key, seen) in found {
                     let sample = seen.video_kbps.map(f64::from);
                     if let Some(publisher) = self.ingest.publishers.get_mut(&key) {
+                        publisher.describe(&seen);
                         if let Some(sample) = sample {
                             publisher.video_kbps = Some(
                                 publisher
@@ -526,16 +635,23 @@ impl<'a> Streams<'a> {
                         entry.config.source.rtmp_key().as_deref() == Some(key.as_str())
                     });
                     if known {
-                        let address = seen.address;
-                        tracing::info!(%key, %address, "RTMP publisher found (statistics page)");
-                        self.ingest.publishers.insert(
-                            key,
-                            Publisher {
-                                address,
-                                video_kbps: sample,
-                                accepted: None,
-                            },
+                        tracing::info!(
+                            %key, address = %seen.address, "RTMP publisher found (statistics page)"
                         );
+                        let connected = Duration::from_millis(seen.connected_ms.unwrap_or(0));
+                        let mut publisher = Publisher {
+                            address: seen.address.clone(),
+                            video_kbps: sample,
+                            accepted: None,
+                            since: SystemTime::now()
+                                .checked_sub(connected)
+                                .unwrap_or_else(SystemTime::now),
+                            video_codec: None,
+                            width: None,
+                            height: None,
+                        };
+                        publisher.describe(&seen);
+                        self.ingest.publishers.insert(key, publisher);
                     }
                 }
                 self.follow_sources();
@@ -601,7 +717,24 @@ impl<'a> Streams<'a> {
             .ingest
             .publishers
             .iter()
-            .map(|(key, publisher)| (key.clone(), json!({"address": publisher.address})))
+            .map(|(key, publisher)| {
+                // Rounded to whole kbps, for the shadow.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let kbps = publisher
+                    .video_kbps
+                    .map(|kbps| kbps.round().clamp(0.0, f64::from(u32::MAX)) as u32);
+                (
+                    key.clone(),
+                    json!({
+                        "address": publisher.address,
+                        "since": timestamp(publisher.since),
+                        "video_codec": publisher.video_codec,
+                        "width": publisher.width,
+                        "height": publisher.height,
+                        "video_kbps": kbps,
+                    }),
+                )
+            })
             .collect();
         json!({
             "state": if self.ingest.last_error.is_some() { "degraded" } else { "ok" },
@@ -642,6 +775,8 @@ impl<'a> Streams<'a> {
         }
         loop {
             let devices = snapshot.borrow_and_update().clone();
+            self.devices = Arc::clone(&devices);
+            self.read_formats();
             let now = Instant::now();
             self.reconcile_senders(&devices, now);
             for index in 0..self.entries.len() {
@@ -672,6 +807,7 @@ impl<'a> Streams<'a> {
                 }
                 Some(tagged) = self.events.recv() => self.job_event(tagged, &ctx),
                 Some(event) = ingest_rx.recv() => self.ingest_event(event),
+                Some((key, result)) = self.formats_rx.recv() => self.formats_read(key, result),
                 Some((job, snapshot)) = self.sender_stats.recv() => {
                     self.senders.stats(job, snapshot, Instant::now());
                 }
@@ -1538,12 +1674,30 @@ impl<'a> Streams<'a> {
         }
         // Encoder and per-link figures change all the time: they wait for the interval.
         let ingest = self.ingest_report();
-        let full = json!({
+        let profiles = inputs::profiles(&self.module.settings);
+        let keys = self.rtmp_keys();
+        let settings = &self.module.settings;
+        let mut inputs = inputs::inputs(settings, &self.devices, &self.formats, &keys, true);
+        let mut full = json!({
             "streams": streams, "outputs": self.outputs_report(now, false), "rtmp_ingest": ingest,
+            "profiles": profiles, "inputs": inputs,
         });
+        let too_big = full.to_string().len() > REPORT_BUDGET;
+        if too_big {
+            inputs = inputs::inputs(settings, &self.devices, &self.formats, &keys, false);
+            full["inputs"] = inputs.clone();
+        }
+        if too_big != self.formats_left_out {
+            if too_big {
+                tracing::warn!(
+                    "the stream shadow is near AWS IoT's 8 KB: cameras' formats left out"
+                );
+            }
+            self.formats_left_out = too_big;
+        }
         let significant = json!({
             "streams": quiet_streams, "outputs": self.outputs_report(now, true),
-            "rtmp_ingest": ingest,
+            "rtmp_ingest": ingest, "profiles": profiles, "inputs": inputs,
         });
         let due = match &self.reported {
             None => true,
@@ -1697,19 +1851,7 @@ fn resolve(source: &Source, devices: &UsbSnapshot) -> (Option<CameraNodes>, Valu
         return (None, Value::Null);
     };
     let report = json!({"port": camera.port, "product": camera.payload.get("product")});
-    // The capture node: a UVC camera makes two, and index 0 is the one that captures.
-    let node = camera.payload["nodes"]["video"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|node| {
-            Some((
-                node["index"].as_u64().unwrap_or(u64::MAX),
-                node["name"].as_str()?,
-            ))
-        })
-        .min();
-    let Some((_, name)) = node else {
+    let Some(name) = inputs::capture_node(camera) else {
         return (None, report);
     };
     let audio = match audio {

@@ -524,6 +524,25 @@ async fn rtmp_cameras_go_through_nginx_and_the_daemon() {
             r["rtmp_ingest"]["publishers"]["ingest"]["address"] == "127.0.0.1"
         })
         .await;
+    // nginx's statistics page describes it (read every 10 s), and its key is an input.
+    let described = helios
+        .shadow("ingest's publisher described", |r| {
+            r["rtmp_ingest"]["publishers"]["ingest"]["video_codec"].is_string()
+        })
+        .await;
+    let publisher = &described["rtmp_ingest"]["publishers"]["ingest"];
+    say(&format!("publisher: {publisher}"));
+    assert_eq!(publisher["video_codec"], "H264", "{publisher}");
+    assert_eq!(publisher["width"], 1280, "{publisher}");
+    assert_eq!(publisher["height"], 720, "{publisher}");
+    assert!(publisher["since"].is_string(), "{publisher}");
+    assert!(
+        described["inputs"]
+            .as_array()
+            .is_some_and(|inputs| inputs.contains(&json!({"type": "rtmp", "key": "ingest"}))),
+        "{}",
+        described["inputs"]
+    );
     let codecs = played(&run, "pocket", "pocket");
     say(&format!("player on play/live/pocket got {codecs}"));
     assert_eq!(codecs, "aac,hevc");

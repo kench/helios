@@ -290,6 +290,12 @@ pub(crate) struct Seen {
     /// The stream's incoming video bitrate (nginx's `bw_video`, averaged over its bandwidth
     /// window), if it has measured one yet.
     pub video_kbps: Option<u32>,
+    /// The video's codec (`H264`, …) and size, from the stream's metadata, once nginx has it.
+    pub video_codec: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// How long the publisher has been connected (its client's `time`, in ms).
+    pub connected_ms: Option<u64>,
 }
 
 /// The keys being published to the `live` application, with each publisher, from the RTMP
@@ -312,11 +318,27 @@ pub(crate) fn publishers(xml: &str) -> BTreeMap<String, Seen> {
                     .filter(|&bps| bps > 0)
                     .map(|bps| u32::try_from(bps.div_ceil(1000)).unwrap_or(u32::MAX));
                 let address = text_of(publisher, "address").unwrap_or_default();
+                let video = blocks(stream, "meta")
+                    .next()
+                    .and_then(|meta| blocks(meta, "video").next());
+                let number = |tag: &str| {
+                    video
+                        .and_then(|video| text_of(video, tag))
+                        .and_then(|text| text.parse::<u32>().ok())
+                        .filter(|&n| n > 0)
+                };
                 found.insert(
                     name,
                     Seen {
                         address,
                         video_kbps,
+                        video_codec: video
+                            .and_then(|video| text_of(video, "codec"))
+                            .filter(|codec| !codec.is_empty()),
+                        width: number("width"),
+                        height: number("height"),
+                        connected_ms: text_of(publisher, "time")
+                            .and_then(|ms| ms.parse::<u64>().ok()),
                     },
                 );
             }
@@ -374,6 +396,18 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found["ingest"].address, "192.168.8.20");
         assert_eq!(found["ingest"].video_kbps, None, "no bw_video yet");
+        assert_eq!(found["ingest"].video_codec, None, "no metadata yet");
+        assert_eq!(found["ingest"].connected_ms, None);
+        let described = xml.replace(
+            "<client><id>3</id>",
+            "<meta><video><width>1920</width><height>1080</height><frame_rate>30</frame_rate>\
+             <codec>H264</codec><profile>High</profile></video><audio><codec>AAC</codec></audio>\
+             </meta><client><id>3</id><time>65432</time>",
+        );
+        let seen = &publishers(&described)["ingest"];
+        assert_eq!(seen.video_codec.as_deref(), Some("H264"));
+        assert_eq!((seen.width, seen.height), (Some(1920), Some(1080)));
+        assert_eq!(seen.connected_ms, Some(65432));
         let measured = xml.replace(
             "<stream><name>ingest</name>",
             "<stream><name>ingest</name><bw_in>3950000</bw_in><bw_video>3812345</bw_video>",

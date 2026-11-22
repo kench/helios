@@ -96,6 +96,8 @@ enabled = false
 port = 1935                        # nginx's RTMP port; jobs read streams back on loopback
 hook_port = 1936                   # on_publish / on_publish_done, on 127.0.0.1
 stat_url = "http://127.0.0.1:1937/stat"  # rtmp_stat, read at start and every 30 s
+# publish_host = "192.168.8.1"     # what cameras publish to, for each key's publish_url in the
+#                                  # stream shadow (the Control API shows it); unset leaves it out
 
 # [modules.stream.outputs.bonded]
 # mode = "srtla"                   # srtla (to srtla_rec) or direct (to an SRT listener)

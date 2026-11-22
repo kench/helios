@@ -73,6 +73,15 @@ pub enum BitrateMode {
     Adaptive,
 }
 
+impl BitrateMode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Adaptive => "adaptive",
+        }
+    }
+}
+
 /// The video bitrate range an encoder works in; both ends equal for a fixed bitrate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Range {
