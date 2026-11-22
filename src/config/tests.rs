@@ -597,6 +597,39 @@ fn mqtt_defaults_without_a_section() {
 }
 
 #[test]
+fn reads_the_command_transports() {
+    let files = Files::new();
+    let config = files.load(&files.local("")).unwrap();
+    assert_eq!(
+        config.mqtt.commands,
+        crate::mqtt::CommandTransports::default()
+    );
+    assert!(config.mqtt.commands.topics && config.mqtt.commands.aws_iot_commands);
+    for (setting, topics, aws) in [
+        ("\"topics\"", true, false),
+        ("\"aws-iot-commands\"", false, true),
+        ("[\"aws-iot-commands\", \"topics\"]", true, true),
+    ] {
+        let config = files
+            .load(&files.local(&format!("\n[mqtt]\ncommands = {setting}\n")))
+            .unwrap();
+        assert_eq!(
+            (
+                config.mqtt.commands.topics,
+                config.mqtt.commands.aws_iot_commands
+            ),
+            (topics, aws),
+            "{setting}"
+        );
+        let subscriptions = config.mqtt.commands.transport().subscriptions("t-1");
+        assert_eq!(
+            subscriptions.len(),
+            usize::from(topics) + 3 * usize::from(aws)
+        );
+    }
+}
+
+#[test]
 fn rejects_bad_mqtt_settings() {
     let files = Files::new();
     for (section, expected) in [
@@ -610,8 +643,10 @@ fn rejects_bad_mqtt_settings() {
             "queue_messages = 0",
             "mqtt.queue_messages must be at least 1",
         ),
-        ("commands = \"aws-iot-commands\"", "isn't supported yet"),
         ("commands = \"jobs\"", "mqtt.commands must be"),
+        ("commands = [\"topics\", \"jobs\"]", "mqtt.commands must be"),
+        ("commands = []", "at least one transport"),
+        ("commands = 1", "TOML parse error"),
         (
             "helios_shadow_interval_s = 9",
             "mqtt.helios_shadow_interval_s must be 10 to 86400",

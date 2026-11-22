@@ -45,7 +45,6 @@ use crate::mqtt::helios_shadow::{self, Sources};
 use crate::mqtt::manager::{Incoming, MqttHandle, MqttManager, Options as MqttOptions};
 use crate::mqtt::shadow::{ShadowHandle, ShadowManager};
 use crate::provision::DEFAULT_TOKEN_LABEL;
-use crate::router::topics::TopicsTransport;
 use crate::router::{CommandTransport, Router, RouterHandle};
 use crate::{hardening, logging};
 
@@ -244,9 +243,8 @@ impl Service {
             clock_samples.clone(),
             cancel.clone(),
         );
-        // Only custom topics for now; mqtt.commands = "aws-iot-commands" is refused by the config
-        // checks until that transport exists (LLD 2, section 7.3).
-        let transport: Arc<dyn CommandTransport> = Arc::new(TopicsTransport);
+        // Custom topics and AWS IoT commands, as mqtt.commands chooses (LLD 2, section 7.3).
+        let transport: Arc<dyn CommandTransport> = config.mqtt.commands.transport();
         let started = std::time::Instant::now();
         let mqtt_cancel = CancellationToken::new();
         let (incoming_tx, incoming) = mpsc::channel(INCOMING_CAPACITY);
@@ -308,7 +306,10 @@ impl Service {
         });
         #[cfg(feature = "module-net")]
         if let Some(settings) = config.net {
-            enabled.push(Arc::new(crate::modules::net::NetModule::new(settings)));
+            enabled.push(Arc::new(crate::modules::net::NetModule::new(
+                settings,
+                identity.watch(),
+            )));
         }
         // Streams run in the stream daemon (helios-stream.service); here the module is its
         // client, so streams outlive Helios's restarts (LLD 4, section 15).

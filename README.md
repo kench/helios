@@ -66,8 +66,10 @@ sections 3 to 6), and keeps an MQTT 3.1.1 connection to AWS IoT Core (LLD 2, sec
 ID = thing name, the token-backed TLS identity, a clean session, `lifecycle.online` after each
 connect and `lifecycle.offline` as the Last Will and on shutdown, and a bounded offline queue for
 events. It reports the `helios` shadow (urgent changes at once, the rest at most once per
-`mqtt.helios_shadow_interval_s`, 60 s by default), answers commands through the router (`helios.ping`
-for now), and checks the clock (LLD 1, section 4.11): the kernel's NTP state, the offset from
+`mqtt.helios_shadow_interval_s`, 60 s by default), answers commands through the router on
+Helios's own `helios/<thing>/cmd|rsp/<module>` topics and as AWS IoT command executions
+(`$aws/commands/things/<thing>/executions/<id>/request/json`, answered on `…/response/json`;
+`mqtt.commands`, both by default; LLD 2, section 7.3), and checks the clock (LLD 1, section 4.11): the kernel's NTP state, the offset from
 server time in replies it gets anyway, and, if the platform writes `/run/helios/boot-clock`
 before NTP runs, how far off the clock was at power-on. It reports them in the shadow's `clock`
 object and logs offsets over `clock.warn_offset_s` (60 s) as warnings and over 240 s as errors.
@@ -164,6 +166,14 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   passphrases) and that result. At most 16 networks; no priorities yet (netplan has none).
   Passphrases are never logged or reported, and a command's `Debug` leaves out its arguments.
   The package enables `helios-wifi.path` on a device that has Helios enabled.
+
+  From the Control API the passphrase arrives sealed to the device (LLD 3, section 10.7),
+  `{"sealed": {"enc", "ct"}}`, because AWS keeps command executions: HPKE (RFC 9180) with
+  DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and AES-128-GCM, `info` `helios secret v1 <thing>`
+  and AAD `wifi.passphrase <ssid>`. Helios makes a `helios-secrets` P-256 key in the token when
+  it has none (derive only, never extractable), does the ECDH there and the rest in software,
+  and reports the public half in the `helios` shadow's `secrets_key`. A value it can't open fails
+  with `SECRET_UNREADABLE`.
 
 The other modules come later.
 

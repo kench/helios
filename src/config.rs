@@ -218,8 +218,16 @@ struct MqttSection {
     port: Option<u16>,
     keep_alive_s: Option<u64>,
     queue_messages: Option<usize>,
-    commands: Option<String>,
+    commands: Option<CommandsSetting>,
     helios_shadow_interval_s: Option<u64>,
+}
+
+/// `mqtt.commands`: one transport's name, or a list of them.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CommandsSetting {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -460,21 +468,35 @@ impl MqttSection {
         if queue_messages == 0 {
             return Err("mqtt.queue_messages must be at least 1".to_owned());
         }
-        match self.commands.as_deref() {
-            None | Some("topics") => {}
-            Some("aws-iot-commands") => {
-                return Err(
-                    "mqtt.commands = \"aws-iot-commands\" isn't supported yet (LLD 2, section 7.3); \
-                     use \"topics\""
-                        .to_owned(),
-                );
+        let commands = match self.commands {
+            None => crate::mqtt::CommandTransports::default(),
+            Some(setting) => {
+                let names = match setting {
+                    CommandsSetting::One(name) => vec![name],
+                    CommandsSetting::Many(names) => names,
+                };
+                if names.is_empty() {
+                    return Err("mqtt.commands must name at least one transport".to_owned());
+                }
+                let mut chosen = crate::mqtt::CommandTransports {
+                    topics: false,
+                    aws_iot_commands: false,
+                };
+                for name in names {
+                    match name.as_str() {
+                        "topics" => chosen.topics = true,
+                        "aws-iot-commands" => chosen.aws_iot_commands = true,
+                        other => {
+                            return Err(format!(
+                                "mqtt.commands must be \"topics\", \"aws-iot-commands\" or a \
+                                 list of them, not {other:?}"
+                            ));
+                        }
+                    }
+                }
+                chosen
             }
-            Some(other) => {
-                return Err(format!(
-                    "mqtt.commands must be \"topics\" or \"aws-iot-commands\", not {other:?}"
-                ));
-            }
-        }
+        };
         let helios_shadow_interval = self
             .helios_shadow_interval_s
             .map_or(defaults.helios_shadow_interval, Duration::from_secs);
@@ -493,6 +515,7 @@ impl MqttSection {
             keep_alive,
             queue_messages,
             helios_shadow_interval,
+            commands,
         })
     }
 }

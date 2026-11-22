@@ -210,6 +210,8 @@ async fn opens_the_token_and_publishes_the_identity() {
             Op::ReadCertificate,
             // Proof of possession.
             Op::SignDigest,
+            // Found, or made, for sealed secrets.
+            Op::SecretsKey,
         ]
     );
     assert!(Arc::ptr_eq(
@@ -784,4 +786,81 @@ fn defaults_follow_the_lld() {
         "random number generator failed: no entropy"
     );
     assert_eq!(hex(&[0x00, 0xff]), "00ff");
+}
+
+#[tokio::test]
+async fn opens_values_sealed_to_the_device() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    use crate::identity::secrets::{self, POINT_LEN, Sealed};
+
+    let device = device();
+    let running = start(&device.token, config(fast()));
+    let identity = ready(&running.handle).await;
+    let key = identity.secrets.as_ref().expect("a secrets key");
+    let public: [u8; POINT_LEN] = URL_SAFE_NO_PAD
+        .decode(key.public_base64())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let ephemeral = p256::SecretKey::from_slice(&[0x42; 32]).unwrap();
+    let (enc, ct) = secrets::seal(
+        &public,
+        &ephemeral,
+        &secrets::info(THING_NAME),
+        b"wifi.passphrase Home",
+        b"correct horse battery",
+    );
+    let sealed = Sealed {
+        enc: URL_SAFE_NO_PAD.encode(enc),
+        ct: URL_SAFE_NO_PAD.encode(ct),
+    };
+    let opened = key
+        .open(THING_NAME, b"wifi.passphrase Home", &sealed)
+        .await
+        .unwrap();
+    assert_eq!(opened.as_slice(), b"correct horse battery");
+    assert_eq!(
+        key.open(THING_NAME, b"wifi.passphrase Cafe", &sealed)
+            .await
+            .unwrap_err(),
+        secrets::SecretError::Unreadable,
+        "bound to its SSID"
+    );
+    assert_eq!(
+        key.open("t-other", b"wifi.passphrase Home", &sealed)
+            .await
+            .unwrap_err(),
+        secrets::SecretError::Unreadable,
+        "bound to its device"
+    );
+    assert!(format!("{key:?}").contains(&key.public_base64()));
+    device
+        .token
+        .fail_next(Op::Ecdh, TokenError::TokenLost("removed".into()));
+    assert!(matches!(
+        key.open(THING_NAME, b"wifi.passphrase Home", &sealed).await,
+        Err(secrets::SecretError::Token(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_token_without_a_secrets_key_only_warns() {
+    let device = device();
+    device.token.fail_next(
+        Op::SecretsKey,
+        TokenError::Unsupported("CKM_EC_KEY_PAIR_GEN".into()),
+    );
+    let running = start(&device.token, config(fast()));
+    let identity = ready(&running.handle).await;
+    assert!(identity.secrets.is_none());
+    assert!(
+        identity
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, Warning::NoSecretsKey { .. })),
+        "{:?}",
+        identity.warnings
+    );
 }

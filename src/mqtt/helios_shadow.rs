@@ -1,8 +1,9 @@
 //! The `helios` shadow (LLD 2, section 5): the agent's own reported state, from the identity,
 //! the credentials and the MQTT connection. Reported only; it accepts no desired state.
 //!
-//! Urgent changes are reported at once: the identity state, the MQTT session or disconnect
-//! reason, a credentials error, and the clock's synced flag, offset or boot offset. Other changes
+//! Urgent changes are reported at once: the identity state and its secrets key (the public
+//! half, which the Control API seals secrets to), the MQTT session or disconnect reason, a
+//! credentials error, and the clock's synced flag, offset or boot offset. Other changes
 //! (timestamps, counters, the clock's drift and error bounds) are reported at most once per
 //! `mqtt.helios_shadow_interval_s`, 60 s by default. Each module's state (`modules`) is urgent
 //! too, except when it last changed.
@@ -123,6 +124,7 @@ async fn run(
 fn significant(reported: &Map<String, Value>) -> Value {
     json!({
         "identity": reported["identity"]["state"],
+        "secrets_key": reported.get("secrets_key"),
         "credentials_error": reported["credentials"]["last_error"],
         "mqtt_session": reported["mqtt"]["session"],
         "mqtt_reason": reported["mqtt"]["last_disconnect_reason"],
@@ -185,6 +187,18 @@ fn reported(sources: &Sources) -> Map<String, Value> {
     reported.insert("boot_id".into(), json!(sources.boot_id));
     reported.insert("started_at".into(), json!(timestamp(sources.started_at)));
     reported.insert("identity".into(), identity_json);
+    // The key the cloud seals secrets to (LLD 3, section 10.7): only its public half.
+    if let IdentityState::Ready(ready) = &identity
+        && let Some(key) = &ready.secrets
+    {
+        reported.insert(
+            "secrets_key".into(),
+            json!({
+                "suite": crate::identity::secrets::SUITE,
+                "public": key.public_base64(),
+            }),
+        );
+    }
     reported.insert(
         "credentials".into(),
         json!({

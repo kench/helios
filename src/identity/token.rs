@@ -92,6 +92,36 @@ pub trait TokenBackend: Send + 'static {
     /// Changes the label of the token to open, for when the bootstrap service supplies it.
     /// Closes the token if the label changes.
     fn set_token_label(&mut self, label: &str);
+
+    /// The public point (uncompressed, 65 bytes) of the P-256 key pair labelled `label` that
+    /// secrets are sealed to (LLD 3, section 10.7), creating the pair if the token has none. Its
+    /// private key can only derive (ECDH): it never signs, and never leaves the token. Needs a
+    /// logged-in token.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Unsupported`] where the token can't (the default), or any error from
+    /// finding or generating the key.
+    fn secrets_key(&mut self, label: &str) -> Result<Vec<u8>, TokenError> {
+        let _ = label;
+        Err(TokenError::Unsupported("sealed secrets".into()))
+    }
+
+    /// ECDH with the secrets key labelled `label` and the peer's public point `peer`
+    /// (uncompressed): the shared secret's x-coordinate, 32 bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Unsupported`] where the token can't (the default),
+    /// [`TokenError::KeyNotFound`] without the key, or any error from deriving.
+    fn ecdh(
+        &mut self,
+        label: &str,
+        peer: &[u8],
+    ) -> Result<secrecy::zeroize::Zeroizing<Vec<u8>>, TokenError> {
+        let _ = (label, peer);
+        Err(TokenError::Unsupported("sealed secrets".into()))
+    }
 }
 
 /// What was opened, for logs and the `helios` shadow. Holds no secrets.
