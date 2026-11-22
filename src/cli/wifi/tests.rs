@@ -203,6 +203,7 @@ fn a_store_it_may_not_write_says_who_may() {
 fn apply_reports_what_it_did() {
     let fixture = Fixture::new();
     std::fs::create_dir_all(fixture.dir.path().join("etc/netplan")).unwrap();
+    std::fs::create_dir_all(fixture.dir.path().join("sys/class/net/wlan0/wireless")).unwrap();
     fixture
         .run(add("Home"), &["correct horse battery"])
         .0

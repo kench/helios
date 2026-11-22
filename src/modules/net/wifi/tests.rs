@@ -185,21 +185,44 @@ fn a_broken_store_is_an_error_that_quotes_nothing() {
 
 #[test]
 fn renders_netplan() {
-    assert_eq!(netplan(&[]), None);
+    let wlan = ["wlP2p33s0".to_owned()];
+    assert_eq!(netplan(&[], &wlan), None);
     let mut quoted = personal("Venue \"Main\" \\ Hall");
     quoted.hidden = true;
-    let yaml = netplan(&[quoted, open_network("Cafe")]).unwrap();
-    let expected = format!(
-        "{}{}",
-        "# Written by helios wifi-apply from Helios's Wi-Fi networks (LLD 3, section 10).\n\
+    let yaml = netplan(&[quoted, open_network("Cafe")], &wlan).unwrap();
+    let expected = "# Written by helios wifi-apply from Helios's Wi-Fi networks (LLD 3, section 10).\n\
          # Change them with `helios wifi` or the Control API, not here.\n\
-         network:\n  version: 2\n  renderer: networkd\n  wifis:\n    helios-wifi:\n      \
-         match:\n        name: \"wl*\"\n      dhcp4: true\n      dhcp6: true\n      \
-         ipv6-privacy: true\n      access-points:\n",
-        "        \"Venue \\\"Main\\\" \\\\ Hall\":\n          password: \"correct horse battery\"\n          hidden: true\n\
-         \x20       \"Cafe\":\n          auth:\n            key-management: none\n          hidden: true\n",
-    );
+         network:\n  version: 2\n  renderer: networkd\n  wifis:\n    \"wlP2p33s0\":\n      \
+         optional: true\n      dhcp4: true\n      dhcp6: true\n      ipv6-privacy: true\n      access-points:\n        \
+         \"Venue \\\"Main\\\" \\\\ Hall\":\n          password: \"correct horse battery\"\n          \
+         hidden: true\n        \"Cafe\":\n          auth:\n            key-management: none\n          \
+         hidden: true\n";
     assert_eq!(yaml, expected);
+    let two = netplan(&[open_network("Cafe")], &["wlan0".into(), "wlan1".into()]).unwrap();
+    assert_eq!(
+        two.matches("\"Cafe\":").count(),
+        2,
+        "every network on every adapter"
+    );
+}
+
+#[test]
+fn finds_wifi_interfaces_in_sysfs() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(wifi_interfaces(root.path()).is_empty());
+    for (name, marker) in [
+        ("wlP2p33s0", Some("wireless")),
+        ("wlan1", Some("phy80211")),
+        ("eth0", None),
+        ("bad name", Some("wireless")),
+    ] {
+        let dir = root.path().join("sys/class/net").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(marker) = marker {
+            std::fs::create_dir_all(dir.join(marker)).unwrap();
+        }
+    }
+    assert_eq!(wifi_interfaces(root.path()), ["wlP2p33s0", "wlan1"]);
 }
 
 #[test]
@@ -247,6 +270,7 @@ impl Board {
     fn new(backend: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(backend)).unwrap();
+        std::fs::create_dir_all(root.path().join("sys/class/net/wlan0/wireless")).unwrap();
         let store = Store::new(root.path().join("var/lib/helios/wifi/networks.json"));
         store.set(personal("Home")).unwrap();
         let status = root.path().join("var/lib/helios-wifi/status.json");
@@ -335,6 +359,18 @@ fn applies_with_networkmanager() {
         0o600
     );
     assert_eq!(*board.ran.borrow(), ["/usr/bin/nmcli connection reload"]);
+}
+
+#[test]
+fn a_netplan_board_without_wifi_is_reported() {
+    let board = Board::new("etc/netplan");
+    std::fs::remove_dir_all(board.root.path().join("sys")).unwrap();
+    let status = board.apply(false);
+    assert_eq!(
+        status.error.as_deref(),
+        Some("the board has no Wi-Fi interface")
+    );
+    assert!(board.ran.borrow().is_empty());
 }
 
 #[test]

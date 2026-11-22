@@ -342,10 +342,13 @@ impl Backend {
     }
 }
 
-/// netplan's YAML for `networks`, or `None` if there are none (then the file is removed). One
-/// `wifis` entry matches every WLAN interface (`wl*`) with DHCP for IPv4 and IPv6, as Armbian's
-/// own file does for Ethernet. Strings are written as JSON strings, which YAML reads the same.
-pub(crate) fn netplan(networks: &[Network]) -> Option<String> {
+/// netplan's YAML for `networks` on the Wi-Fi `interfaces`, or `None` if there are no networks
+/// (then the file is removed). One `wifis` entry per interface, by name (networkd's netplan
+/// backend can't match Wi-Fi by pattern), each with every network and DHCP for IPv4 and IPv6,
+/// as Armbian's own file does for Ethernet. `optional`, so booting doesn't wait for Wi-Fi
+/// (network-online.target, which Helios starts after) when no known network is in range. Strings are written as JSON strings, which YAML
+/// reads the same.
+pub(crate) fn netplan(networks: &[Network], interfaces: &[String]) -> Option<String> {
     if networks.is_empty() {
         return None;
     }
@@ -353,26 +356,56 @@ pub(crate) fn netplan(networks: &[Network]) -> Option<String> {
     let mut yaml = String::from(
         "# Written by helios wifi-apply from Helios's Wi-Fi networks (LLD 3, section 10).\n\
          # Change them with `helios wifi` or the Control API, not here.\n\
-         network:\n  version: 2\n  renderer: networkd\n  wifis:\n    helios-wifi:\n      \
-         match:\n        name: \"wl*\"\n      dhcp4: true\n      dhcp6: true\n      \
-         ipv6-privacy: true\n      access-points:\n",
+         network:\n  version: 2\n  renderer: networkd\n  wifis:\n",
     );
-    for network in networks {
-        yaml.push_str(&format!("        {}:\n", quote(&network.ssid)));
-        match &network.passphrase {
-            Some(passphrase) => {
-                yaml.push_str(&format!(
-                    "          password: {}\n",
-                    quote(passphrase.expose())
-                ));
+    for interface in interfaces {
+        yaml.push_str(&format!(
+            "    {}:\n      optional: true\n      dhcp4: true\n      dhcp6: true\n      \
+             ipv6-privacy: true\n      access-points:\n",
+            quote(interface)
+        ));
+        for network in networks {
+            yaml.push_str(&format!("        {}:\n", quote(&network.ssid)));
+            match &network.passphrase {
+                Some(passphrase) => {
+                    yaml.push_str(&format!(
+                        "          password: {}\n",
+                        quote(passphrase.expose())
+                    ));
+                }
+                None => yaml.push_str("          auth:\n            key-management: none\n"),
             }
-            None => yaml.push_str("          auth:\n            key-management: none\n"),
-        }
-        if network.hidden {
-            yaml.push_str("          hidden: true\n");
+            if network.hidden {
+                yaml.push_str("          hidden: true\n");
+            }
         }
     }
     Some(yaml)
+}
+
+/// The Wi-Fi interfaces under `root` (`sys/class/net/<name>/wireless` or `phy80211`), sorted.
+pub(crate) fn wifi_interfaces(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(root.join("sys/class/net"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let path = entry.path();
+            path.join("wireless").exists() || path.join("phy80211").exists()
+        })
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| check_interface(name))
+        .collect();
+    names.sort();
+    names
+}
+
+/// An interface name that can't break the file: 1 to 15 characters, no `/`, space or control.
+fn check_interface(name: &str) -> bool {
+    (1..=15).contains(&name.len())
+        && !name
+            .chars()
+            .any(|c| c == '/' || c.is_whitespace() || c.is_control())
 }
 
 /// NetworkManager keyfiles for `networks`: (file name, contents). The SSID is written as its
@@ -461,7 +494,11 @@ pub(crate) fn apply(store: &Store, root: &Path, status: &Path, run: Run<'_>) -> 
 
 fn apply_netplan(networks: &[Network], root: &Path, run: Run<'_>) -> io::Result<()> {
     let path = root.join(NETPLAN_FILE);
-    match netplan(networks) {
+    let interfaces = wifi_interfaces(root);
+    if interfaces.is_empty() && !networks.is_empty() {
+        return Err(io::Error::other("the board has no Wi-Fi interface"));
+    }
+    match netplan(networks, &interfaces) {
         Some(yaml) => {
             let mut bytes = yaml.into_bytes();
             let result = write_private(&path, &bytes);
