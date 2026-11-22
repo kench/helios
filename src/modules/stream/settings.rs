@@ -24,9 +24,10 @@ pub struct StreamSettings {
     /// The GStreamer encoders, for profiles with `encoder = "belacoder"` or `"ceracoder"`.
     pub(crate) belacoder: PathBuf,
     pub(crate) ceracoder: PathBuf,
-    /// `GST_PLUGIN_PATH` for them: where helios-packages' Rockchip plugin is, if not in
-    /// GStreamer's own directory.
-    pub(crate) gst_plugin_path: Option<PathBuf>,
+    /// `GST_PLUGIN_PATH` for them, searched before GStreamer's own directories: where
+    /// helios-packages' `helios-gst-rockchip-rk3588` installs the Rockchip plugin. A directory
+    /// that doesn't exist (a board without it) is skipped; empty sets none.
+    pub(crate) gst_plugin_path: PathBuf,
     /// The stream daemon's control socket (LLD 4, section 15), which Helios connects to.
     pub(crate) control_socket: PathBuf,
     /// Where the daemon keeps the desired state across its restarts.
@@ -83,7 +84,7 @@ impl Default for StreamSettings {
             srtla_send: "/usr/bin/srtla_send".into(),
             belacoder: "/usr/bin/belacoder".into(),
             ceracoder: "/usr/bin/ceracoder".into(),
-            gst_plugin_path: None,
+            gst_plugin_path: "/usr/lib/helios-gst/gstreamer-1.0".into(),
             control_socket: "/run/helios-stream/control.sock".into(),
             state_dir: "/var/lib/helios-stream".into(),
             client_user: "helios".into(),
