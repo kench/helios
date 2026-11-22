@@ -39,6 +39,10 @@ use crate::identity::token::{
     Digest, KeyRef, RawSignature, TokenBackend, TokenError, TokenSummary,
 };
 
+/// How long a stopping manager waits for the signer thread to close the token; a hung token
+/// (a stuck pcscd or YubiKey) is left to the thread after that, so stopping never hangs.
+const SIGNER_CLOSE_WAIT: Duration = Duration::from_secs(5);
+
 /// Where the device certificate comes from (`identity.certificate`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertificateSource {
@@ -588,7 +592,7 @@ impl Manager {
     async fn run(mut self) -> ManagerExit {
         if let Some(setup) = self.bootstrap.take() {
             if let Err(exit) = self.bootstrap(*setup).await {
-                return self.exit(exit);
+                return self.exit(exit).await;
             }
         } else if let Some(label) = self.config.token_label.clone()
             && self
@@ -597,13 +601,13 @@ impl Manager {
                 .await
                 .is_err()
         {
-            return self.exit(ManagerExit::SignerStopped);
+            return self.exit(ManagerExit::SignerStopped).await;
         }
         loop {
             let delay = match self.attempt().await {
-                Attempt::Exit(exit) => return self.exit(exit),
+                Attempt::Exit(exit) => return self.exit(exit).await,
                 Attempt::Failed(Failure::Fatal(reason)) => {
-                    return self.exit(ManagerExit::Fatal(reason));
+                    return self.exit(ManagerExit::Fatal(reason)).await;
                 }
                 Attempt::Failed(Failure::Unavailable { reason, retry }) => {
                     self.set_unavailable(&reason);
@@ -615,7 +619,7 @@ impl Manager {
                 Attempt::Ready => {
                     self.backoff.reset();
                     let lost = tokio::select! {
-                        () = self.cancel.cancelled() => return self.exit(ManagerExit::Cancelled),
+                        () = self.cancel.cancelled() => return self.exit(ManagerExit::Cancelled).await,
                         lost = self.lost.recv() => lost,
                     };
                     let reason = lost.map_or_else(
@@ -629,7 +633,7 @@ impl Manager {
                 }
             };
             tokio::select! {
-                () = self.cancel.cancelled() => return self.exit(ManagerExit::Cancelled),
+                () = self.cancel.cancelled() => return self.exit(ManagerExit::Cancelled).await,
                 () = tokio::time::sleep(delay) => {}
                 () = self.poke.notified() => {}
             }
@@ -804,7 +808,10 @@ impl Manager {
         let _ = self.signer.submit(|backend| backend.close());
     }
 
-    fn exit(self, exit: ManagerExit) -> ManagerExit {
+    /// Stops: reports why, then closes the token and waits (up to [`SIGNER_CLOSE_WAIT`]) for
+    /// the signer thread to finalize the module, so the task ends only once the token is closed
+    /// and whoever awaits it can open the module again.
+    async fn exit(self, exit: ManagerExit) -> ManagerExit {
         self.resolver.set(None);
         match &exit {
             ManagerExit::Fatal(reason) => {
@@ -819,7 +826,16 @@ impl Manager {
             }
             ManagerExit::Cancelled => {}
         }
-        // Dropping the signer handle closes the token and stops the thread.
+        let signer = self.signer;
+        let closed = tokio::task::spawn_blocking(move || signer.shutdown_within(SIGNER_CLOSE_WAIT))
+            .await
+            .unwrap_or(false);
+        if !closed {
+            tracing::warn!(
+                wait_s = SIGNER_CLOSE_WAIT.as_secs(),
+                "the token didn't close in time; leaving it to the signer thread"
+            );
+        }
         exit
     }
 }
