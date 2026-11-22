@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use super::ffmpeg::{self, CameraNodes, ProgressParser};
 use super::process::{self, BoxFuture, Job, JobEvent, JobSpec, Spawner, Tagged};
 use super::settings::StreamSettings;
-use super::{ModuleContext, StreamModule};
+use super::{ModuleContext, StreamModule, v4l2};
 use crate::modules::Module;
 use crate::modules::usb::{UsbDevice, UsbHandle, UsbSnapshot};
 use crate::mqtt::manager::{MqttHandle, Request as MqttRequest};
@@ -444,6 +444,22 @@ fn harness_with(
     refuse: bool,
     addresses: Arc<super::Addresses>,
 ) -> Harness {
+    harness_full(
+        config,
+        encoders,
+        refuse,
+        addresses,
+        Arc::new(|_| Ok(Vec::new())),
+    )
+}
+
+fn harness_full(
+    config: &str,
+    encoders: Option<&[&str]>,
+    refuse: bool,
+    addresses: Arc<super::Addresses>,
+    formats: Arc<super::FormatReader>,
+) -> Harness {
     let usb = UsbHandle::default();
     let (started_tx, started) = mpsc::unbounded_channel();
     let spawner = FakeSpawner {
@@ -452,7 +468,8 @@ fn harness_with(
         refuse: AtomicBool::new(refuse),
     };
     let module =
-        StreamModule::with_fakes(settings(config), usb.clone(), Arc::new(spawner), addresses);
+        StreamModule::with_fakes(settings(config), usb.clone(), Arc::new(spawner), addresses)
+            .with_formats(formats);
     let (mqtt, published, _status) = MqttHandle::for_test();
     let (shadows, reports, _desired) = ShadowHandle::for_test();
     let (commands, commands_rx) = mpsc::channel(4);
@@ -1346,6 +1363,7 @@ ffmpeg = "/opt/ffmpeg"
 enabled = true
 hook_port = HOOK
 stat_url = "http://127.0.0.1:STAT/stat"
+publish_host = "192.168.8.1"
 
 [outputs.main]
 mode = "direct"
@@ -1383,6 +1401,10 @@ fn checks_rtmp_sources_and_their_keys() {
         keys,
         [Some("ingest".to_owned()), Some("ingest-1".to_owned())]
     );
+    for host in ["pocket.local", "[fd00::1]", ""] {
+        let changed = config.replacen("\"192.168.8.1\"", &format!("\"{host}\""), 1);
+        assert_eq!(settings(&changed).rtmp_ingest.publish_host, host);
+    }
     for (from, to, message) in [
         ("camera = 1", "camera = 0", "counts from 1"),
         (
@@ -1401,6 +1423,9 @@ fn checks_rtmp_sources_and_their_keys() {
             "enabled = false",
             "need [modules.stream.rtmp_ingest] enabled",
         ),
+        ("\"192.168.8.1\"", "\"host/live\"", "publish_host"),
+        ("\"192.168.8.1\"", "\"fe80::1\"", "bracketed IPv6"),
+        ("\"192.168.8.1\"", "\"[]\"", "publish_host"),
     ] {
         let error = refused(&config.replacen(from, to, 1));
         assert!(error.contains(message), "{to}: {error}");
@@ -1467,7 +1492,11 @@ fn stat_page(publishing: &[(&str, &str)]) -> String {
     let streams: String = publishing
         .iter()
         .map(|(key, address)| {
-            format!("<stream><name>{key}</name><client><address>{address}</address><publishing/></client></stream>")
+            format!(
+                "<stream><name>{key}</name><meta><video><width>1280</width><height>720</height>\
+                 <codec>H264</codec></video></meta><client><address>{address}</address>\
+                 <time>5000</time><publishing/></client></stream>"
+            )
         })
         .collect();
     format!(
@@ -1551,14 +1580,41 @@ async fn rtmp_streams_follow_the_hook_and_the_statistics_page() {
             .await
             .expect("a report")
             .expect("shadow");
-        if shadow == "stream" && reported["rtmp_ingest"]["publishers"]["ingest-1"].is_object() {
+        // Accepted through the hook first; described once the statistics page lists it.
+        if shadow == "stream"
+            && reported["rtmp_ingest"]["publishers"]["ingest-1"]["video_codec"].is_string()
+        {
             break reported;
         }
     };
     assert_eq!(reported["rtmp_ingest"]["state"], "ok");
+    let publisher = &reported["rtmp_ingest"]["publishers"]["ingest-1"];
+    assert_eq!(publisher["address"], "192.168.8.21");
+    assert_eq!(publisher["video_codec"], "H264");
     assert_eq!(
-        reported["rtmp_ingest"]["publishers"]["ingest-1"]["address"],
-        "192.168.8.21"
+        (&publisher["width"], &publisher["height"]),
+        (&json!(1280), &json!(720))
+    );
+    assert!(
+        publisher["since"]
+            .as_str()
+            .is_some_and(|since| since.ends_with('Z')),
+        "{publisher}"
+    );
+    assert_eq!(publisher["video_kbps"], Value::Null, "nothing measured");
+    // Each key a stream takes is an input, with the URL cameras publish to.
+    let rtmp: Vec<_> = reported["inputs"]
+        .as_array()
+        .expect("inputs")
+        .iter()
+        .filter(|input| input["type"] == "rtmp")
+        .collect();
+    assert_eq!(
+        rtmp,
+        [
+            &json!({"type": "rtmp", "key": "ingest", "publish_url": "rtmp://192.168.8.1:1935/live/ingest"}),
+            &json!({"type": "rtmp", "key": "ingest-1", "publish_url": "rtmp://192.168.8.1:1935/live/ingest-1"}),
+        ]
     );
     assert_eq!(
         reported["streams"]["second"]["source"]["publisher"],
@@ -2265,6 +2321,190 @@ desired = "stopped"
             .as_str()
             .is_some_and(|r| r.starts_with("source: ")),
         "{reported}"
+    );
+    harness.stop().await;
+}
+
+fn usb_device(port: &str, key: Option<&str>, nodes: Value) -> (String, Arc<UsbDevice>) {
+    let payload = json!({
+        "port": port, "key": key, "product": "Device", "manufacturer": "Maker", "nodes": nodes,
+    });
+    (
+        port.to_owned(),
+        Arc::new(UsbDevice {
+            port: port.to_owned(),
+            devpath: format!("/devices/usb1/{port}"),
+            vid: 0x1234,
+            pid: 0x5678,
+            hub: false,
+            payload: payload.as_object().expect("object").clone(),
+            attached_at: SystemTime::now(),
+        }),
+    )
+}
+
+/// Waits for a stream shadow report that `ready` accepts.
+async fn report_matching(harness: &mut Harness, ready: impl Fn(&Value) -> bool) -> Value {
+    loop {
+        let (shadow, reported) = tokio::time::timeout(WAIT, harness.reports.recv())
+            .await
+            .expect("a report in time")
+            .expect("shadow");
+        let reported = Value::Object(reported);
+        if shadow == "stream" && ready(&reported) {
+            return reported;
+        }
+    }
+}
+
+fn mjpeg(width: u32, height: u32) -> v4l2::Format {
+    v4l2::Format {
+        pixel_format: "mjpeg".into(),
+        width,
+        height,
+        fps: vec![30.0, 15.0],
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reports_inputs_with_camera_formats_and_profiles() {
+    let read = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reads = Arc::clone(&read);
+    let formats: Arc<super::FormatReader> = Arc::new(move |path: &std::path::Path| {
+        reads.lock().expect("reads").push(path.to_owned());
+        if path.ends_with("video7") {
+            return Err(std::io::Error::from_raw_os_error(libc::ENODEV));
+        }
+        Ok(vec![mjpeg(1920, 1080), mjpeg(1280, 720)])
+    });
+    let mut harness = harness_full(CONFIG, None, false, Arc::new(|| Ok(Vec::new())), formats);
+    let reported = report_matching(&mut harness, |r| r["inputs"].is_array()).await;
+    assert_eq!(
+        reported["inputs"],
+        json!([{"type": "test"}]),
+        "nothing attached"
+    );
+    assert_eq!(
+        reported["profiles"],
+        json!({"cam": {
+            "video": "libx264", "encoder": "ffmpeg", "bitrate_mode": "fixed",
+            "bitrate_kbps": 4000, "min_bitrate_kbps": 1000, "max_bitrate_kbps": 8000,
+            "scale": "1280x720", "audio": "aac",
+        }})
+    );
+
+    let video = |name: &str| json!({"video": [{"name": name, "index": 0}], "alsa": []});
+    let mic = json!({"alsa": [{"card": 2, "capture": true}]});
+    harness.usb.set_for_test(UsbSnapshot::from([
+        camera("1-1.3", true),
+        // Two of the same model: their key doesn't tell them apart, so their port does.
+        usb_device("1-1.4", Some("1234:5678:SAME"), video("video5")),
+        usb_device("1-1.5", Some("1234:5678:SAME"), video("video7")),
+        usb_device("1-1.6", None, mic),
+        // Neither a camera nor audio: not an input.
+        usb_device("1-1.7", Some("1234:5678:DISK"), json!({})),
+    ]));
+    let reported = report_matching(&mut harness, |r| {
+        r["inputs"][0]["formats"].is_array() && r["inputs"][1]["formats"].is_array()
+    })
+    .await;
+    let formats = json!([
+        {"pixel_format": "mjpeg", "width": 1920, "height": 1080, "fps": [30.0, 15.0]},
+        {"pixel_format": "mjpeg", "width": 1280, "height": 720, "fps": [30.0, 15.0]},
+    ]);
+    assert_eq!(
+        reported["inputs"],
+        json!([
+            {"type": "camera", "selector": "0bda:5830:CAM1", "port": "1-1.3", "product": "Webcam",
+             "manufacturer": null, "has_audio": true, "formats": formats},
+            {"type": "camera", "selector": "usb:1-1.4", "port": "1-1.4", "product": "Device",
+             "manufacturer": "Maker", "has_audio": false, "formats": formats},
+            // Its formats couldn't be read: none reported.
+            {"type": "camera", "selector": "usb:1-1.5", "port": "1-1.5", "product": "Device",
+             "manufacturer": "Maker", "has_audio": false},
+            {"type": "audio", "selector": "usb:1-1.6", "port": "1-1.6", "product": "Device",
+             "manufacturer": "Maker"},
+            {"type": "test"},
+        ])
+    );
+    // Each camera is read once, at its capture node, not again for later reports.
+    for _ in 0..100 {
+        if read.lock().expect("reads").len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut paths = read.lock().expect("reads").clone();
+    paths.sort();
+    assert_eq!(
+        paths,
+        ["/dev/video2", "/dev/video5", "/dev/video7"].map(std::path::PathBuf::from)
+    );
+
+    // Unplugged: gone from the inputs, and read again when it comes back.
+    harness.unplug();
+    report_matching(&mut harness, |r| r["inputs"] == json!([{"type": "test"}])).await;
+    harness.plug(false);
+    report_matching(&mut harness, |r| r["inputs"][0]["formats"].is_array()).await;
+    assert_eq!(read.lock().expect("reads").len(), 4);
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn leaves_formats_out_when_the_shadow_would_be_too_large() {
+    let (read_tx, mut read_rx) = mpsc::unbounded_channel();
+    let formats: Arc<super::FormatReader> = Arc::new(move |_: &std::path::Path| {
+        let _ = read_tx.send(());
+        Ok((0..200).map(|n| mjpeg(640 + n, 480)).collect())
+    });
+    let mut harness = harness_full(CONFIG, None, false, Arc::new(|| Ok(Vec::new())), formats);
+    harness.plug(true);
+    tokio::time::timeout(WAIT, read_rx.recv())
+        .await
+        .expect("read")
+        .expect("reader");
+    let job = harness.next_start().await;
+    job.progress(1_000_000);
+    job.progress(3_000_000);
+    // The camera goes live; by then the formats have long arrived, and no report has them.
+    let mut reports = Vec::new();
+    loop {
+        let (shadow, reported) = tokio::time::timeout(WAIT, harness.reports.recv())
+            .await
+            .expect("a report in time")
+            .expect("shadow");
+        if shadow != "stream" {
+            continue;
+        }
+        let live = reported["streams"]["camera"]["state"] == "live";
+        reports.push(Value::Object(reported));
+        if live {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    while let Ok((shadow, reported)) = harness.reports.try_recv() {
+        if shadow == "stream" {
+            reports.push(Value::Object(reported));
+        }
+    }
+    assert!(
+        reports
+            .iter()
+            .all(|r| r["inputs"][0]["type"] == "camera" || r["inputs"][0]["type"] == "test")
+    );
+    assert!(
+        reports
+            .iter()
+            .all(|r| r["inputs"][0].get("formats").is_none()),
+        "formats sent: {:?}",
+        reports.last()
+    );
+    let last = reports.last().expect("a report");
+    assert!(
+        last.to_string().len() < super::REPORT_BUDGET,
+        "{}",
+        last.to_string().len()
     );
     harness.stop().await;
 }

@@ -67,6 +67,9 @@ pub struct RtmpIngest {
     pub(crate) hook_port: u16,
     /// The RTMP module's statistics page, read at start and every 30 s.
     pub(crate) stat_url: String,
+    /// The host name or address cameras publish to (`192.168.8.1`), for each key's
+    /// `publish_url` in the shadow; empty leaves the URLs out.
+    pub(crate) publish_host: String,
 }
 
 impl Default for RtmpIngest {
@@ -76,6 +79,7 @@ impl Default for RtmpIngest {
             port: 1935,
             hook_port: 1936,
             stat_url: "http://127.0.0.1:1937/stat".into(),
+            publish_host: String::new(),
         }
     }
 }
@@ -296,6 +300,23 @@ impl StreamSettings {
             return Err(
                 "modules.stream.rtmp_ingest: port and hook_port must be distinct, and stat_url \
                  an http://127.0.0.1:<port>/... URL"
+                    .into(),
+            );
+        }
+        let host = &ingest.publish_host;
+        let bracketed = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+        let plain = |h: &str| {
+            h.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        };
+        let host_ok = match bracketed {
+            Some(v6) => !v6.is_empty() && v6.bytes().all(|b| b.is_ascii_hexdigit() || b == b':'),
+            None => host.len() <= 253 && plain(host),
+        };
+        if !host_ok {
+            return Err(
+                "modules.stream.rtmp_ingest.publish_host must be a host name, an IPv4 address or \
+                 a bracketed IPv6 address"
                     .into(),
             );
         }

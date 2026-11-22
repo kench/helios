@@ -4,8 +4,10 @@
 //! Modules hand it their whole reported state with [`ShadowHandle::report`]. It sends that
 //! snapshot after every connect and whenever it changes: at most one update per shadow a second,
 //! and one at a time per shadow (until `accepted`, `rejected` or a timeout). After connecting it
-//! also sends `get` for each shadow. The reply's `reported` keys tell it which fields a module
-//! no longer reports, and those are set to `null` in the next update, which removes them. The
+//! also sends `get` for each shadow. The reply's `reported` state tells it which fields a module
+//! no longer reports, and those are set to `null` in the next update, which removes them. That
+//! goes for nested keys too (`streams.<id>`), since the service merges an update into what it
+//! holds and keeps a nested key until it's set to `null`. The
 //! reply's `desired` state, and every later `update/delta`, go to the module if it asked for
 //! them with [`ShadowHandle::desired`].
 
@@ -155,15 +157,15 @@ struct InFlight {
     /// When it was sent, by the device clock, for clock checks.
     sent_at: SystemTime,
     /// The stale keys it set to `null`; once accepted, they're gone from the shadow.
-    nulls: Vec<String>,
+    nulls: Vec<Path>,
 }
 
 #[derive(Debug, Default)]
 struct Shadow {
     /// The module's latest snapshot.
     reported: Map<String, Value>,
-    /// Keys the service holds that the snapshot no longer has: sent as `null`.
-    stale: Vec<String>,
+    /// Keys the service holds that the snapshot no longer has, by path: sent as `null`.
+    stale: Vec<Path>,
     /// Whether the snapshot hasn't been sent since it changed (or since connecting).
     dirty: bool,
     /// The update waiting for a reply.
@@ -238,12 +240,14 @@ impl Manager {
                 let entry = self.shadows.entry(shadow.clone()).or_default();
                 let first = entry.reported.is_empty() && entry.last_sent.is_none();
                 // A key reported before and gone now must be removed from the shadow.
-                for key in entry.reported.keys() {
-                    if !reported.contains_key(key) && !entry.stale.contains(key) {
-                        entry.stale.push(key.clone());
+                let mut gone = Vec::new();
+                missing(&entry.reported, &reported, &mut Vec::new(), &mut gone);
+                for path in gone {
+                    if !entry.stale.contains(&path) {
+                        entry.stale.push(path);
                     }
                 }
-                entry.stale.retain(|key| !reported.contains_key(key));
+                entry.stale.retain(|path| still_stale(&reported, path));
                 if entry.reported != reported || first {
                     entry.reported = reported;
                     entry.dirty = true;
@@ -287,7 +291,7 @@ impl Manager {
             ("update", "accepted") if ours => {
                 if let Some(in_flight) = shadow.in_flight.take() {
                     // Only the keys this update removed: others may have gone stale since.
-                    shadow.stale.retain(|key| !in_flight.nulls.contains(key));
+                    shadow.stale.retain(|path| !in_flight.nulls.contains(path));
                     if let Some(seconds) = document["timestamp"].as_u64() {
                         self.clock.offer(Sample {
                             source: Source::Shadow,
@@ -315,9 +319,11 @@ impl Manager {
             }
             ("get", "accepted") => {
                 if let Some(reported) = document["state"]["reported"].as_object() {
-                    for key in reported.keys() {
-                        if !shadow.reported.contains_key(key) && !shadow.stale.contains(key) {
-                            shadow.stale.push(key.clone());
+                    let mut gone = Vec::new();
+                    missing(reported, &shadow.reported, &mut Vec::new(), &mut gone);
+                    for path in gone {
+                        if !shadow.stale.contains(&path) {
+                            shadow.stale.push(path);
                             shadow.dirty = true;
                         }
                     }
@@ -360,8 +366,8 @@ impl Manager {
                 continue;
             }
             let mut reported = shadow.reported.clone();
-            for key in &shadow.stale {
-                reported.insert(key.clone(), Value::Null);
+            for path in &shadow.stale {
+                set_null(&mut reported, path);
             }
             let sent_at = SystemTime::now();
             let token = crate::ulid::new(sent_at);
@@ -441,6 +447,60 @@ impl ShadowHandle {
 }
 
 /// `$aws/things/<thing>/shadow/name/<name>`.
+/// A key in a reported document: top-level first, then each nested object's key.
+type Path = Vec<String>;
+
+/// Collects into `gone` the paths of keys in `held` that `now` no longer has, where both hold an
+/// object at the parent path. Below a key that went altogether, nothing more is collected: the
+/// `null` for it removes everything under it.
+fn missing(
+    held: &Map<String, Value>,
+    now: &Map<String, Value>,
+    at: &mut Path,
+    gone: &mut Vec<Path>,
+) {
+    for (key, value) in held {
+        at.push(key.clone());
+        match (value, now.get(key)) {
+            (_, None) => gone.push(at.clone()),
+            (Value::Object(held), Some(Value::Object(now))) => missing(held, now, at, gone),
+            _ => {}
+        }
+        at.pop();
+    }
+}
+
+/// Whether `path` still needs a `null`: its parent is still an object in `reported` (otherwise
+/// the parent's own value replaces it) and that object doesn't have the key.
+fn still_stale(reported: &Map<String, Value>, path: &[String]) -> bool {
+    let Some((key, parents)) = path.split_last() else {
+        return false;
+    };
+    let mut object = reported;
+    for parent in parents {
+        match object.get(parent) {
+            Some(Value::Object(inner)) => object = inner,
+            _ => return false,
+        }
+    }
+    !object.contains_key(key)
+}
+
+/// Sets `path` to `null` in `reported`, if its parent is an object there.
+fn set_null(reported: &mut Map<String, Value>, path: &[String]) {
+    let Some((key, parents)) = path.split_last() else {
+        return;
+    };
+    let mut object = reported;
+    for parent in parents {
+        match object.get_mut(parent) {
+            Some(Value::Object(inner)) => object = inner,
+            _ => return,
+        }
+    }
+    object.entry(key.clone()).or_insert(Value::Null);
+}
+
 fn base(thing: &str, name: &str) -> String {
     format!("$aws/things/{thing}/shadow/name/{name}")
 }

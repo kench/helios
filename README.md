@@ -112,6 +112,16 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   else `srtla_uplinks`. Each stream reports the `destination` in use and its `overrides`, which
   the daemon saves with the rest of the desired state.
 
+  So the Control API can offer only what's there, the shadow also has `profiles` (each one's
+  encoder, bitrates, scale and audio) and `inputs`: the attached USB cameras (selector, port,
+  product, whether they record audio, and their capture `formats`: pixel format in ffmpeg's
+  names, size and frame rates, read once per camera over V4L2), USB audio devices, the RTMP keys
+  (`ingest` and every key a stream takes, with `publish_url` when
+  `rtmp_ingest.publish_host` is set) and the test pattern. Each RTMP publisher has its
+  `address`, `since`, `video_codec`, `width`, `height` and `video_kbps`. A report that would
+  come near AWS IoT's 8 KB leaves the cameras' formats out. Keys that go from the snapshot,
+  nested ones too, are set to `null`, so the shadow doesn't keep stale publishers or streams.
+
   Streams run in the stream daemon, `helios stream-daemon` (`helios-stream.service`, user
   `helios-stream`), so they keep going while Helios restarts or is upgraded; Helios's `stream`
   module is its client over `/run/helios-stream/control.sock` (JSON-RPC lines). The daemon saves

@@ -71,7 +71,10 @@ version rather than moving the tag.
 - `unsafe_code = "deny"`. The approved exceptions: the read-only `adjtimex` call in
   `src/clock/kernel.rs`, and registering owned descriptors with tokio
   (`AsyncFd::register_with_interest`) in `src/modules/usb/uevent.rs` and `mounts.rs`, since tokio
-  deprecated its safe-looking constructors as unsound. Any other `unsafe` needs the owner's OK.
+  deprecated its safe-looking constructors as unsound, and the three read-only V4L2 enumerate
+  ioctls (`VIDIOC_ENUM_FMT`, `_FRAMESIZES`, `_FRAMEINTERVALS`) in
+  `src/modules/stream/v4l2.rs`, since rustix has no safe wrappers (owner, 2026-11-22). Any other
+  `unsafe` needs the owner's OK.
   Prefer safe crates (`rustix`).
 - `unwrap_used` is denied. Document errors and panics on public items; keep 90% line coverage.
 - Never log or print PINs, and never put them in process arguments.

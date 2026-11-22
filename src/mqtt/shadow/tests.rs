@@ -248,6 +248,102 @@ async fn removes_fields_an_earlier_run_left() {
 }
 
 #[tokio::test]
+async fn removes_nested_fields_that_are_no_longer_reported() {
+    let mut setup = setup();
+    connect(&setup, 1);
+    let both = json!({"ingest": {"publishers": {"a": {"address": "x"}, "b": {"address": "y"}}}});
+    setup.shadows.report("helios", map(both));
+    let first = next_update(&mut setup).await;
+    reply(
+        &setup,
+        "update/accepted",
+        json!({"clientToken": first["clientToken"]}),
+    )
+    .await;
+
+    setup.shadows.report(
+        "helios",
+        map(json!({"ingest": {"publishers": {"a": {"address": "x"}}}})),
+    );
+    let second = next_update(&mut setup).await;
+
+    assert_eq!(
+        second["state"]["reported"],
+        json!({"ingest": {"publishers": {"a": {"address": "x"}, "b": null}}})
+    );
+    reply(
+        &setup,
+        "update/accepted",
+        json!({"clientToken": second["clientToken"]}),
+    )
+    .await;
+    // b came back: no null for it any more; and a's whole object going takes one null.
+    setup.shadows.report(
+        "helios",
+        map(json!({"ingest": {"publishers": {"b": {"address": "z"}}}})),
+    );
+    let third = next_update(&mut setup).await;
+    assert_eq!(
+        third["state"]["reported"],
+        json!({"ingest": {"publishers": {"a": null, "b": {"address": "z"}}}})
+    );
+}
+
+#[tokio::test]
+async fn a_nested_null_gives_way_to_a_new_value_of_another_kind() {
+    let mut setup = setup();
+    connect(&setup, 1);
+    setup
+        .shadows
+        .report("helios", map(json!({"ingest": {"publishers": {"a": 1}}})));
+    let first = next_update(&mut setup).await;
+    reply(
+        &setup,
+        "update/accepted",
+        json!({"clientToken": first["clientToken"]}),
+    )
+    .await;
+
+    // The parent stops being an object: its own value replaces everything under it.
+    setup.shadows.report("helios", map(json!({"ingest": null})));
+    let second = next_update(&mut setup).await;
+
+    assert_eq!(second["state"]["reported"], json!({"ingest": null}));
+}
+
+#[tokio::test]
+async fn removes_nested_fields_an_earlier_run_left() {
+    let mut setup = setup();
+    connect(&setup, 1);
+    setup.shadows.report(
+        "helios",
+        map(json!({"streams": {"now": {"state": "live"}}})),
+    );
+    let first = next_update(&mut setup).await;
+    reply(
+        &setup,
+        "update/accepted",
+        json!({"clientToken": first["clientToken"]}),
+    )
+    .await;
+
+    reply(
+        &setup,
+        "get/accepted",
+        json!({"state": {"reported": {"streams": {
+            "now": {"state": "stopped", "old_field": 1}, "old": {"state": "live"}
+        }}}}),
+    )
+    .await;
+    let second = next_update(&mut setup).await;
+
+    assert_eq!(
+        second["state"]["reported"],
+        json!({"streams": {"now": {"state": "live", "old_field": null}, "old": null}})
+    );
+}
+
+#[tokio::test]
 async fn a_rejected_update_waits_for_the_next_change() {
     let mut setup = setup();
     connect(&setup, 1);
