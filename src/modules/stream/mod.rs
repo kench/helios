@@ -72,6 +72,15 @@ const ENCODER_REPORT: Duration = Duration::from_secs(60);
 /// yet (nginx asks before it lists the publisher).
 const PUBLISH_GRACE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
 
+/// What a command or the desired state does to a stream's bitrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitrateChange {
+    Keep,
+    /// Back to the profile's bitrate.
+    Profile,
+    Override(u32),
+}
+
 /// A camera publishing to `rtmp-ingest`.
 #[derive(Debug, Clone)]
 struct Publisher {
@@ -180,7 +189,11 @@ struct Entry {
     id: String,
     config: Stream,
     desired_live: bool,
+    /// The bitrate in use: the override if there is one, else the profile's.
     bitrate_kbps: u32,
+    /// A bitrate set by `stream.start` or the desired state, which outlasts restarts; `None`
+    /// follows the profile, so a changed `bitrate_kbps` in the config applies.
+    bitrate_override: Option<u32>,
     state: State,
     since: SystemTime,
     nodes: Option<CameraNodes>,
@@ -237,6 +250,7 @@ impl Entry {
             "source": source,
             "profile": self.config.profile,
             "bitrate_kbps": self.bitrate_kbps,
+            "bitrate_override_kbps": self.bitrate_override,
             "encoder": self.encoder(),
             "output": self.config.output,
             "last_error": self.last_error.as_ref().or(self.unusable.as_ref()),
@@ -280,6 +294,7 @@ impl<'a> Streams<'a> {
                     .profiles
                     .get(&config.profile)
                     .map_or(0, |profile| profile.bitrate_kbps),
+                bitrate_override: None,
                 config: config.clone(),
                 state: State::Stopped,
                 since: SystemTime::now(),
@@ -371,7 +386,9 @@ impl<'a> Streams<'a> {
                 }
             }
             IngestEvent::Publishers(Ok(found)) => {
-                self.ingest.last_error = None;
+                if self.ingest.last_error.take().is_some() {
+                    tracing::info!("rtmp-ingest: nginx's statistics page reads again");
+                }
                 let recent = |publisher: &Publisher| {
                     publisher
                         .accepted
@@ -857,22 +874,16 @@ impl<'a> Streams<'a> {
         let Some(index) = self.entries.iter().position(|entry| entry.id == id) else {
             return Outcome::error(codes::INVALID_MESSAGE, format!("no stream {id:?}"));
         };
-        let bitrate = match args.get("bitrate_kbps") {
-            None | Some(Value::Null) => None,
-            Some(value) => match value.as_u64().and_then(|v| u32::try_from(v).ok()) {
-                Some(bitrate) if self.bitrate_allowed(index, bitrate) => Some(bitrate),
-                _ => {
-                    return Outcome::error(
-                        codes::INVALID_MESSAGE,
-                        "bitrate_kbps is outside the profile's limits",
-                    );
-                }
-            },
+        let Ok(bitrate) = self.bitrate_change(index, args.get("bitrate_kbps")) else {
+            return Outcome::error(
+                codes::INVALID_MESSAGE,
+                "bitrate_kbps is outside the profile's limits",
+            );
         };
         if name == "start" {
             self.set_live(index, true, bitrate);
         } else {
-            self.set_live(index, false, None);
+            self.set_live(index, false, BitrateChange::Keep);
         }
         Outcome::Ok(self.entries[index].status(false))
     }
@@ -888,9 +899,36 @@ impl<'a> Streams<'a> {
             })
     }
 
+    /// What a `bitrate_kbps` value asks for: absent, no change; `null` or the profile's own
+    /// bitrate, back to the profile; another value within the profile's limits, an override.
+    fn bitrate_change(&self, index: usize, value: Option<&Value>) -> Result<BitrateChange, ()> {
+        let profile = self
+            .module
+            .settings
+            .profiles
+            .get(&self.entries[index].config.profile);
+        match value {
+            None => Ok(BitrateChange::Keep),
+            Some(Value::Null) => Ok(BitrateChange::Profile),
+            Some(value) => {
+                let bitrate = value
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or(())?;
+                if profile.is_some_and(|profile| profile.bitrate_kbps == bitrate) {
+                    Ok(BitrateChange::Profile)
+                } else if self.bitrate_allowed(index, bitrate) {
+                    Ok(BitrateChange::Override(bitrate))
+                } else {
+                    Err(())
+                }
+            }
+        }
+    }
+
     /// The desired state from a command or the shadow. Starting a failed stream gives it a new
     /// chance; a new bitrate restarts a running job.
-    fn set_live(&mut self, index: usize, live: bool, bitrate: Option<u32>) {
+    fn set_live(&mut self, index: usize, live: bool, bitrate: BitrateChange) {
         let entry = &mut self.entries[index];
         entry.desired_live = live;
         if live && entry.state == State::Failed && entry.unusable.is_none() {
@@ -899,15 +937,27 @@ impl<'a> Streams<'a> {
             entry.backoff.reset();
             entry.set_state(State::Stopped);
         }
-        if let Some(bitrate) = bitrate
-            && bitrate != entry.bitrate_kbps
-        {
+        let profile_kbps = self
+            .module
+            .settings
+            .profiles
+            .get(&entry.config.profile)
+            .map_or(entry.bitrate_kbps, |profile| profile.bitrate_kbps);
+        entry.bitrate_override = match bitrate {
+            BitrateChange::Keep => return,
+            BitrateChange::Profile => None,
+            BitrateChange::Override(bitrate) => Some(bitrate),
+        };
+        let bitrate = entry.bitrate_override.unwrap_or(profile_kbps);
+        if bitrate != entry.bitrate_kbps {
             entry.bitrate_kbps = bitrate;
             self.stop_job(index);
         }
     }
 
-    /// The `stream` shadow's desired state: `{"streams": {"<id>": {"state", "bitrate_kbps"}}}`.
+    /// The `stream` shadow's desired state: `{"streams": {"<id>": {"state", "bitrate_kbps"}}}`,
+    /// `bitrate_kbps` being an override (`null` for the profile's). A bitrate outside the
+    /// profile's limits is ignored.
     fn desired(&mut self, state: &Value) {
         let Some(streams) = state.get("streams").and_then(Value::as_object) else {
             return;
@@ -917,15 +967,16 @@ impl<'a> Streams<'a> {
                 tracing::warn!(stream = %id, "desired state for an unknown stream");
                 continue;
             };
-            let bitrate = desired
-                .get("bitrate_kbps")
-                .and_then(Value::as_u64)
-                .and_then(|v| u32::try_from(v).ok())
-                .filter(|bitrate| self.bitrate_allowed(index, *bitrate));
+            let bitrate = self
+                .bitrate_change(index, desired.get("bitrate_kbps"))
+                .unwrap_or_else(|()| {
+                    tracing::warn!(stream = %id, "desired bitrate_kbps outside the profile's limits");
+                    BitrateChange::Keep
+                });
             match desired.get("state").and_then(Value::as_str) {
                 Some("live") => self.set_live(index, true, bitrate),
-                Some("stopped") => self.set_live(index, false, None),
-                _ if bitrate.is_some() => {
+                Some("stopped") => self.set_live(index, false, bitrate),
+                _ if bitrate != BitrateChange::Keep => {
                     let live = self.entries[index].desired_live;
                     self.set_live(index, live, bitrate);
                 }

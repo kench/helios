@@ -729,6 +729,87 @@ async fn commands_stop_start_and_change_the_bitrate() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_bitrate_override_is_kept_apart_from_the_profiles() {
+    let mut harness = harness(CONFIG, None, false);
+    harness.plug(true);
+    assert!(
+        harness
+            .next_start()
+            .await
+            .spec
+            .args
+            .join(" ")
+            .contains("-b:v 4000k")
+    );
+    let live = harness.state("starting").await;
+    assert_eq!(live["bitrate_kbps"], 4000);
+    assert_eq!(live["bitrate_override_kbps"], Value::Null);
+
+    // The profile's own bitrate (as an old saved state held it) is no override: nothing restarts.
+    harness
+        .desired
+        .send(json!({"streams": {"camera": {"state": "live", "bitrate_kbps": 4000}}}))
+        .expect("module running");
+    // An override restarts the job with it, and is reported as one.
+    harness
+        .desired
+        .send(json!({"streams": {"camera": {"state": "live", "bitrate_kbps": 2500}}}))
+        .expect("module running");
+    assert!(
+        harness
+            .next_start()
+            .await
+            .spec
+            .args
+            .join(" ")
+            .contains("-b:v 2500k")
+    );
+    let overridden = loop {
+        let status = harness.state("starting").await;
+        if status["bitrate_override_kbps"] == 2500 {
+            break status;
+        }
+    };
+    assert_eq!(overridden["bitrate_kbps"], 2500);
+
+    // null goes back to the profile's.
+    let outcome = harness
+        .command(
+            "start",
+            json!({"stream_id": "camera", "bitrate_kbps": null}),
+        )
+        .await;
+    let Outcome::Ok(status) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(status["bitrate_kbps"], 4000);
+    assert_eq!(status["bitrate_override_kbps"], Value::Null);
+    assert!(
+        harness
+            .next_start()
+            .await
+            .spec
+            .args
+            .join(" ")
+            .contains("-b:v 4000k")
+    );
+    // A value outside the profile's limits is ignored, not applied.
+    harness
+        .desired
+        .send(json!({"streams": {"camera": {"bitrate_kbps": 99_999}}}))
+        .expect("module running");
+    let Outcome::Ok(status) = harness
+        .command("status", json!({"stream_id": "camera"}))
+        .await
+    else {
+        panic!("status");
+    };
+    assert_eq!(status["bitrate_kbps"], 4000);
+    assert_eq!(status["bitrate_override_kbps"], Value::Null);
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn follows_the_shadows_desired_state() {
     let mut harness = harness(CONFIG, None, false);
     harness.plug(true);

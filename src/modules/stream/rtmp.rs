@@ -7,9 +7,9 @@
 //!   publish (200) if its key belongs to a stream and isn't already publishing, or refuses it (403,
 //!   and nginx drops the camera). No token: the hook is on loopback, and local processes are
 //!   trusted (owner, 2026-11-21).
-//! - **The statistics page:** at start and every 30 s the daemon reads nginx's `rtmp_stat`, so it
-//!   learns about cameras already publishing when it (re)starts, and notices a `publish_done` it
-//!   missed.
+//! - **The statistics page:** at start and every 30 s (2 s after a failure) the daemon reads
+//!   nginx's `rtmp_stat`, so it learns about cameras already publishing when it (re)starts, and
+//!   notices a `publish_done` it missed.
 //!
 //! nginx's requests are small and fixed, so the HTTP here is a minimal HTTP/1.x parser over a
 //! loopback socket rather than a server library.
@@ -24,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 
 /// How often the statistics page is read (a second in tests, which run on real sockets).
 const STAT_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
+/// How soon a failed read is tried again: at boot the daemon starts before nginx listens.
+const STAT_RETRY: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 2 });
 /// How long one hook request or statistics read may take.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The largest hook request and statistics page read.
@@ -58,16 +60,19 @@ pub(crate) async fn run(
 ) {
     let hook = serve_hook(hook_port, events.clone(), cancel.clone());
     let stats = async {
-        let mut tick = tokio::time::interval(STAT_INTERVAL);
         loop {
+            let publishers = read_stat(&stat_url).await;
+            let wait = if publishers.is_ok() {
+                STAT_INTERVAL
+            } else {
+                STAT_RETRY
+            };
+            if events.send(IngestEvent::Publishers(publishers)).is_err() {
+                return;
+            }
             tokio::select! {
                 () = cancel.cancelled() => return,
-                _ = tick.tick() => {
-                    let publishers = read_stat(&stat_url).await;
-                    if events.send(IngestEvent::Publishers(publishers)).is_err() {
-                        return;
-                    }
-                }
+                () = tokio::time::sleep(wait) => {}
             }
         }
     };
