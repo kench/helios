@@ -151,6 +151,20 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   `helios net list` prints the same snapshot. `tests/net.rs` checks it against a real kernel
   in a user network namespace (`unshare -rn`).
 
+  Wi-Fi networks (LLD 3, section 10): `net.wifi.set` (`ssid`, `passphrase` for WPA-Personal or
+  none for an open network, `hidden`), `net.wifi.remove` and `net.wifi.list` commands (the
+  Control API's `SetWifiNetwork` and `DeleteWifiNetwork` send the first two), and locally
+  `helios wifi add|remove|list` (the passphrase is asked for without echo, or read with
+  `--passphrase-file`, never taken as an argument). Helios keeps them in
+  `/var/lib/helios/wifi/networks.json` (0600); `helios-wifi.path` then starts
+  `helios-wifi.service`, which runs `helios wifi-apply` as root: it writes its own
+  `/etc/netplan/60-helios-wifi.yaml` and runs `netplan apply`, or `helios-wifi-NN.nmconnection`
+  keyfiles and `nmcli connection reload` where NetworkManager runs, and records the result in
+  `/var/lib/helios-wifi/status.json`. The net shadow's `wifi` has the networks (never
+  passphrases) and that result. At most 16 networks; no priorities yet (netplan has none).
+  Passphrases are never logged or reported, and a command's `Debug` leaves out its arguments.
+  The package enables `helios-wifi.path` on a device that has Helios enabled.
+
 The other modules come later.
 
 `dist/helios.toml` is an example config. With the bootstrap service it needs only the module

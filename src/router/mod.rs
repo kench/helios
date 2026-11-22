@@ -35,8 +35,9 @@ pub mod codes {
     pub const INTERNAL: &str = "INTERNAL";
 }
 
-/// A command as modules see it, whichever transport carried it.
-#[derive(Debug, Clone, PartialEq)]
+/// A command as modules see it, whichever transport carried it. Its `Debug` leaves out the
+/// arguments, which can hold secrets (a Wi-Fi passphrase).
+#[derive(Clone, PartialEq)]
 pub struct Command {
     /// The envelope `id`, or the AWS IoT execution ID.
     pub id: String,
@@ -48,6 +49,18 @@ pub struct Command {
     pub args: Value,
     /// When the sender stops waiting, if it said.
     pub deadline: Option<SystemTime>,
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Command")
+            .field("id", &self.id)
+            .field("module", &self.module)
+            .field("name", &self.name)
+            .field("args", &format_args!(".."))
+            .field("deadline", &self.deadline)
+            .finish()
+    }
 }
 
 /// How a command ended.
@@ -164,7 +177,14 @@ impl PendingCommand {
     }
 
     /// A command for module tests, with the channel its answer arrives on.
-    #[cfg(all(test, any(feature = "module-display", feature = "module-usb")))]
+    #[cfg(all(
+        test,
+        any(
+            feature = "module-display",
+            feature = "module-usb",
+            feature = "module-net"
+        )
+    ))]
     pub(crate) fn for_test(
         module: &str,
         name: &str,

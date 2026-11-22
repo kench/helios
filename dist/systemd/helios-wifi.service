@@ -1,0 +1,23 @@
+# Helios Wi-Fi: renders Helios's Wi-Fi networks for the board's network configuration and applies
+# them (LLD 3, section 10): its own /etc/netplan/60-helios-wifi.yaml then `netplan apply`, or
+# helios-wifi-NN.nmconnection keyfiles then `nmcli connection reload`. It writes only those files,
+# so removing them reverts it. Started by helios-wifi.path; records what it did in
+# /var/lib/helios-wifi/status.json, which Helios reports in the net shadow.
+
+[Unit]
+Description=Apply Helios's Wi-Fi networks
+After=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/helios wifi-apply
+StateDirectory=helios-wifi
+# Files holding passphrases are written 0600; the status file is meant to be read by Helios.
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+LimitCORE=0

@@ -376,3 +376,18 @@ fn outcome_error_builds_a_failure() {
         }
     );
 }
+
+#[test]
+fn a_commands_debug_leaves_out_its_arguments() {
+    let command = super::Command {
+        id: "c1".into(),
+        module: "net".into(),
+        name: "net.wifi.set".into(),
+        args: serde_json::json!({"ssid": "Home", "passphrase": "correct horse battery"}),
+        deadline: None,
+    };
+    let shown = format!("{command:?}");
+    assert!(shown.contains("net.wifi.set"), "{shown}");
+    assert!(!shown.contains("horse"), "{shown}");
+    assert!(!shown.contains("Home"), "{shown}");
+}
