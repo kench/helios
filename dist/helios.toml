@@ -63,6 +63,42 @@ ignore = []                      # "vid:pid" or ports ("1-1.2"): tracked, not re
 max_events_per_port = 20         # attachments a minute before a port counts as flapping
 mp_sd_mount = "/init/efad/mp_sd" # scanner: where the platform mounts the PROXdongl3 drive
 
+[modules.stream]
+# Video streams through ffmpeg to SRT listeners (LLD 4): directly, or bonded over several uplinks
+# by srtla_send. Needs a build with the module-stream Cargo feature and [modules.usb] for
+# cameras. Commands: stream.start, stream.stop, stream.status. No streams are configured here.
+enabled = false
+ffmpeg = "/usr/lib/helios-ffmpeg/bin/ffmpeg"
+srtla_send = "/usr/bin/srtla_send"
+runtime_dir = "/run/helios"        # senders' IP files and control sockets go in <runtime_dir>/srtla
+srtla_port_base = 6000             # srtla outputs get local ports from here, in name order
+sender_idle_s = 60                 # 1 to 3600: how long a sender outlives its last stream
+stats_interval_s = 30              # 5 to 3600: stream.stats while live
+
+# [modules.stream.outputs.bonded]
+# mode = "srtla"                   # srtla (to srtla_rec) or direct (to an SRT listener)
+# host = "ingest.example.com"
+# port = 5000
+# latency_ms = 2000
+# uplinks = ["usb:ethernet", "usb:cellular"]  # usb categories or interface names
+# passphrase = "…"                 # 10 to 79 characters; SRT URLs aren't secrets
+#
+# [modules.stream.profiles.hevc]
+# video = "hevc_rkmpp"             # copy, libx264, libx265, h264_rkmpp, hevc_rkmpp, h264_v4l2m2m
+# bitrate_kbps = 6000              # stream.start may change it within min/max
+# min_bitrate_kbps = 1000
+# max_bitrate_kbps = 12000
+# gop_s = 2                        # keyframe interval in seconds
+# audio = "aac"                    # aac, none, or copy (RTMP sources)
+# input = { format = "mjpeg", size = "1920x1080", fps = 30 }  # what to ask a camera for
+#
+# [modules.stream.streams.camera]
+# source = { type = "camera", video = "usb:1-1.3", audio = "usb:1-1.3" }  # or { type = "test" }
+# profile = "hevc"
+# output = "bonded"
+# streamid = "publish/live/backpack"
+# desired = "live"
+
 [modules.display]
 # Screens on a framebuffer (LLD 9): the scanner's 800x480 screen. Needs a build with the
 # module-display Cargo feature; other builds log this section as unused. Needs the video group

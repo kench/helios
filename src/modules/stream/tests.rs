@@ -84,9 +84,13 @@ fn refuses_what_this_version_cannot_run_and_bad_values() {
         (
             "mode = \"direct\"",
             "mode = \"srtla\"",
-            "srtla outputs aren't supported yet",
+            "uplinks must name at least one uplink",
         ),
-        ("mode = \"direct\"", "mode = \"udp\"", "mode must be direct"),
+        (
+            "mode = \"direct\"",
+            "mode = \"udp\"",
+            "mode must be direct or srtla",
+        ),
         (
             "type = \"camera\", video = \"usb:1-1.3\", audio = \"usb:1-1.3\"",
             "type = \"rtmp\"",
@@ -152,6 +156,14 @@ fn refuses_what_this_version_cannot_run_and_bad_values() {
     settings(&keyed);
 }
 
+fn target<'a>(output: &'a super::settings::Output, streamid: &'a str) -> ffmpeg::Target<'a> {
+    ffmpeg::Target {
+        output,
+        streamid,
+        sender_port: None,
+    }
+}
+
 fn nodes(audio: bool) -> CameraNodes {
     CameraNodes {
         video: "/dev/video2".into(),
@@ -164,8 +176,7 @@ fn builds_camera_arguments_from_the_profile() {
     let settings = settings(CONFIG);
     let args = ffmpeg::camera_args(
         &settings.profiles["cam"],
-        &settings.outputs["main"],
-        "publish/live/backpack",
+        target(&settings.outputs["main"], "publish/live/backpack"),
         &nodes(true),
         5000,
     )
@@ -195,7 +206,7 @@ fn copies_or_uses_hardware_encoders_and_brackets_ipv6() {
     profile.video = "copy".into();
     profile.scale = String::new();
     profile.input = Default::default();
-    let args = ffmpeg::camera_args(profile, &output, "s", &nodes(false), 1).join(" ");
+    let args = ffmpeg::camera_args(profile, target(&output, "s"), &nodes(false), 1).join(" ");
     assert!(
         args.contains("-i /dev/video2 -map 0:v:0 -c:v copy -an"),
         "{args}"
@@ -205,13 +216,13 @@ fn copies_or_uses_hardware_encoders_and_brackets_ipv6() {
         "{args}"
     );
     profile.video = "hevc_rkmpp".into();
-    let args = ffmpeg::camera_args(profile, &output, "s", &nodes(false), 6000).join(" ");
+    let args = ffmpeg::camera_args(profile, target(&output, "s"), &nodes(false), 6000).join(" ");
     assert!(
         args.contains("-c:v hevc_rkmpp -rc_mode CBR -b:v 6000k"),
         "{args}"
     );
     profile.audio = "copy".into();
-    let args = ffmpeg::camera_args(profile, &output, "s", &nodes(true), 6000).join(" ");
+    let args = ffmpeg::camera_args(profile, target(&output, "s"), &nodes(true), 6000).join(" ");
     assert!(args.contains("-c:a copy"), "{args}");
 }
 
@@ -301,6 +312,7 @@ struct Started {
     job: u64,
     events: mpsc::UnboundedSender<Tagged>,
     stopped: Arc<AtomicBool>,
+    reloads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Started {
@@ -325,11 +337,16 @@ impl Started {
 
 struct FakeJob {
     stopped: Arc<AtomicBool>,
+    reloads: Arc<std::sync::atomic::AtomicUsize>,
     job: u64,
     events: mpsc::UnboundedSender<Tagged>,
 }
 
 impl Job for FakeJob {
+    fn reload(&self) {
+        self.reloads.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn stop(&mut self, _grace: Duration) -> BoxFuture<'_, ()> {
         self.stopped.store(true, Ordering::SeqCst);
         let _ = self.events.send(Tagged {
@@ -357,14 +374,17 @@ impl Spawner for FakeSpawner {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         }
         let stopped = Arc::new(AtomicBool::new(false));
+        let reloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let _ = self.started.send(Started {
             spec: spec.clone(),
             job,
             events: events.clone(),
             stopped: stopped.clone(),
+            reloads: reloads.clone(),
         });
         Ok(Box::new(FakeJob {
             stopped,
+            reloads,
             job,
             events,
         }))
@@ -414,6 +434,15 @@ struct Harness {
 }
 
 fn harness(config: &str, encoders: Option<&[&str]>, refuse: bool) -> Harness {
+    harness_with(config, encoders, refuse, Arc::new(|| Ok(Vec::new())))
+}
+
+fn harness_with(
+    config: &str,
+    encoders: Option<&[&str]>,
+    refuse: bool,
+    addresses: Arc<super::Addresses>,
+) -> Harness {
     let usb = UsbHandle::default();
     let (started_tx, started) = mpsc::unbounded_channel();
     let spawner = FakeSpawner {
@@ -421,7 +450,8 @@ fn harness(config: &str, encoders: Option<&[&str]>, refuse: bool) -> Harness {
         encoders: encoders.map(|names| names.iter().map(|name| (*name).to_owned()).collect()),
         refuse: AtomicBool::new(refuse),
     };
-    let module = StreamModule::with_spawner(settings(config), usb.clone(), Arc::new(spawner));
+    let module =
+        StreamModule::with_fakes(settings(config), usb.clone(), Arc::new(spawner), addresses);
     let (mqtt, published, _status) = MqttHandle::for_test();
     let (shadows, reports, _desired) = ShadowHandle::for_test();
     let (commands, commands_rx) = mpsc::channel(4);
@@ -481,13 +511,18 @@ impl Harness {
 
     /// Waits for the shadow to show the camera stream in `state`.
     async fn state(&mut self, state: &str) -> Value {
+        self.state_of("camera", state).await
+    }
+
+    /// Waits for the shadow to show stream `id` in `state`.
+    async fn state_of(&mut self, id: &str, state: &str) -> Value {
         loop {
             let (shadow, reported) = tokio::time::timeout(WAIT, self.reports.recv())
                 .await
                 .expect("a report in time")
                 .expect("shadow");
-            if shadow == "stream" && reported["streams"]["camera"]["state"] == state {
-                return reported["streams"]["camera"].clone();
+            if shadow == "stream" && reported["streams"][id]["state"] == state {
+                return reported["streams"][id].clone();
             }
         }
     }
@@ -785,5 +820,439 @@ async fn a_flapping_camera_stops_sending_events() {
         }
     }
     assert_eq!(connected, super::FLAP_LIMIT);
+    harness.stop().await;
+}
+
+// --- srtla outputs, test-pattern sources, uplinks, addresses -------------------------------------
+
+use super::addrs::{self, Address};
+use super::srtla;
+
+const SRTLA: &str = r#"
+ffmpeg = "/opt/ffmpeg"
+srtla_send = "/opt/srtla_send"
+runtime_dir = "RUNTIME"
+sender_idle_s = 1
+
+[outputs.bond]
+mode = "srtla"
+host = "rec.example.com"
+port = 5000
+latency_ms = 2000
+uplinks = ["usb:ethernet", "wlan0"]
+
+[profiles.test]
+video = "libx264"
+audio = "aac"
+
+[streams.pattern]
+source = { type = "test", size = "640x360", fps = 25 }
+profile = "test"
+output = "bond"
+streamid = "publish/live/pattern"
+"#;
+
+#[test]
+fn checks_srtla_outputs_test_sources_and_sender_settings() {
+    let config = SRTLA.replace("RUNTIME", "/run/helios");
+    let settings = settings(&config);
+    assert_eq!(settings.sender_port("bond"), Some(6000));
+    assert_eq!(settings.sender_port("nope"), None);
+    for (from, to, message) in [
+        (
+            "uplinks = [\"usb:ethernet\", \"wlan0\"]",
+            "uplinks = []",
+            "at least one uplink",
+        ),
+        ("\"wlan0\"", "\"usb:modem\"", "must be usb:ethernet"),
+        (
+            "\"wlan0\"",
+            "\"this-name-is-far-too-long\"",
+            "must be usb:ethernet",
+        ),
+        (
+            "video = \"libx264\"",
+            "video = \"copy\"",
+            "needs encoders, not copy",
+        ),
+        (
+            "size = \"640x360\"",
+            "size = \"tiny\"",
+            "test pattern needs size",
+        ),
+        ("fps = 25", "fps = 0", "test pattern needs size"),
+        ("sender_idle_s = 1", "sender_idle_s = 0", "sender_idle_s"),
+        (
+            "sender_idle_s = 1",
+            "srtla_port_base = 80",
+            "srtla_port_base",
+        ),
+    ] {
+        let error = refused(&config.replacen(from, to, 1));
+        assert!(error.contains(message), "{to}: {error}");
+    }
+    let direct = CONFIG.replacen(
+        "latency_ms = 1500",
+        "latency_ms = 1500\nuplinks = [\"eth1\"]",
+        1,
+    );
+    assert!(refused(&direct).contains("only for srtla outputs"));
+}
+
+#[test]
+fn builds_test_pattern_arguments_and_srtla_urls() {
+    let config = SRTLA.replace("RUNTIME", "/run/helios");
+    let settings = settings(&config);
+    let target = ffmpeg::Target {
+        output: &settings.outputs["bond"],
+        streamid: "publish/live/pattern",
+        sender_port: Some(6000),
+    };
+    let args = ffmpeg::test_args(&settings.profiles["test"], target, "640x360", 25, 3000).join(" ");
+    for part in [
+        "-re -f lavfi -i testsrc2=size=640x360:rate=25",
+        "-re -f lavfi -i sine=frequency=1000:sample_rate=48000",
+        "-map 0:v:0 -map 1:a:0 -c:v libx264",
+        "-c:a aac",
+        "srt://127.0.0.1:6000?mode=caller&latency=2000000&streamid=publish/live/pattern",
+    ] {
+        assert!(args.contains(part), "missing {part:?} in {args}");
+    }
+    let mut silent = settings.profiles["test"].clone();
+    silent.audio = "none".into();
+    let args = ffmpeg::test_args(&silent, target, "640x360", 25, 3000).join(" ");
+    assert!(!args.contains("sine") && args.contains("-an"), "{args}");
+}
+
+/// An `RTM_NEWADDR` message as the kernel sends it.
+fn newaddr(interface: &str, address: [u8; 4]) -> Vec<u8> {
+    let mut attributes = Vec::new();
+    for (kind, value) in [
+        (2u16, address.to_vec()),
+        (3u16, [interface.as_bytes(), &[0]].concat()),
+    ] {
+        let len = 4 + value.len();
+        attributes.extend_from_slice(&u16::try_from(len).expect("short").to_ne_bytes());
+        attributes.extend_from_slice(&kind.to_ne_bytes());
+        attributes.extend_from_slice(&value);
+        attributes.resize(attributes.len().div_ceil(4) * 4, 0);
+    }
+    let total = 16 + 8 + attributes.len();
+    let mut message = Vec::new();
+    message.extend_from_slice(&u32::try_from(total).expect("short").to_ne_bytes());
+    message.extend_from_slice(&20u16.to_ne_bytes());
+    message.extend_from_slice(&[0; 10]);
+    message.extend_from_slice(&[2, 24, 0, 0, 1, 0, 0, 0]);
+    message.extend_from_slice(&attributes);
+    message
+}
+
+fn done() -> Vec<u8> {
+    let mut message = 16u32.to_ne_bytes().to_vec();
+    message.extend_from_slice(&3u16.to_ne_bytes());
+    message.extend_from_slice(&[0; 10]);
+    message
+}
+
+#[test]
+fn parses_the_kernels_address_dump() {
+    let mut addresses = Vec::new();
+    let first = [
+        newaddr("eth1", [10, 0, 1, 2]),
+        newaddr("wlan0", [10, 0, 2, 2]),
+    ]
+    .concat();
+    assert!(!addrs::parse_dump(&first, &mut addresses).expect("parsed"));
+    assert!(addrs::parse_dump(&done(), &mut addresses).expect("parsed"));
+    assert_eq!(
+        addresses,
+        [
+            Address {
+                interface: "eth1".into(),
+                address: [10, 0, 1, 2].into()
+            },
+            Address {
+                interface: "wlan0".into(),
+                address: [10, 0, 2, 2].into()
+            },
+        ]
+    );
+    let mut error = 36u32.to_ne_bytes().to_vec();
+    error.extend_from_slice(&2u16.to_ne_bytes());
+    error.extend_from_slice(&[0; 10]);
+    error.extend_from_slice(&(-1i32).to_ne_bytes());
+    error.resize(36, 0);
+    assert!(addrs::parse_dump(&error, &mut addresses).is_err());
+    assert!(
+        addrs::parse_dump(
+            &[255, 255, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &mut addresses
+        )
+        .is_err()
+    );
+    // The real kernel: loopback at least.
+    let real = addrs::ipv4_addresses().expect("rtnetlink");
+    assert!(real.iter().any(|a| a.address.is_loopback()), "{real:?}");
+}
+
+fn ethernet_adapter() -> (String, Arc<UsbDevice>) {
+    let payload = json!({"port": "1-2", "categories": ["ethernet"], "nodes": {"net": ["eth1"]}});
+    (
+        "1-2".into(),
+        Arc::new(UsbDevice {
+            port: "1-2".into(),
+            devpath: "/devices/usb1/1-2".into(),
+            vid: 0x0bda,
+            pid: 0x8153,
+            hub: false,
+            payload: payload.as_object().expect("object").clone(),
+            attached_at: SystemTime::now(),
+        }),
+    )
+}
+
+fn address(interface: &str, ip: [u8; 4]) -> Address {
+    Address {
+        interface: interface.into(),
+        address: ip.into(),
+    }
+}
+
+#[test]
+fn resolves_uplinks_from_usb_categories_and_interface_names() {
+    let usb = UsbSnapshot::from([ethernet_adapter()]);
+    let addresses = [
+        address("eth1", [10, 0, 1, 2]),
+        address("wlan0", [10, 0, 2, 2]),
+        address("wlan0:1", [10, 0, 2, 3]),
+        address("wlan0", [169, 254, 1, 1]),
+        address("lo", [127, 0, 0, 1]),
+        address("eth0", [192, 168, 1, 5]),
+    ];
+    let uplinks = [
+        "usb:ethernet".to_owned(),
+        "wlan0".to_owned(),
+        "lo".to_owned(),
+    ];
+    let ips = srtla::resolve_uplinks(&uplinks, &usb, &addresses);
+    assert_eq!(
+        ips,
+        [[10, 0, 1, 2], [10, 0, 2, 2], [10, 0, 2, 3]].map(std::net::Ipv4Addr::from)
+    );
+    assert!(srtla::resolve_uplinks(&["usb:cellular".into()], &usb, &addresses).is_empty());
+}
+
+#[test]
+fn reads_stats_update_notifications_only() {
+    let update = r#"{"jsonrpc":"2.0","method":"stats.update","params":{"subscription_id":"sub-0","data":{"active_links":2}}}"#;
+    assert_eq!(
+        srtla::stats_update(update),
+        Some(json!({"active_links": 2}))
+    );
+    assert_eq!(
+        srtla::stats_update(r#"{"jsonrpc":"2.0","result":{"subscription_id":"sub-0"},"id":1}"#),
+        None
+    );
+    assert_eq!(srtla::stats_update("not json"), None);
+}
+
+/// A fake `srtla_send` control socket: accepts one client, checks it subscribes, and sends it
+/// the given snapshots.
+async fn control_socket(path: std::path::PathBuf) -> mpsc::UnboundedSender<Value> {
+    let (snapshots, mut receive) = mpsc::unbounded_channel::<Value>();
+    let listener = tokio::net::UnixListener::bind(&path).expect("socket");
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (stream, _) = listener.accept().await.expect("client");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        let subscribe = lines.next_line().await.expect("read").expect("a line");
+        assert!(
+            subscribe.contains("\"subscribe\"") && subscribe.contains("\"stats\""),
+            "{subscribe}"
+        );
+        while let Some(data) = receive.recv().await {
+            let line = json!({"jsonrpc": "2.0", "method": "stats.update", "params": {"subscription_id": "sub-0", "data": data}});
+            writer
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write");
+        }
+    });
+    snapshots
+}
+
+fn snapshot(active: u64) -> Value {
+    json!({
+        "active_links": active, "total_links": 2, "total_window": 4000, "total_in_flight": 0,
+        "negotiated_latency_ms": 2000,
+        "links": [
+            {"ip": "10.0.1.2", "connected": true, "timed_out": false, "rtt_ms": 30, "nak_count": 0, "weak": false, "label": "x"},
+            {"ip": "10.0.2.2", "connected": active > 1, "timed_out": false, "rtt_ms": 60, "nak_count": 3, "weak": false},
+        ],
+    })
+}
+
+impl Harness {
+    /// Waits for the shadow's `outputs.<name>.state` to be `state`.
+    async fn output_state(&mut self, name: &str, state: &str) -> Value {
+        loop {
+            let (shadow, reported) =
+                tokio::time::timeout(Duration::from_secs(20), self.reports.recv())
+                    .await
+                    .expect("a report in time")
+                    .expect("shadow");
+            if shadow == "stream" && reported["outputs"][name]["state"] == state {
+                return reported["outputs"][name].clone();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_srtla_output_runs_its_sender_first_and_follows_its_uplinks() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
+    let addresses = Arc::new(std::sync::Mutex::new(vec![
+        address("eth1", [10, 0, 1, 2]),
+        address("wlan0", [10, 0, 2, 2]),
+    ]));
+    let source = addresses.clone();
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(move || Ok(source.lock().expect("addresses").clone())),
+    );
+    harness
+        .usb
+        .set_for_test(UsbSnapshot::from([ethernet_adapter()]));
+
+    // The sender starts first, with the uplinks' addresses in its IP file.
+    let sender = harness.next_start().await;
+    assert_eq!(
+        sender.spec.program,
+        std::path::PathBuf::from("/opt/srtla_send")
+    );
+    let dir = runtime.path().join("srtla");
+    let socket = dir.join("bond.sock");
+    let ips = dir.join("bond.ips");
+    assert_eq!(
+        sender.spec.args,
+        [
+            "--control-socket".to_owned(),
+            socket.display().to_string(),
+            "--conn-timeout-ms".into(),
+            "5000".into(),
+            "6000".into(),
+            "rec.example.com".into(),
+            "5000".into(),
+            ips.display().to_string(),
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ips).expect("ips"),
+        "10.0.1.2\n10.0.2.2\n"
+    );
+    let starting = harness.state_of("pattern", "starting").await;
+    assert!(
+        starting["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("waiting for output bond")),
+        "{starting}"
+    );
+
+    // ffmpeg waits until the bond has an active link.
+    let stats = control_socket(socket).await;
+    stats.send(snapshot(2)).expect("socket");
+    let job = harness.next_start().await;
+    let args = job.spec.args.join(" ");
+    assert!(
+        args.contains(
+            "srt://127.0.0.1:6000?mode=caller&latency=2000000&streamid=publish/live/pattern"
+        ),
+        "{args}"
+    );
+    assert!(args.contains("testsrc2=size=640x360:rate=25"), "{args}");
+    job.progress(1_000_000);
+    job.progress(2_000_000);
+    let live = harness.event("stream.live").await;
+    assert!(live.contains("active_links\": Number(2)"), "{live}");
+    let up = harness.output_state("bond", "up").await;
+    assert_eq!(up["uplinks"], json!(["10.0.1.2", "10.0.2.2"]));
+
+    // An uplink loses its address: the IP file is rewritten and the sender reloaded.
+    addresses
+        .lock()
+        .expect("addresses")
+        .retain(|a| a.interface != "wlan0");
+    harness
+        .usb
+        .set_for_test(UsbSnapshot::from([ethernet_adapter()]));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while sender.reloads.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reloaded");
+    assert_eq!(std::fs::read_to_string(&ips).expect("ips"), "10.0.1.2\n");
+    stats.send(snapshot(1)).expect("socket");
+    // One uplink now, and one active link: still up.
+    while harness.output_state("bond", "up").await["active_links"] != 1 {}
+
+    // Stopped: ffmpeg goes at once, the sender after its idle time.
+    let Outcome::Ok(_) = harness
+        .command("stop", json!({"stream_id": "pattern"}))
+        .await
+    else {
+        panic!("stop refused");
+    };
+    harness.output_state("bond", "stopped").await;
+    assert!(job.stopped.load(Ordering::SeqCst));
+    assert!(sender.stopped.load(Ordering::SeqCst));
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_sender_that_exits_is_restarted() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(|| Ok(vec![address("wlan0", [10, 0, 2, 2])])),
+    );
+    let sender = harness.next_start().await;
+    sender.send(JobEvent::Stderr("can't resolve rec.example.com".into()));
+    sender.send(JobEvent::Exited(Some(1)));
+    let down = harness.output_state("bond", "down").await;
+    assert!(
+        down["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("can't resolve")),
+        "{down}"
+    );
+    let again = harness.next_start().await;
+    assert_eq!(
+        again.spec.program,
+        std::path::PathBuf::from("/opt/srtla_send")
+    );
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn no_uplink_addresses_leave_the_output_waiting() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(|| Err(std::io::Error::other("no netlink"))),
+    );
+    harness.next_start().await;
+    harness.output_state("bond", "no_uplinks").await;
     harness.stop().await;
 }

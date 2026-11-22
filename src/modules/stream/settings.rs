@@ -1,9 +1,9 @@
 //! `[modules.stream]` (LLD 4, section 6.2): outputs, profiles and streams, checked at start-up.
 //!
-//! This version runs USB-camera streams to `direct` SRT outputs. RTMP sources (`rtmp-ingest`) and
-//! `srtla` outputs (`srtla-sender`) come in later versions; a config that uses them is refused
-//! with a message saying so, rather than ignored. SRT URLs, passphrases included, aren't secrets
-//! (owner, 2026-11-21), so the passphrase is set here.
+//! This version runs USB-camera and test-pattern streams to `direct` or `srtla` SRT outputs. RTMP
+//! sources (`rtmp-ingest`) come in a later version; a config that uses them is refused with a
+//! message saying so, rather than ignored. SRT URLs, passphrases included, aren't secrets (owner,
+//! 2026-11-21), so the passphrase is set here.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -18,6 +18,16 @@ pub struct StreamSettings {
     pub(crate) enabled: bool,
     /// The ffmpeg to run.
     pub(crate) ffmpeg: PathBuf,
+    /// The `srtla_send` to run for `srtla` outputs.
+    pub(crate) srtla_send: PathBuf,
+    /// Where senders' IP files and control sockets go (`<runtime_dir>/srtla/`), normally the
+    /// unit's `RuntimeDirectory`.
+    pub(crate) runtime_dir: PathBuf,
+    /// The first local UDP port for senders: outputs get consecutive ports in name order.
+    pub(crate) srtla_port_base: u16,
+    /// How long a sender stays up after its last stream stops, so a source that comes back
+    /// keeps a warm bond.
+    sender_idle_s: u64,
     /// How often `stream.stats` goes out while a stream is live.
     stats_interval_s: u64,
     pub(crate) outputs: BTreeMap<String, Output>,
@@ -30,6 +40,10 @@ impl Default for StreamSettings {
         Self {
             enabled: true,
             ffmpeg: "/usr/lib/helios-ffmpeg/bin/ffmpeg".into(),
+            srtla_send: "/usr/bin/srtla_send".into(),
+            runtime_dir: "/run/helios".into(),
+            srtla_port_base: 6000,
+            sender_idle_s: 60,
             stats_interval_s: 30,
             outputs: BTreeMap::new(),
             profiles: BTreeMap::new(),
@@ -65,7 +79,8 @@ fn default_latency_ms() -> u32 {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
-    /// `copy`, `libx264`, `h264_rkmpp`, `hevc_rkmpp` or `h264_v4l2m2m`.
+    /// `copy`, `libx264`, `libx265` (software; the harness's HEVC), `h264_rkmpp`, `hevc_rkmpp` or
+    /// `h264_v4l2m2m`.
     pub(crate) video: String,
     #[serde(default = "default_bitrate")]
     pub(crate) bitrate_kbps: u32,
@@ -131,6 +146,20 @@ pub enum Source {
         #[serde(default)]
         camera: Option<u32>,
     },
+    /// A generated test pattern with a tone: checks the whole chain without a camera.
+    Test {
+        #[serde(default = "default_test_size")]
+        size: String,
+        #[serde(default = "default_test_fps")]
+        fps: u32,
+    },
+}
+
+fn default_test_size() -> String {
+    "1280x720".into()
+}
+fn default_test_fps() -> u32 {
+    30
 }
 
 /// One configured stream.
@@ -152,9 +181,10 @@ fn default_desired() -> String {
 }
 
 /// Encoders profiles may name.
-pub(crate) const ENCODERS: [&str; 5] = [
+pub(crate) const ENCODERS: [&str; 6] = [
     "copy",
     "libx264",
+    "libx265",
     "h264_rkmpp",
     "hevc_rkmpp",
     "h264_v4l2m2m",
@@ -170,13 +200,39 @@ impl StreamSettings {
         if !(5..=3600).contains(&self.stats_interval_s) {
             return Err("modules.stream.stats_interval_s must be 5 to 3600".into());
         }
+        if !(1..=3600).contains(&self.sender_idle_s) {
+            return Err("modules.stream.sender_idle_s must be 1 to 3600".into());
+        }
+        let last_port = usize::from(self.srtla_port_base) + self.outputs.len();
+        if self.srtla_port_base < 1024 || last_port > 65535 {
+            return Err(
+                "modules.stream.srtla_port_base must leave a port per output in 1024 to 65535"
+                    .into(),
+            );
+        }
         for (name, output) in &self.outputs {
             let at = format!("modules.stream.outputs.{name}");
             check_name(name, &at)?;
             match output.mode.as_str() {
-                "direct" => {}
-                "srtla" => return Err(format!("{at}: srtla outputs aren't supported yet")),
-                other => return Err(format!("{at}.mode must be direct, not {other:?}")),
+                "direct" => {
+                    if !output.uplinks.is_empty() {
+                        return Err(format!("{at}.uplinks is only for srtla outputs"));
+                    }
+                }
+                "srtla" => {
+                    if output.uplinks.is_empty() {
+                        return Err(format!("{at}.uplinks must name at least one uplink"));
+                    }
+                    for uplink in &output.uplinks {
+                        if !valid_uplink(uplink) {
+                            return Err(format!(
+                                "{at}.uplinks: {uplink:?} must be usb:ethernet, usb:cellular, \
+                                 usb:wifi or an interface name"
+                            ));
+                        }
+                    }
+                }
+                other => return Err(format!("{at}.mode must be direct or srtla, not {other:?}")),
             }
             if output.host.is_empty()
                 || !output
@@ -262,6 +318,19 @@ impl StreamSettings {
                 Source::Rtmp { .. } => {
                     return Err(format!("{at}: RTMP sources aren't supported yet"));
                 }
+                Source::Test { size, fps } => {
+                    if parse_size(size).is_none() || !(1..=120).contains(fps) {
+                        return Err(format!(
+                            "{at}.source: a test pattern needs size WIDTHxHEIGHT and fps 1 to 120"
+                        ));
+                    }
+                    if profile.video == "copy" || profile.audio == "copy" {
+                        return Err(format!(
+                            "{at}: a test pattern is generated, so its profile needs encoders, \
+                             not copy"
+                        ));
+                    }
+                }
                 Source::Camera { video, audio } => {
                     for selector in std::iter::once(video).chain(audio) {
                         if !valid_selector(selector) {
@@ -297,6 +366,16 @@ impl StreamSettings {
         Ok(self.enabled.then_some(self))
     }
 
+    pub(crate) fn sender_idle(&self) -> Duration {
+        Duration::from_secs(self.sender_idle_s)
+    }
+
+    /// Each `srtla` output's local port: consecutive from `srtla_port_base`, in name order.
+    pub(crate) fn sender_port(&self, output: &str) -> Option<u16> {
+        let index = self.outputs.keys().position(|name| name == output)?;
+        self.srtla_port_base.checked_add(u16::try_from(index).ok()?)
+    }
+
     pub(crate) fn stats_interval(&self) -> Duration {
         Duration::from_secs(self.stats_interval_s)
     }
@@ -324,6 +403,16 @@ fn valid_selector(selector: &str) -> bool {
         part.is_some_and(|p| p.len() == 4 && p.bytes().all(|b| b.is_ascii_hexdigit()))
     };
     hex4(parts.next()) && hex4(parts.next()) && parts.next().is_some_and(|s| !s.is_empty())
+}
+
+/// `usb:ethernet`, `usb:cellular`, `usb:wifi`, or an interface name.
+fn valid_uplink(uplink: &str) -> bool {
+    matches!(uplink, "usb:ethernet" | "usb:cellular" | "usb:wifi")
+        || (!uplink.is_empty()
+            && uplink.len() <= 15
+            && uplink
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
 }
 
 /// `WIDTHxHEIGHT`, each 16 to 8192.

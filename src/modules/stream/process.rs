@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::{mpsc, watch};
 
@@ -51,6 +51,9 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub(crate) trait Job: Send {
     /// Stops it: SIGTERM, then SIGKILL after `grace`. Returns once it has exited.
     fn stop(&mut self, grace: Duration) -> BoxFuture<'_, ()>;
+
+    /// Asks it to reload (SIGHUP to the child itself): `srtla_send` rereads its IP file.
+    fn reload(&self);
 }
 
 /// Starts children.
@@ -180,6 +183,15 @@ impl SystemJob {
 }
 
 impl Job for SystemJob {
+    fn reload(&self) {
+        // The child leads its own process group, so the group's ID is its PID.
+        if let Some(pid) = self.group
+            && !*self.done.borrow()
+        {
+            let _ = kill_process(pid, Signal::HUP);
+        }
+    }
+
     fn stop(&mut self, grace: Duration) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.signal(Signal::TERM);

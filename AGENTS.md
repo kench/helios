@@ -15,7 +15,7 @@ src/credentials/   AWS credentials through the AWS IoT credentials provider
 src/mqtt/          connection manager, envelopes, shadow manager, the helios shadow (LLD 2)
 src/router/        command router; CommandTransport (custom cmd/rsp topics now)
 src/clock/         clock checks (LLD 1, 4.11); kernel.rs holds an allowed unsafe call (adjtimex)
-src/modules/       device modules behind Cargo features (display: LLD 9, usb: LLD 5), the Module trait and
+src/modules/       device modules behind Cargo features (display: LLD 9, usb: LLD 5, stream: LLD 4), the Module trait and
                    the supervisor that restarts them (LLD 5, section 14)
 src/provision/     `helios provision` (challenge key, show, verify)
 src/service.rs     wires everything together for `helios` with no subcommand
@@ -39,14 +39,15 @@ cargo llvm-cov --locked --workspace --all-features --fail-under-lines 90
 ```
 
 CI runs all of these on every PR and they're required on `main`. The SoftHSM2 integration tests
-need Debian's `softhsm2`.
+need Debian's `softhsm2`. The stream module's end-to-end harness is `tests/stream-e2e/` (see
+the README); it isn't in CI yet.
 
 ## Builds by device
 
 | Device | Command |
 | --- | --- |
 | Scanner (PROXmobil3, armv7, glibc 2.28) | `cargo zigbuild --release --target armv7-unknown-linux-gnueabihf.2.28 --features module-display,module-usb` (zig 0.14.1) |
-| Debian boards (arm64) | built and published by `.github/workflows/release.yml` on a `v*` tag: `aarch64-unknown-linux-gnu.2.31 --features module-usb`, `cargo deb --no-strip` |
+| Debian boards (arm64) | built and published by `.github/workflows/release.yml` on a `v*` tag: `aarch64-unknown-linux-gnu.2.31 --features module-usb,module-stream`, `cargo deb --no-strip` |
 | Provisioning computer (x86-64) | `cargo build --release` (used by the provisioning scripts) |
 
 The scanner runs Helios from its USB drive (`~/workspace/helios/scanner-usb`, not in this
@@ -73,7 +74,9 @@ version rather than moving the tag.
 - Never log or print PINs, and never put them in process arguments.
 - Modules are Cargo features, off by default; a module's config section is ignored in builds
   without it. The scanner build needs `--features module-display,module-usb`, the boards'
-  package `--features module-usb` (`FEATURES` in `release.yml`).
+  package `--features module-usb,module-stream` (`FEATURES` in `release.yml`).
+- Stream module changes run through `tests/stream-e2e/` before their PR (`setup.sh`, then
+  `external.sh` and `helios.sh`; no root needed), with the result in the PR.
 - A module implements `Module` (`src/modules/mod.rs`) and runs under the supervisor, which gives
   each run a fresh `ModuleContext` and restarts it with backoff; module state is in the `helios`
   shadow's `modules`.
