@@ -1,11 +1,12 @@
 //! The `stream` module (LLD 4): video streams to SRT listeners, run by ffmpeg.
 //!
-//! This version runs USB-camera streams (cameras from the usb module, LLD 5) to `direct` SRT
-//! outputs. Each configured stream is `live` (run whenever its camera is attached) or `stopped`,
-//! from config, the `stream` shadow's desired state, or `stream.start` / `stream.stop`. The
-//! module starts ffmpeg when a live stream's camera is there, reads its `-progress` output,
-//! restarts it with backoff when it exits or stalls, and stops it when the camera goes or the
-//! stream is stopped. `rtmp-ingest` and `srtla-sender` (LLD 4, sections 4 and 5) come later.
+//! Streams read USB cameras (from the usb module, LLD 5), RTMP publishers (`rtmp-ingest`, LLD 4
+//! section 4: nginx under systemd, with its publish hook and statistics page in [`rtmp`]) or a
+//! test pattern, and go to `direct` SRT outputs or `srtla` ones through `srtla_send` (section 5).
+//! Each configured stream is `live` (run whenever its input is there) or `stopped`, from config,
+//! the `stream` shadow's desired state, or `stream.start` / `stream.stop`. The module starts
+//! ffmpeg when a live stream's input is there, reads its `-progress` output, restarts it with
+//! backoff when it exits or stalls, and stops it when the input goes or the stream is stopped.
 //!
 //! Events on `helios/<thing>/evt/stream`: `stream.connected` (the source became ready),
 //! `stream.live`, `stream.disconnected` (with a reason) and, while live, `stream.stats`.
@@ -19,10 +20,11 @@ pub mod daemon;
 mod e2e;
 mod ffmpeg;
 mod process;
+mod rtmp;
 pub(crate) mod settings;
 mod srtla;
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -41,6 +43,7 @@ use addrs::Address;
 pub use client::StreamClient;
 use ffmpeg::{CameraNodes, Progress, ProgressParser};
 use process::{Job, JobEvent, JobSpec, Spawner, Tagged};
+use rtmp::IngestEvent;
 pub use settings::StreamSettings;
 use settings::{Source, Stream};
 use srtla::Senders;
@@ -65,6 +68,25 @@ const LOG_LINES: usize = 20;
 const FLAP_LIMIT: usize = 20;
 /// Encoder figures go to the shadow at most this often.
 const ENCODER_REPORT: Duration = Duration::from_secs(60);
+/// A publish the hook accepted this recently stays even if the statistics page doesn't show it
+/// yet (nginx asks before it lists the publisher).
+const PUBLISH_GRACE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
+
+/// A camera publishing to `rtmp-ingest`.
+#[derive(Debug, Clone)]
+struct Publisher {
+    address: String,
+    /// When the hook accepted it; `None` if it was found on the statistics page.
+    accepted: Option<Instant>,
+}
+
+/// `rtmp-ingest` as the daemon sees it, for the shadow.
+#[derive(Debug, Default)]
+struct Ingest {
+    publishers: BTreeMap<String, Publisher>,
+    /// Why the hook or the statistics page last failed; cleared when the page reads again.
+    last_error: Option<String>,
+}
 
 /// Where a stream is in its life (LLD 4, section 6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +262,7 @@ struct Streams<'a> {
     sender_stats: mpsc::UnboundedReceiver<(u64, Value)>,
     addresses: Vec<Address>,
     addresses_at: Option<Instant>,
+    ingest: Ingest,
 }
 
 impl<'a> Streams<'a> {
@@ -289,7 +312,119 @@ impl<'a> Streams<'a> {
             sender_stats,
             addresses: Vec::new(),
             addresses_at: None,
+            ingest: Ingest::default(),
         }
+    }
+
+    /// Whether a stream's input is there: its camera attached, or its RTMP key publishing.
+    fn input_ready(&self, entry: &Entry) -> bool {
+        match &entry.config.source {
+            Source::Test { .. } => true,
+            Source::Camera { .. } => entry.nodes.is_some(),
+            Source::Rtmp { .. } => entry
+                .config
+                .source
+                .rtmp_key()
+                .is_some_and(|key| self.ingest.publishers.contains_key(&key)),
+        }
+    }
+
+    /// Something from the publish hook or the statistics page.
+    fn ingest_event(&mut self, event: IngestEvent) {
+        let now = Instant::now();
+        match event {
+            IngestEvent::Publish {
+                key,
+                address,
+                accept,
+            } => {
+                let stream = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.config.source.rtmp_key().as_deref() == Some(key.as_str()));
+                let verdict = match stream {
+                    None => Err("no stream takes this key"),
+                    Some(entry) if entry.unusable.is_some() => Err("its stream can't run"),
+                    Some(_) if self.ingest.publishers.contains_key(&key) => {
+                        Err("the key is already publishing")
+                    }
+                    Some(_) => Ok(()),
+                };
+                match verdict {
+                    Ok(()) => {
+                        tracing::info!(%key, %address, "RTMP publish accepted");
+                        self.ingest.publishers.insert(
+                            key,
+                            Publisher {
+                                address,
+                                accepted: Some(now),
+                            },
+                        );
+                    }
+                    Err(why) => tracing::warn!(%key, %address, why, "RTMP publish refused"),
+                }
+                let _ = accept.send(verdict.is_ok());
+            }
+            IngestEvent::PublishDone { key } => {
+                if self.ingest.publishers.remove(&key).is_some() {
+                    tracing::info!(%key, "RTMP publisher stopped");
+                }
+            }
+            IngestEvent::Publishers(Ok(found)) => {
+                self.ingest.last_error = None;
+                let recent = |publisher: &Publisher| {
+                    publisher
+                        .accepted
+                        .is_some_and(|at| now.duration_since(at) < PUBLISH_GRACE)
+                };
+                self.ingest.publishers.retain(|key, publisher| {
+                    let keep = found.contains_key(key) || recent(publisher);
+                    if !keep {
+                        tracing::info!(%key, "RTMP publisher gone (statistics page)");
+                    }
+                    keep
+                });
+                for (key, address) in found {
+                    let known = self.entries.iter().any(|entry| {
+                        entry.config.source.rtmp_key().as_deref() == Some(key.as_str())
+                    });
+                    if known && !self.ingest.publishers.contains_key(&key) {
+                        tracing::info!(%key, %address, "RTMP publisher found (statistics page)");
+                        self.ingest.publishers.insert(
+                            key,
+                            Publisher {
+                                address,
+                                accepted: None,
+                            },
+                        );
+                    }
+                }
+            }
+            IngestEvent::Publishers(Err(error)) | IngestEvent::HookFailed(error) => {
+                if self.ingest.last_error.as_ref() != Some(&error) {
+                    tracing::warn!(%error, "rtmp-ingest");
+                }
+                self.ingest.last_error = Some(error);
+            }
+        }
+    }
+
+    /// `rtmp_ingest` in the shadow, when it's enabled.
+    fn ingest_report(&self) -> Value {
+        if !self.module.settings.rtmp_ingest.enabled {
+            return Value::Null;
+        }
+        let publishers: Map<String, Value> = self
+            .ingest
+            .publishers
+            .iter()
+            .map(|(key, publisher)| (key.clone(), json!({"address": publisher.address})))
+            .collect();
+        json!({
+            "state": if self.ingest.last_error.is_some() { "degraded" } else { "ok" },
+            "publishers": publishers,
+            "last_error": self.ingest.last_error,
+        })
     }
 
     async fn run(mut self, mut ctx: ModuleContext) -> Result<(), ModuleError> {
@@ -305,6 +440,17 @@ impl<'a> Streams<'a> {
         stats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut commands_open = true;
         let mut desired_open = true;
+        let (ingest_tx, mut ingest_rx) = mpsc::unbounded_channel();
+        let ingest_cancel = ctx.cancel.child_token();
+        let ingest_task = settings.rtmp_ingest.enabled.then(|| {
+            let ingest = &settings.rtmp_ingest;
+            tokio::spawn(rtmp::run(
+                ingest.hook_port,
+                ingest.stat_url.clone(),
+                ingest_tx,
+                ingest_cancel.clone(),
+            ))
+        });
         // Desired state queued before the start (the daemon's saved state) applies before the
         // first pass, so a stream saved as stopped doesn't start for a moment.
         while let Ok(state) = ctx.desired.try_recv() {
@@ -341,12 +487,17 @@ impl<'a> Streams<'a> {
                     self.addresses_at = None;
                 }
                 Some(tagged) = self.events.recv() => self.job_event(tagged, &ctx),
+                Some(event) = ingest_rx.recv() => self.ingest_event(event),
                 Some((job, snapshot)) = self.sender_stats.recv() => {
                     self.senders.stats(job, snapshot, Instant::now());
                 }
                 _ = stats.tick() => self.stats(&ctx),
                 () = tokio::time::sleep_until(wake) => {}
             }
+        }
+        ingest_cancel.cancel();
+        if let Some(task) = ingest_task {
+            let _ = task.await;
         }
         self.shutdown(&ctx).await;
         Ok(())
@@ -380,11 +531,21 @@ impl<'a> Streams<'a> {
         if self.entries[index].state == State::Failed {
             return;
         }
-        let ready = matches!(self.entries[index].config.source, Source::Test { .. })
-            || self.entries[index].nodes.is_some();
-        if !ready {
+        let rtmp_key = self.entries[index].config.source.rtmp_key();
+        if let Some(publisher) = rtmp_key
+            .as_ref()
+            .and_then(|key| self.ingest.publishers.get(key))
+        {
+            self.entries[index].camera = json!({"key": rtmp_key, "publisher": publisher.address});
+        }
+        if !self.input_ready(&self.entries[index]) {
             self.stop_job(index);
-            self.disconnect(index, "camera_removed", ctx);
+            let reason = if rtmp_key.is_some() {
+                "publish_done"
+            } else {
+                "camera_removed"
+            };
+            self.disconnect(index, reason, ctx);
             let entry = &mut self.entries[index];
             entry.restart_at = None;
             entry.set_state(State::WaitingForInput);
@@ -442,7 +603,7 @@ impl<'a> Streams<'a> {
                 entry.desired_live
                     && entry.unusable.is_none()
                     && entry.state != State::Failed
-                    && (matches!(entry.config.source, Source::Test { .. }) || entry.nodes.is_some())
+                    && self.input_ready(entry)
             })
             .map(|entry| entry.config.output.as_str())
             .filter(|output| self.senders.port(output).is_some())
@@ -495,7 +656,18 @@ impl<'a> Streams<'a> {
             (Source::Camera { .. }, Some(nodes)) => {
                 ffmpeg::camera_args(profile, target, nodes, entry.bitrate_kbps)
             }
-            _ => return,
+            (Source::Rtmp { .. }, _) => {
+                let Some(key) = entry.config.source.rtmp_key() else {
+                    return;
+                };
+                let url = format!(
+                    "rtmp://127.0.0.1:{}/{}/{key}",
+                    settings.rtmp_ingest.port,
+                    rtmp::APP
+                );
+                ffmpeg::rtmp_args(profile, target, &url, entry.bitrate_kbps)
+            }
+            (Source::Camera { .. }, None) => return,
         };
         let spec = JobSpec {
             name: entry.id.clone(),
@@ -800,9 +972,14 @@ impl<'a> Streams<'a> {
             }
         }
         // Encoder and per-link figures change all the time: they wait for the interval.
-        let full = json!({"streams": streams, "outputs": self.senders.report(now, false)});
-        let significant =
-            json!({"streams": quiet_streams, "outputs": self.senders.report(now, true)});
+        let ingest = self.ingest_report();
+        let full = json!({
+            "streams": streams, "outputs": self.senders.report(now, false), "rtmp_ingest": ingest,
+        });
+        let significant = json!({
+            "streams": quiet_streams, "outputs": self.senders.report(now, true),
+            "rtmp_ingest": ingest,
+        });
         let due = match &self.reported {
             None => true,
             Some((last_significant, last_full, at)) => {

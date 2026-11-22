@@ -4,7 +4,7 @@
 set -e
 
 if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
-    systemctl stop helios.service helios-stream.service || true
+    systemctl stop helios.service helios-rtmp.service helios-stream.service || true
 fi
 
 exit 0

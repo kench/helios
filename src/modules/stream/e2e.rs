@@ -2,7 +2,7 @@
 //! process, with the real ffmpeg, `srtla_send`, `srtla_rec` and irl-srt-server, and this test as
 //! Helios (the daemon's client). Run only by `tests/stream-e2e/helios.sh`, inside the network
 //! namespace it sets up (uplinks `up0` 10.10.1.2 and `up1` 10.10.2.2, the receiving side on
-//! 10.10.0.1); skipped otherwise.
+//! 10.10.0.1, nginx from `dist/rtmp/nginx.conf`); skipped otherwise.
 
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -24,10 +24,17 @@ fn say(message: &str) {
 
 /// Plays `play/live/e2e` from irl-srt-server for a few seconds; the codecs it got.
 fn played_codecs(run: &str, name: &str) -> String {
+    played(run, name, "e2e")
+}
+
+/// Plays `play/live/<stream>` from irl-srt-server for a few seconds; the codecs it got.
+fn played(run: &str, name: &str, stream: &str) -> String {
     let file = format!("{run}/{name}.ts");
     let _ = Command::new("timeout")
         .args(["20", "ffmpeg", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg("srt://10.10.0.1:4000?mode=caller&streamid=play/live/e2e&latency=200000")
+        .arg(format!(
+            "srt://10.10.0.1:4000?mode=caller&streamid=play/live/{stream}&latency=200000"
+        ))
         .args(["-t", "4", "-c", "copy", "-f", "mpegts", &file])
         .status();
     let output = Command::new("ffprobe")
@@ -151,6 +158,120 @@ impl Helios {
 struct Daemon(Child);
 
 impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Daemon {
+    /// `helios stream-daemon` with `streams` (TOML under `[modules.stream]`) as its config.
+    fn start(bin: &str, run: &str, log: &str, settings: &str) -> Self {
+        // The daemon loads the whole helios.toml, which checks the CA bundle holds certificates.
+        for file in ["libsofthsm2.so", "pin"] {
+            std::fs::write(format!("{run}/{file}"), "").expect("placeholder");
+        }
+        let config = format!(
+            r#"
+[device]
+thing_name = "t-01J0000000000000000000E2E0"
+
+[identity]
+pkcs11_module = "{run}/libsofthsm2.so"
+token_label = "helios"
+key_label = "device-key"
+pin = "file:{run}/pin"
+
+[aws]
+region = "us-west-2"
+iot_endpoint = "example-ats.iot.us-west-2.amazonaws.com"
+credentials_endpoint = "example.credentials.iot.us-west-2.amazonaws.com"
+role_alias = "helios-device-role-alias"
+root_ca = "/etc/ssl/certs/ca-certificates.crt"
+
+[modules.usb]
+enabled = false
+
+{settings}
+"#
+        );
+        let path = format!("{run}/helios.toml");
+        std::fs::write(&path, config).expect("config");
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{run}/{log}"))
+            .expect("log");
+        Self(
+            Command::new(bin)
+                .args(["--config", &path, "stream-daemon"])
+                .stdout(log.try_clone().expect("log"))
+                .stderr(log)
+                .spawn()
+                .expect("helios stream-daemon"),
+        )
+    }
+
+    /// SIGTERM, and a clean exit.
+    fn terminate(mut self) {
+        let pid =
+            rustix::process::Pid::from_raw(i32::try_from(self.0.id()).expect("pid")).expect("pid");
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("signal");
+        let status = self.0.wait().expect("exit");
+        assert!(status.success(), "{status}");
+    }
+}
+
+/// A camera publishing RTMP to nginx: H.264 and AAC, as the Osmo Pocket 3 sends.
+struct Camera(Child);
+
+impl Camera {
+    fn publish(run: &str, key: &str) -> Self {
+        let log = std::fs::File::create(format!("{run}/camera-{key}.log")).expect("log");
+        Self(
+            Command::new("ffmpeg")
+                .args(["-hide_banner", "-nostdin", "-loglevel", "warning", "-re"])
+                .args(["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30"])
+                .args([
+                    "-re",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000",
+                ])
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                ])
+                .args([
+                    "-g", "60", "-b:v", "3M", "-c:a", "aac", "-b:a", "128k", "-f", "flv",
+                ])
+                .arg(format!("rtmp://127.0.0.1:1935/live/{key}"))
+                .stdout(std::process::Stdio::null())
+                .stderr(log)
+                .spawn()
+                .expect("ffmpeg"),
+        )
+    }
+
+    /// Whether nginx dropped it within `limit` (a refused publish).
+    fn refused_within(&mut self, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if self.0.try_wait().expect("wait").is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        false
+    }
+}
+
+impl Drop for Camera {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -324,5 +445,142 @@ streamid = "publish/live/e2e"
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("signal");
     let status = daemon.0.wait().expect("exit");
     assert!(status.success(), "{status}");
+    say("the daemon stopped on SIGTERM");
+}
+
+const RTMP_SETTINGS: &str = r#"
+[modules.stream]
+ffmpeg = "/usr/bin/ffmpeg"
+srtla_send = "E2E/bin/srtla_send"
+control_socket = "RUN/control.sock"
+state_dir = "RUN/rtmp-state"
+runtime_dir = "RUN/runtime"
+sender_idle_s = 2
+
+[modules.stream.rtmp_ingest]
+enabled = true
+
+[modules.stream.outputs.bond]
+mode = "srtla"
+host = "10.10.0.1"
+port = 5000
+latency_ms = 2000
+uplinks = ["up0", "up1"]
+
+[modules.stream.profiles.hevc]
+video = "libx265"
+bitrate_kbps = 3000
+audio = "copy"
+
+[modules.stream.profiles.passthrough]
+video = "copy"
+audio = "copy"
+
+[modules.stream.streams.pocket]
+source = { type = "rtmp" }
+profile = "hevc"
+output = "bond"
+streamid = "publish/live/pocket"
+
+[modules.stream.streams.relay]
+source = { type = "rtmp", camera = 1 }
+profile = "passthrough"
+output = "bond"
+streamid = "publish/live/relay"
+"#;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "run by tests/stream-e2e/helios.sh"]
+async fn rtmp_cameras_go_through_nginx_and_the_daemon() {
+    let (Ok(e2e), Ok(run), Ok(bin)) = (
+        std::env::var("HELIOS_E2E_DIR"),
+        std::env::var("HELIOS_E2E_RUN"),
+        std::env::var("HELIOS_E2E_BIN"),
+    ) else {
+        eprintln!("skipping: run through tests/stream-e2e/helios.sh");
+        return;
+    };
+    let settings = RTMP_SETTINGS.replace("E2E", &e2e).replace("RUN", &run);
+    let socket = format!("{run}/control.sock");
+    let daemon = Daemon::start(&bin, &run, "rtmp-daemon.log", &settings);
+    say("started the daemon with rtmp_ingest on");
+
+    let mut helios = Helios::start(&socket);
+    helios
+        .shadow("rtmp_ingest ok, pocket waiting for its camera", |r| {
+            r["rtmp_ingest"]["state"] == "ok"
+                && r["streams"]["pocket"]["state"] == "waiting_for_input"
+        })
+        .await;
+
+    // The Osmo Pocket publishes `ingest`: nginx asks the daemon, which starts the HEVC job.
+    let pocket = Camera::publish(&run, "ingest");
+    say("camera publishing rtmp://127.0.0.1:1935/live/ingest");
+    helios.event("stream.connected").await;
+    helios.event("stream.live").await;
+    say("event: stream.live");
+    helios
+        .shadow("ingest's publisher in the shadow", |r| {
+            r["rtmp_ingest"]["publishers"]["ingest"]["address"] == "127.0.0.1"
+        })
+        .await;
+    let codecs = played(&run, "pocket", "pocket");
+    say(&format!("player on play/live/pocket got {codecs}"));
+    assert_eq!(codecs, "aac,hevc");
+
+    // A key no stream takes: the daemon refuses it and nginx drops the camera.
+    let mut stranger = Camera::publish(&run, "ingest-9");
+    assert!(
+        stranger.refused_within(Duration::from_secs(15)),
+        "ingest-9 was accepted"
+    );
+    say("ingest-9 refused: nginx dropped the camera");
+
+    // A second camera on `ingest-1`, H.264 passed through.
+    let second = Camera::publish(&run, "ingest-1");
+    helios
+        .shadow("relay live", |r| r["streams"]["relay"]["state"] == "live")
+        .await;
+    let codecs = played(&run, "relay", "relay");
+    say(&format!(
+        "player on play/live/relay got {codecs} (passed through)"
+    ));
+    assert_eq!(codecs, "aac,h264");
+
+    // The daemon restarts while both cameras publish: no new on_publish comes, so it finds them
+    // on nginx's statistics page.
+    helios.stop().await;
+    daemon.terminate();
+    say("daemon stopped; cameras still publishing to nginx");
+    let daemon = Daemon::start(&bin, &run, "rtmp-daemon.log", &settings);
+    let mut helios = Helios::start(&socket);
+    helios
+        .shadow("both streams live again from the statistics page", |r| {
+            r["streams"]["pocket"]["state"] == "live" && r["streams"]["relay"]["state"] == "live"
+        })
+        .await;
+    let codecs = played(&run, "pocket-after-restart", "pocket");
+    say(&format!("after the restart, play/live/pocket got {codecs}"));
+    assert_eq!(codecs, "aac,hevc");
+
+    // The Pocket stops: on_publish_done, and the stream waits for it again.
+    drop(pocket);
+    let disconnected = helios.event("stream.disconnected").await;
+    assert!(disconnected.contains("publish_done"), "{disconnected}");
+    say("event: stream.disconnected (publish_done)");
+    helios
+        .shadow("pocket waiting, relay still live", |r| {
+            r["streams"]["pocket"]["state"] == "waiting_for_input"
+                && r["streams"]["relay"]["state"] == "live"
+        })
+        .await;
+    drop(second);
+    helios
+        .shadow("relay waiting", |r| {
+            r["streams"]["relay"]["state"] == "waiting_for_input"
+        })
+        .await;
+    helios.stop().await;
+    daemon.terminate();
     say("the daemon stopped on SIGTERM");
 }
