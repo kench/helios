@@ -178,11 +178,12 @@ pub(crate) fn plan(
         Backend::Ceracoder => settings.ceracoder.clone(),
         _ => settings.belacoder.clone(),
     };
-    let env = settings
-        .gst_plugin_path
-        .iter()
-        .map(|path| ("GST_PLUGIN_PATH".to_owned(), path.display().to_string()))
-        .collect();
+    let path = &settings.gst_plugin_path;
+    let env = if path.as_os_str().is_empty() {
+        Vec::new()
+    } else {
+        vec![("GST_PLUGIN_PATH".to_owned(), path.display().to_string())]
+    };
     Plan {
         program,
         args,
@@ -511,6 +512,24 @@ streamid = "publish/live/pattern"
         assert_eq!(
             plan.env,
             [("GST_PLUGIN_PATH".to_owned(), "/opt/helios-gst".to_owned())]
+        );
+        // By default, helios-packages' plugin directory; empty, none.
+        let mut defaults = settings.clone();
+        defaults.gst_plugin_path = StreamSettings::default().gst_plugin_path;
+        let output = target(&settings.outputs["main"], None);
+        let env = super::plan(&defaults, "pattern", profile, output, input, range).env;
+        assert_eq!(
+            env,
+            [(
+                "GST_PLUGIN_PATH".to_owned(),
+                "/usr/lib/helios-gst/gstreamer-1.0".to_owned()
+            )]
+        );
+        defaults.gst_plugin_path = PathBuf::new();
+        assert!(
+            super::plan(&defaults, "pattern", profile, output, input, range)
+                .env
+                .is_empty()
         );
         let files: Vec<_> = plan
             .files

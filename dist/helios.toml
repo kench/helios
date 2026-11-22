@@ -74,7 +74,8 @@ ffmpeg = "/usr/lib/helios-ffmpeg/bin/ffmpeg"
 srtla_send = "/usr/bin/srtla_send"
 belacoder = "/usr/bin/belacoder"   # GStreamer encoders, for profiles with encoder = belacoder
 ceracoder = "/usr/bin/ceracoder"   # or ceracoder (adaptive bitrate)
-# gst_plugin_path = "/usr/lib/helios-gst"  # GST_PLUGIN_PATH for them (the Rockchip plugin)
+gst_plugin_path = "/usr/lib/helios-gst/gstreamer-1.0"  # GST_PLUGIN_PATH for them: the Rockchip
+                                   # plugin (helios-gst-rockchip-rk3588); "" for none
 control_socket = "/run/helios-stream/control.sock"  # the daemon's; Helios connects here
 state_dir = "/var/lib/helios-stream"  # the daemon saves the desired state here
 client_user = "helios"             # who may use the control socket (besides root)
