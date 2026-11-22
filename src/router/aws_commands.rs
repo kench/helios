@@ -41,7 +41,8 @@ fn executions(thing: &str) -> String {
 struct Request {
     module: String,
     name: String,
-    timeout_s: Option<u64>,
+    /// A number, or (from AWS's template, where placeholders sit in strings) a numeric string.
+    timeout_s: Option<Value>,
     args: Option<String>,
 }
 
@@ -142,7 +143,21 @@ fn decode(id: &str, payload: &[u8]) -> Result<Command, InvalidCommand> {
             args
         }
     };
-    let deadline = request.timeout_s.map(|seconds| {
+    let timeout = match &request.timeout_s {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(seconds)) => seconds.as_u64(),
+        Some(Value::String(seconds)) => seconds.trim().parse::<u64>().ok(),
+        Some(_) => None,
+    };
+    if request
+        .timeout_s
+        .as_ref()
+        .is_some_and(|value| !value.is_null())
+        && timeout.is_none()
+    {
+        return Err(invalid("timeout_s isn't a number of seconds".into()));
+    }
+    let deadline = timeout.map(|seconds| {
         let window = Duration::from_secs(seconds)
             .saturating_sub(MARGIN)
             .max(MIN_DEADLINE);

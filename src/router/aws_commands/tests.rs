@@ -61,6 +61,13 @@ fn decodes_a_request() {
         .unwrap()
         .unwrap();
     assert!(command.deadline.unwrap() > SystemTime::now());
+    // AWS's template gives the timeout as a string.
+    let quoted = br#"{"module": "net", "name": "wifi.list", "timeout_s": "10"}"#;
+    let command = AwsCommandsTransport
+        .decode(THING, REQUEST, quoted)
+        .unwrap()
+        .unwrap();
+    assert!(command.deadline.unwrap() > SystemTime::now() + Duration::from_secs(7));
     // Unpadded base64url works too.
     let url = json!({"module": "net", "name": "wifi.set", "args": URL_SAFE_NO_PAD.encode(b"{\"ssid\":\"~?~\"}")});
     let command = AwsCommandsTransport
@@ -77,6 +84,18 @@ fn a_bad_request_is_answered_by_its_execution() {
         (
             br#"{"module": "", "name": "x"}"#.to_vec(),
             "must not be empty",
+        ),
+        (
+            br#"{"module": "net", "name": "x", "timeout_s": "soon"}"#.to_vec(),
+            "isn't a number of seconds",
+        ),
+        (
+            br#"{"module": "net", "name": "x", "timeout_s": -1}"#.to_vec(),
+            "isn't a number of seconds",
+        ),
+        (
+            br#"{"module": "net", "name": "x", "timeout_s": []}"#.to_vec(),
+            "isn't a number of seconds",
         ),
         (
             br#"{"module": "net", "name": "x", "args": "***"}"#.to_vec(),
