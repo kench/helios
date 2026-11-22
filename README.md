@@ -28,12 +28,13 @@ clock reading when it checks certificate dates. Set `SOURCE_DATE_EPOCH` for repr
 
 Device modules are Cargo features, off by default, so each device's build carries only the
 modules it uses: `module-display` (the display module, with its fonts and the `fontdue` and
-`jiff` crates) and `module-usb` (the usb module, no extra crates). Builds by device:
+`jiff` crates), `module-usb` (the usb module, no extra crates) and `module-stream` (the stream
+module; it needs `module-usb`). Builds by device:
 
 | Device | Build |
 | --- | --- |
 | Scanner (PROXmobil3) | `cargo zigbuild --release --target armv7-unknown-linux-gnueabihf.2.28 --features module-display,module-usb` |
-| Relay (Raspberry Pi 5), transcoder (Orange Pi 5 Plus) | the release workflow's package: `--features module-usb` |
+| Relay (Raspberry Pi 5), transcoder (Orange Pi 5 Plus) | the release workflow's package: `--features module-usb,module-stream` |
 
 The checks below use `--all-features`; CI also runs Clippy and the tests with
 `--no-default-features`.
@@ -82,6 +83,18 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   rows that change, needs no `unsafe` code, and shows "Helios stopped" on shutdown. It needs the
   `video` group. `bold_font` can name a font file on the device to use for bold text instead, for
   licensed fonts that mustn't be compiled into Helios; the scanner keeps it on the USB drive.
+- `stream` (LLD 4, Cargo feature `module-stream`): video streams through ffmpeg to SRT listeners,
+  directly or bonded over several uplinks by `srtla_send`. Sources: USB cameras (from the usb
+  module) and a generated test pattern; RTMP ingest comes next. `stream.start`, `stream.stop` and
+  `stream.status`; events `stream.connected`, `stream.live`, `stream.disconnected` and
+  `stream.stats`; the `stream` shadow has each stream's and each bonded output's state, with
+  per-link statistics. ffmpeg's arguments come only from the local profiles.
+
+  `tests/stream-e2e/` runs it end to end without root: `setup.sh` builds nginx's RTMP module,
+  `srtla_send`, `srtla_rec` and irl-srt-server (pinned) into `~/.cache/helios-stream-e2e`;
+  `external.sh` checks the external pieces together; `helios.sh` runs this module with the real
+  ffmpeg and `srtla_send` through `srtla_rec` to irl-srt-server, dropping and restoring an uplink
+  on the way.
 
 The other modules come later.
 

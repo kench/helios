@@ -15,29 +15,84 @@ pub(crate) struct CameraNodes {
 }
 
 /// The arguments (after the program) for a camera stream to an SRT output.
+/// Where ffmpeg sends: the output's SRT listener (`direct`), or its local `srtla_send`'s port
+/// on loopback (`srtla`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Target<'a> {
+    pub output: &'a Output,
+    pub streamid: &'a str,
+    /// The local sender's port, for `srtla` outputs.
+    pub sender_port: Option<u16>,
+}
+
+const COMMON: [&str; 8] = [
+    "-hide_banner",
+    "-nostdin",
+    "-loglevel",
+    "warning",
+    "-progress",
+    "pipe:1",
+    "-stats_period",
+    "2",
+];
+
+/// The arguments for a generated test pattern with a 1 kHz tone, at real-time speed.
+pub(crate) fn test_args(
+    profile: &Profile,
+    target: Target<'_>,
+    size: &str,
+    fps: u32,
+    bitrate_kbps: u32,
+) -> Vec<String> {
+    let mut args: Vec<String> = COMMON.map(String::from).into();
+    args.extend(
+        [
+            "-re".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            format!("testsrc2=size={size}:rate={fps}"),
+        ]
+        .into_iter()
+        .chain(
+            (profile.audio != "none")
+                .then(|| {
+                    [
+                        "-re",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=frequency=1000:sample_rate=48000",
+                    ]
+                    .map(String::from)
+                })
+                .into_iter()
+                .flatten(),
+        ),
+    );
+    args.extend(["-map".into(), "0:v:0".into()]);
+    if profile.audio != "none" {
+        args.extend(["-map".into(), "1:a:0".into()]);
+    }
+    args.extend(video_args(profile, bitrate_kbps));
+    if profile.audio == "none" {
+        args.push("-an".into());
+    } else {
+        args.extend(audio_args(&profile.audio));
+    }
+    args.extend(output_args(target));
+    args
+}
+
+/// The arguments for a camera stream.
 pub(crate) fn camera_args(
     profile: &Profile,
-    output: &Output,
-    streamid: &str,
+    target: Target<'_>,
     nodes: &CameraNodes,
     bitrate_kbps: u32,
 ) -> Vec<String> {
-    let mut args: Vec<String> = [
-        "-hide_banner",
-        "-nostdin",
-        "-loglevel",
-        "warning",
-        "-progress",
-        "pipe:1",
-        "-stats_period",
-        "2",
-        "-f",
-        "v4l2",
-        "-thread_queue_size",
-        "512",
-    ]
-    .map(String::from)
-    .into();
+    let mut args: Vec<String> = COMMON.map(String::from).into();
+    args.extend(["-f", "v4l2", "-thread_queue_size", "512"].map(String::from));
     let input = &profile.input;
     if !input.format.is_empty() {
         args.extend(["-input_format".into(), input.format.clone()]);
@@ -63,7 +118,7 @@ pub(crate) fn camera_args(
     } else {
         args.push("-an".into());
     }
-    args.extend(output_args(output, streamid));
+    args.extend(output_args(target));
     args
 }
 
@@ -88,6 +143,17 @@ fn video_args(profile: &Profile, bitrate_kbps: u32) -> Vec<String> {
             .map(String::from),
         ),
         "h264_rkmpp" | "hevc_rkmpp" => args.extend(["-rc_mode".into(), "CBR".into()]),
+        "libx265" => args.extend(
+            [
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-x265-params",
+                "log-level=error",
+            ]
+            .map(String::from),
+        ),
         _ => {}
     }
     args.extend(["-b:v".into(), bitrate]);
@@ -111,26 +177,27 @@ fn audio_args(audio: &str) -> Vec<String> {
 
 /// MPEG-TS (irl-srt-server accepts only that) to an SRT listener in caller mode. ffmpeg's SRT
 /// `latency` is in microseconds.
-fn output_args(output: &Output, streamid: &str) -> Vec<String> {
+fn output_args(target: Target<'_>) -> Vec<String> {
     vec![
         "-f".into(),
         "mpegts".into(),
         "-mpegts_flags".into(),
         "+resend_headers".into(),
-        srt_url(output, streamid),
+        srt_url(target),
     ]
 }
 
-pub(crate) fn srt_url(output: &Output, streamid: &str) -> String {
-    let host = if output.host.contains(':') {
-        format!("[{}]", output.host)
-    } else {
-        output.host.clone()
+pub(crate) fn srt_url(target: Target<'_>) -> String {
+    let output = target.output;
+    let (host, port) = match target.sender_port {
+        Some(port) => ("127.0.0.1".to_owned(), port),
+        None if output.host.contains(':') => (format!("[{}]", output.host), output.port),
+        None => (output.host.clone(), output.port),
     };
     let mut url = format!(
-        "srt://{host}:{}?mode=caller&latency={}&streamid={streamid}",
-        output.port,
-        u64::from(output.latency_ms) * 1000
+        "srt://{host}:{port}?mode=caller&latency={}&streamid={}",
+        u64::from(output.latency_ms) * 1000,
+        target.streamid
     );
     if let Some(passphrase) = &output.passphrase {
         url.push_str("&passphrase=");

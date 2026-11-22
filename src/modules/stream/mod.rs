@@ -11,9 +11,13 @@
 //! `stream.live`, `stream.disconnected` (with a reason) and, while live, `stream.stats`.
 //! Commands: `stream.start`, `stream.stop`, `stream.status`.
 
+mod addrs;
+#[cfg(test)]
+mod e2e;
 mod ffmpeg;
 mod process;
 pub(crate) mod settings;
+mod srtla;
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -30,10 +34,12 @@ use crate::mqtt::envelope::timestamp;
 use crate::router::{Outcome, codes};
 
 use super::{Module, ModuleContext, ModuleError, ModuleFuture};
+use addrs::Address;
 use ffmpeg::{CameraNodes, Progress, ProgressParser};
 use process::{Job, JobEvent, JobSpec, Spawner, Tagged};
 pub use settings::StreamSettings;
 use settings::{Source, Stream};
+use srtla::Senders;
 
 /// The module name: commands, events, shadow and config section.
 pub const MODULE: &str = "stream";
@@ -85,7 +91,14 @@ pub struct StreamModule {
     settings: StreamSettings,
     usb: UsbHandle,
     spawner: Arc<dyn Spawner>,
+    addresses: Arc<Addresses>,
 }
+
+/// Where uplink addresses come from: rtnetlink, or a fake in tests.
+type Addresses = dyn Fn() -> std::io::Result<Vec<Address>> + Send + Sync;
+
+/// How often uplink addresses are read again.
+const ADDRESS_REFRESH: Duration = Duration::from_secs(5);
 
 impl StreamModule {
     /// The module, following cameras through the usb module's `handle`.
@@ -95,15 +108,22 @@ impl StreamModule {
             settings,
             usb,
             spawner: Arc::new(process::System),
+            addresses: Arc::new(addrs::ipv4_addresses),
         }
     }
 
     #[cfg(test)]
-    fn with_spawner(settings: StreamSettings, usb: UsbHandle, spawner: Arc<dyn Spawner>) -> Self {
+    fn with_fakes(
+        settings: StreamSettings,
+        usb: UsbHandle,
+        spawner: Arc<dyn Spawner>,
+        addresses: Arc<Addresses>,
+    ) -> Self {
         Self {
             settings,
             usb,
             spawner,
+            addresses,
         }
     }
 }
@@ -179,6 +199,7 @@ impl Entry {
                 json!({"type": "camera", "video": video, "audio": audio})
             }
             Source::Rtmp { camera } => json!({"type": "rtmp", "camera": camera}),
+            Source::Test { size, fps } => json!({"type": "test", "size": size, "fps": fps}),
         };
         if let (Some(source), Value::Object(camera)) = (source.as_object_mut(), &self.camera) {
             source.extend(camera.clone());
@@ -211,6 +232,10 @@ struct Streams<'a> {
     /// Jobs being stopped, awaited at shutdown.
     stopping: Vec<tokio::task::JoinHandle<()>>,
     reported: Option<(Value, Value, Instant)>,
+    senders: Senders,
+    sender_stats: mpsc::UnboundedReceiver<(u64, Value)>,
+    addresses: Vec<Address>,
+    addresses_at: Option<Instant>,
 }
 
 impl<'a> Streams<'a> {
@@ -247,6 +272,7 @@ impl<'a> Streams<'a> {
                 progress: None,
             })
             .collect();
+        let (stats_tx, sender_stats) = mpsc::unbounded_channel();
         Self {
             module,
             entries,
@@ -255,6 +281,10 @@ impl<'a> Streams<'a> {
             events,
             stopping: Vec::new(),
             reported: None,
+            senders: Senders::new(&module.settings, stats_tx),
+            sender_stats,
+            addresses: Vec::new(),
+            addresses_at: None,
         }
     }
 
@@ -274,6 +304,7 @@ impl<'a> Streams<'a> {
         loop {
             let devices = snapshot.borrow_and_update().clone();
             let now = Instant::now();
+            self.reconcile_senders(&devices, now);
             for index in 0..self.entries.len() {
                 self.reconcile(index, &devices, now, &ctx);
             }
@@ -293,10 +324,17 @@ impl<'a> Streams<'a> {
                     Some(state) => self.desired(&state),
                     None => desired_open = false,
                 },
-                changed = snapshot.changed() => if changed.is_err() {
-                    return Err(ModuleError("the usb module's snapshot closed".into()));
-                },
+                changed = snapshot.changed() => {
+                    if changed.is_err() {
+                        return Err(ModuleError("the usb module's snapshot closed".into()));
+                    }
+                    // A USB network device came or went: read uplink addresses again now.
+                    self.addresses_at = None;
+                }
                 Some(tagged) = self.events.recv() => self.job_event(tagged, &ctx),
+                Some((job, snapshot)) = self.sender_stats.recv() => {
+                    self.senders.stats(job, snapshot, Instant::now());
+                }
                 _ = stats.tick() => self.stats(&ctx),
                 () = tokio::time::sleep_until(wake) => {}
             }
@@ -333,7 +371,9 @@ impl<'a> Streams<'a> {
         if self.entries[index].state == State::Failed {
             return;
         }
-        if self.entries[index].nodes.is_none() {
+        let ready = matches!(self.entries[index].config.source, Source::Test { .. })
+            || self.entries[index].nodes.is_some();
+        if !ready {
             self.stop_job(index);
             self.disconnect(index, "camera_removed", ctx);
             let entry = &mut self.entries[index];
@@ -366,30 +406,92 @@ impl<'a> Streams<'a> {
             entry.set_state(State::Reconnecting);
             return;
         }
+        // An srtla output must carry traffic before ffmpeg can connect through it.
+        let output = &entry.config.output;
+        if self.senders.port(output).is_some() && !self.senders.state(output, now).carries() {
+            let waiting = format!(
+                "waiting for output {output}: {}",
+                self.senders.state(output, now).as_str()
+            );
+            let entry = &mut self.entries[index];
+            if entry.state != State::Reconnecting {
+                entry.set_state(State::Starting);
+            }
+            entry.last_error.get_or_insert(waiting);
+            return;
+        }
         self.start_job(index, ctx);
+    }
+
+    /// The outputs live streams need now, and the senders for them; reads uplink addresses
+    /// again every few seconds while any sender is wanted.
+    fn reconcile_senders(&mut self, devices: &UsbSnapshot, now: Instant) {
+        let wanted: Vec<&str> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.desired_live
+                    && entry.unusable.is_none()
+                    && entry.state != State::Failed
+                    && (matches!(entry.config.source, Source::Test { .. }) || entry.nodes.is_some())
+            })
+            .map(|entry| entry.config.output.as_str())
+            .filter(|output| self.senders.port(output).is_some())
+            .collect();
+        if !wanted.is_empty()
+            && self
+                .addresses_at
+                .is_none_or(|at| now.duration_since(at) >= ADDRESS_REFRESH)
+        {
+            match (self.module.addresses)() {
+                Ok(addresses) => self.addresses = addresses,
+                Err(error) => tracing::warn!(%error, "can't read interface addresses"),
+            }
+            self.addresses_at = Some(now);
+        }
+        let wanted: Vec<String> = wanted.into_iter().map(str::to_owned).collect();
+        let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        self.senders.reconcile(
+            &wanted,
+            devices,
+            &self.addresses,
+            now,
+            srtla::Spawning {
+                spawner: self.module.spawner.as_ref(),
+                events: &self.events_tx,
+                next_job: &mut self.next_job,
+            },
+        );
     }
 
     fn start_job(&mut self, index: usize, ctx: &ModuleContext) {
         let module = self.module;
         let settings = &module.settings;
         let entry = &mut self.entries[index];
-        let (Some(profile), Some(output), Some(nodes)) = (
+        let (Some(profile), Some(output)) = (
             settings.profiles.get(&entry.config.profile),
             settings.outputs.get(&entry.config.output),
-            entry.nodes.as_ref(),
         ) else {
             return;
+        };
+        let target = ffmpeg::Target {
+            output,
+            streamid: &entry.config.streamid,
+            sender_port: self.senders.port(&entry.config.output),
+        };
+        let args = match (&entry.config.source, entry.nodes.as_ref()) {
+            (Source::Test { size, fps }, _) => {
+                ffmpeg::test_args(profile, target, size, *fps, entry.bitrate_kbps)
+            }
+            (Source::Camera { .. }, Some(nodes)) => {
+                ffmpeg::camera_args(profile, target, nodes, entry.bitrate_kbps)
+            }
+            _ => return,
         };
         let spec = JobSpec {
             name: entry.id.clone(),
             program: settings.ffmpeg.clone(),
-            args: ffmpeg::camera_args(
-                profile,
-                output,
-                &entry.config.streamid,
-                nodes,
-                entry.bitrate_kbps,
-            ),
+            args,
         };
         self.next_job += 1;
         let id = self.next_job;
@@ -483,6 +585,9 @@ impl<'a> Streams<'a> {
     }
 
     fn job_event(&mut self, tagged: Tagged, ctx: &ModuleContext) {
+        if self.senders.job_event(&tagged, Instant::now()) {
+            return;
+        }
         let Some(index) = self
             .entries
             .iter()
@@ -513,6 +618,7 @@ impl<'a> Streams<'a> {
                             let payload = json!({
                                 "stream_id": entry.id, "profile": entry.config.profile,
                                 "bitrate_kbps": entry.bitrate_kbps, "output": entry.config.output,
+                                "active_links": self.senders.active_links(&entry.config.output),
                             });
                             ctx.mqtt.publish_event(MODULE, "stream.live", payload);
                         }
@@ -653,9 +759,11 @@ impl<'a> Streams<'a> {
             .iter()
             .filter(|e| e.state == State::Live && !e.quiet)
         {
+            let outputs = self.senders.report(Instant::now(), false);
             let payload = json!({
                 "stream_id": entry.id, "encoder": entry.encoder(),
                 "bitrate_kbps": entry.bitrate_kbps, "output": entry.config.output,
+                "link_stats": outputs.get(&entry.config.output),
             });
             ctx.mqtt.publish_event(MODULE, "stream.stats", payload);
         }
@@ -672,15 +780,20 @@ impl<'a> Streams<'a> {
 
     /// Reports the shadow: state changes at once, encoder figures at most once a minute.
     fn report(&mut self, ctx: &ModuleContext) {
-        let full = self.statuses(false);
-        let mut significant = full.clone();
-        if let Some(streams) = significant.as_object_mut() {
+        let now = Instant::now();
+        let streams = self.statuses(false);
+        let mut quiet_streams = streams.clone();
+        if let Some(streams) = quiet_streams.as_object_mut() {
             for status in streams.values_mut() {
                 if let Some(status) = status.as_object_mut() {
                     status.remove("encoder");
                 }
             }
         }
+        // Encoder and per-link figures change all the time: they wait for the interval.
+        let full = json!({"streams": streams, "outputs": self.senders.report(now, false)});
+        let significant =
+            json!({"streams": quiet_streams, "outputs": self.senders.report(now, true)});
         let due = match &self.reported {
             None => true,
             Some((last_significant, last_full, at)) => {
@@ -689,8 +802,7 @@ impl<'a> Streams<'a> {
             }
         };
         if due {
-            let mut reported = Map::new();
-            reported.insert("streams".into(), full.clone());
+            let reported: Map<String, Value> = full.as_object().cloned().unwrap_or_default();
             ctx.shadows.report(MODULE, reported);
             self.reported = Some((significant, full, Instant::now()));
         }
@@ -714,6 +826,12 @@ impl<'a> Streams<'a> {
         if let Some((_, _, at)) = &self.reported {
             wake = wake.min((*at + ENCODER_REPORT).max(now + Duration::from_secs(1)));
         }
+        if let Some(at) = self.senders.next_wake() {
+            wake = wake.min(at.max(now + Duration::from_millis(100)));
+        }
+        if let Some(at) = self.addresses_at {
+            wake = wake.min(at + ADDRESS_REFRESH);
+        }
         wake
     }
 
@@ -723,10 +841,11 @@ impl<'a> Streams<'a> {
             self.disconnect(index, "stopped", ctx);
             self.entries[index].set_state(State::Stopped);
         }
-        self.report(ctx);
         for task in self.stopping.drain(..) {
             let _ = task.await;
         }
+        self.senders.shutdown().await;
+        self.report(ctx);
     }
 }
 
