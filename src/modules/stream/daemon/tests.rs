@@ -88,15 +88,16 @@ fn reads_users_desired_state_and_activity() {
     assert_eq!(uid_of("root", passwd), Some(0));
     assert_eq!(uid_of("nobody", passwd), None);
     let shadow: Map<String, Value> = json!({"streams": {
-        "a": {"state": "live", "desired": "live", "bitrate_kbps": 3000},
-        "b": {"state": "stopped", "desired": "stopped", "bitrate_kbps": 2000},
+        "a": {"state": "live", "desired": "live", "bitrate_kbps": 3000, "bitrate_override_kbps": 3000},
+        "b": {"state": "stopped", "desired": "stopped", "bitrate_kbps": 2000, "bitrate_override_kbps": null},
     }})
     .as_object()
     .cloned()
     .expect("object");
     assert_eq!(
         desired_state(&shadow),
-        json!({"streams": {"a": {"state": "live", "bitrate_kbps": 3000}, "b": {"state": "stopped", "bitrate_kbps": 2000}}})
+        // Only an override is saved: b follows its profile, even if the profile changes.
+        json!({"streams": {"a": {"state": "live", "bitrate_kbps": 3000}, "b": {"state": "stopped", "bitrate_kbps": null}}})
     );
     assert!(busy(&shadow));
     assert!(!busy(&Map::new()));

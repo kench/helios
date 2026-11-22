@@ -323,7 +323,8 @@ fn peer_allowed(stream: &UnixStream, allowed: &[u32]) -> Result<(), String> {
     }
 }
 
-/// The desired state in a `stream` shadow report: each stream's `desired` and bitrate.
+/// The desired state in a `stream` shadow report: each stream's `desired` and bitrate override
+/// (`null`: the profile's, so a config change to the profile applies after a restart).
 pub(crate) fn desired_state(shadow: &Map<String, Value>) -> Value {
     let streams: Map<String, Value> = shadow
         .get("streams")
@@ -333,7 +334,7 @@ pub(crate) fn desired_state(shadow: &Map<String, Value>) -> Value {
         .map(|(id, status)| {
             (
                 id.clone(),
-                json!({"state": status["desired"], "bitrate_kbps": status["bitrate_kbps"]}),
+                json!({"state": status["desired"], "bitrate_kbps": status["bitrate_override_kbps"]}),
             )
         })
         .collect();
