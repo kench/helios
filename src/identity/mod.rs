@@ -9,6 +9,7 @@ pub mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
 pub mod pin;
+pub mod secrets;
 pub mod signer;
 #[cfg(test)]
 pub(crate) mod testing;

@@ -27,6 +27,8 @@ pub(crate) enum Op {
     FindKey,
     ReadCertificate,
     SignDigest,
+    SecretsKey,
+    Ecdh,
 }
 
 /// A key on the mock token.
@@ -57,6 +59,8 @@ struct State {
     panics: Vec<Op>,
     sign_delay: Duration,
     raw_signature_override: Option<RawSignature>,
+    /// The secrets key pair, once made, by label.
+    secrets: HashMap<String, p256::SecretKey>,
 }
 
 /// A mock token. Clones share the same state.
@@ -89,6 +93,7 @@ impl MockToken {
             panics: Vec::new(),
             sign_delay: Duration::ZERO,
             raw_signature_override: None,
+            secrets: HashMap::new(),
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -313,6 +318,41 @@ impl TokenBackend for MockToken {
             state.logged_in = false;
             label.clone_into(&mut state.token_label);
         }
+    }
+
+    fn secrets_key(&mut self, label: &str) -> Result<Vec<u8>, TokenError> {
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        let mut state = self.state();
+        state.enter(Op::SecretsKey)?;
+        if !state.logged_in {
+            return Err(TokenError::Other("not logged in".into()));
+        }
+        let key = state
+            .secrets
+            .entry(label.to_owned())
+            .or_insert_with(|| p256::SecretKey::from_slice(&[0x5e; 32]).expect("a valid scalar"));
+        Ok(key.public_key().to_sec1_point(false).as_bytes().to_vec())
+    }
+
+    fn ecdh(
+        &mut self,
+        label: &str,
+        peer: &[u8],
+    ) -> Result<secrecy::zeroize::Zeroizing<Vec<u8>>, TokenError> {
+        let mut state = self.state();
+        state.enter(Op::Ecdh)?;
+        let key = state
+            .secrets
+            .get(label)
+            .ok_or_else(|| TokenError::KeyNotFound {
+                label: label.to_owned(),
+            })?;
+        let peer = p256::PublicKey::from_sec1_bytes(peer)
+            .map_err(|_| TokenError::Other("CKR_DOMAIN_PARAMS_INVALID".into()))?;
+        let shared = p256::ecdh::diffie_hellman(key.to_nonzero_scalar(), peer.as_affine());
+        Ok(secrecy::zeroize::Zeroizing::new(
+            shared.raw_secret_bytes().to_vec(),
+        ))
     }
 }
 
