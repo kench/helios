@@ -19,6 +19,7 @@ pub mod mqtt;
 pub mod provision;
 pub mod router;
 pub mod service;
+pub mod sigv4;
 pub mod ulid;
 
 mod sysfs;
