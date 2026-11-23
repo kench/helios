@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::clock::ClockStatus;
+use crate::clock::{ClockReport, ClockStatus};
 use crate::credentials::provider::CredentialsStatus;
 use crate::identity::manager::IdentityState;
 use crate::modules::ModuleStates;
@@ -46,6 +46,8 @@ pub struct Sources {
     pub mqtt: watch::Receiver<MqttStatus>,
     /// The clock checks' results (LLD 1, section 4.11).
     pub clock: watch::Receiver<ClockStatus>,
+    /// How much of the clock to report (`clock.report`).
+    pub clock_report: ClockReport,
     /// Each device module's state, from the supervisor.
     pub modules: watch::Receiver<ModuleStates>,
     /// The kernel's boot ID.
@@ -222,9 +224,10 @@ fn reported(sources: &Sources) -> Map<String, Value> {
         }),
     );
     let offset = clock.offset;
-    reported.insert(
-        "clock".into(),
-        json!({
+    let clock_json = match sources.clock_report {
+        // The details are left out, so the shadow manager removes them from the shadow.
+        ClockReport::Synced => json!({"synced": clock.synced}),
+        ClockReport::Full => json!({
             "synced": clock.synced,
             "max_error_ms": clock.max_error_ms,
             // Two decimals: finer than NTP's estimate means, and stable in the shadow.
@@ -235,7 +238,8 @@ fn reported(sources: &Sources) -> Map<String, Value> {
             "offset_at": offset.map(|o| timestamp(o.at)),
             "boot_offset_s": clock.boot_offset_s,
         }),
-    );
+    };
+    reported.insert("clock".into(), clock_json);
     reported.insert("modules".into(), Value::Object(modules));
     reported
 }

@@ -57,6 +57,9 @@ helios_shadow_interval_s = 60  # 10 to 86400: how often the helios shadow may be
 # Clock checks (LLD 1, section 4.11). Helios reports the clock in the helios shadow but never
 # sets it. The platform may write /run/helios/boot-clock before NTP runs, for the boot offset.
 warn_offset_s = 60           # warn when off from server time by more; error above 240 s
+# What the helios shadow's clock block holds: "synced" (the default) only clock.synced; "full"
+# also the error bound, drift, server offset and boot offset, which change every minute.
+# report = "synced"
 
 [modules.usb]
 # USB devices arriving and leaving (LLD 5), from the kernel's uevents and sysfs: events

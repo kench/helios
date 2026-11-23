@@ -244,6 +244,7 @@ enum CommandsSetting {
 struct ClockSection {
     warn_offset_s: Option<u64>,
     state_file: Option<PathBuf>,
+    report: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,8 +455,18 @@ impl ClockSection {
                     .to_owned(),
             );
         }
+        let report = match self.report.as_deref() {
+            None | Some("synced") => crate::clock::ClockReport::Synced,
+            Some("full") => crate::clock::ClockReport::Full,
+            Some(other) => {
+                return Err(format!(
+                    "clock.report must be \"synced\" or \"full\", not {other:?}"
+                ));
+            }
+        };
         Ok(ClockSettings {
             warn_offset,
+            report,
             ..defaults
         })
     }
