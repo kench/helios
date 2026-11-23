@@ -110,6 +110,9 @@ pub struct Config {
     /// The `[modules.net]` settings, when it's enabled (LLD 3).
     #[cfg(feature = "module-net")]
     pub net: Option<crate::modules::net::NetSettings>,
+    /// The `[modules.gps]` settings, when it's enabled (LLD 10).
+    #[cfg(feature = "module-gps")]
+    pub gps: Option<crate::modules::gps::GpsSettings>,
     /// Sections this version doesn't use: modules as `modules.<name>`, then top-level sections.
     pub ignored_sections: Vec<String>,
 }
@@ -157,6 +160,8 @@ struct ModulesSection {
     stream: Option<crate::modules::stream::StreamSettings>,
     #[cfg(feature = "module-net")]
     net: Option<crate::modules::net::NetSettings>,
+    #[cfg(feature = "module-gps")]
+    gps: Option<crate::modules::gps::GpsSettings>,
     #[cfg(feature = "module-display")]
     display: Option<DisplaySection>,
     #[serde(flatten)]
@@ -365,6 +370,13 @@ impl File {
                 .modules
                 .net
                 .map(crate::modules::net::NetSettings::check)
+                .transpose()?
+                .flatten(),
+            #[cfg(feature = "module-gps")]
+            gps: self
+                .modules
+                .gps
+                .map(crate::modules::gps::GpsSettings::check)
                 .transpose()?
                 .flatten(),
             ignored_sections: self
