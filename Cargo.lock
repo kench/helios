@@ -707,6 +707,7 @@ dependencies = [
  "fontdue",
  "getrandom 0.4.3",
  "hkdf",
+ "hmac",
  "http-body-util",
  "httpdate",
  "hyper",

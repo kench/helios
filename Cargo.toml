@@ -79,6 +79,7 @@ toml = { version = "1.2.1", default-features = false, features = ["parse", "serd
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 x509-parser = "0.18.1"
+hmac = "0.13"
 
 [features]
 # Device modules (HLD section 6.1), off by default so each device's build carries only the
