@@ -88,6 +88,8 @@ module-usb = []
 module-stream = ["module-usb", "tokio/process", "tokio/io-util"]
 # The net module (LLD 3): network interfaces, addresses and default routes, over rtnetlink.
 module-net = []
+# The gps module (LLD 10): the position, from gpsd. Boards only.
+module-gps = ["tokio/io-util"]
 
 [dev-dependencies]
 bytes = "1.12.1"

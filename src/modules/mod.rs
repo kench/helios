@@ -5,9 +5,10 @@
 //! - `usb`: USB devices arriving and leaving, from kernel uevents and sysfs (LLD 5).
 //! - `stream`: video streams to SRT listeners through ffmpeg (LLD 4).
 //! - `net`: network interfaces, their link state, addresses and default routes (LLD 3).
+//! - `gps`: the position, from gpsd (LLD 10).
 //!
 //! Each module is behind a Cargo feature (`module-display`, `module-usb`, `module-stream`,
-//! `module-net`), off by default, so a device's build
+//! `module-net`, `module-gps`), off by default, so a device's build
 //! carries only the modules it uses. In a build without it, the module's config section is
 //! reported as unused, like any other unknown section.
 //!
@@ -31,6 +32,8 @@ use crate::router::PendingCommand;
 
 #[cfg(feature = "module-display")]
 pub mod display;
+#[cfg(feature = "module-gps")]
+pub mod gps;
 #[cfg(feature = "module-net")]
 pub mod net;
 #[cfg(feature = "module-stream")]

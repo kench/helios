@@ -305,6 +305,10 @@ impl Service {
             )));
             handle
         });
+        #[cfg(feature = "module-gps")]
+        if let Some(settings) = &config.gps {
+            enabled.push(Arc::new(crate::modules::gps::GpsModule::new(settings)));
+        }
         #[cfg(feature = "module-net")]
         if let Some(settings) = config.net {
             enabled.push(Arc::new(crate::modules::net::NetModule::new(
