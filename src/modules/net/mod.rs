@@ -13,6 +13,7 @@
 
 pub(crate) mod netlink;
 pub(crate) mod nl80211;
+pub(crate) mod routes;
 pub(crate) mod snapshot;
 pub(crate) mod wifi;
 
