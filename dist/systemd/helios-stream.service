@@ -10,9 +10,9 @@ After=network-online.target helios-firewall.service
 [Service]
 User=helios-stream
 # Group helios: to read /etc/helios/helios.toml and to share the control socket with Helios.
-# video: the cameras and the RK3588's encoder devices.
+# video: the cameras and the RK3588's encoder devices. audio: a USB camera's microphone (ALSA).
 Group=helios
-SupplementaryGroups=video
+SupplementaryGroups=video audio
 ExecStart=/usr/bin/helios stream-daemon
 # Exit 0 after an upgrade's idle restart, or 78 for a configuration problem; anything else is
 # restarted, and the saved desired state brings streams back.
