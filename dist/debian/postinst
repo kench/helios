@@ -20,9 +20,11 @@ if [ "$1" = configure ]; then
         adduser --system --group --home /nonexistent --no-create-home \
             --gecos "Helios RTMP ingest (nginx)" helios-rtmp
     fi
-    if getent group video >/dev/null; then
-        adduser helios-stream video >/dev/null || true
-    fi
+    for group in video audio; do
+        if getent group "$group" >/dev/null; then
+            adduser helios-stream "$group" >/dev/null || true
+        fi
+    done
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
         # Upgrades restart a running Helios; installs and stopped services are left alone.
