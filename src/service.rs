@@ -195,6 +195,7 @@ impl Service {
         manager.sign_timeout = config.sign_timeout;
 
         let cancel = CancellationToken::new();
+        let clock_report = config.clock.report;
         let (clock_samples, clock_status, clock_task) = ClockMonitor::start(
             config.clock.clone(),
             timing.clock,
@@ -341,6 +342,7 @@ impl Service {
                 credentials: credentials.status(),
                 mqtt: mqtt.status(),
                 clock: clock_status,
+                clock_report,
                 modules: module_states,
                 boot_id: platform.boot_id.clone(),
                 started_at,

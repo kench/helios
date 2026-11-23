@@ -71,9 +71,10 @@ Helios's own `helios/<thing>/cmd|rsp/<module>` topics and as AWS IoT command exe
 (`$aws/commands/things/<thing>/executions/<id>/request/json`, answered on `…/response/json`;
 `mqtt.commands`, both by default; LLD 2, section 7.3), and checks the clock (LLD 1, section 4.11): the kernel's NTP state, the offset from
 server time in replies it gets anyway, and, if the platform writes `/run/helios/boot-clock`
-before NTP runs, how far off the clock was at power-on. It reports them in the shadow's `clock`
-object and logs offsets over `clock.warn_offset_s` (60 s) as warnings and over 240 s as errors.
-It never sets the clock.
+before NTP runs, how far off the clock was at power-on. The shadow's `clock` object holds only
+`synced` by default (`clock.report = "synced"`); `clock.report = "full"` adds the error bound,
+drift, server offset and boot offset, which change every minute. Either way it logs offsets over
+`clock.warn_offset_s` (60 s) as warnings and over 240 s as errors. It never sets the clock.
 
 Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
 
