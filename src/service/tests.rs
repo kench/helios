@@ -83,6 +83,8 @@ fn local_config(service: &MockService, pin_dir: &Path) -> Config {
         stream: None,
         #[cfg(feature = "module-net")]
         net: None,
+        #[cfg(feature = "module-gps")]
+        gps: None,
         ignored_sections: vec!["modules.usb".into()],
     }
 }

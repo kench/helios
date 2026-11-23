@@ -117,7 +117,10 @@ pub(crate) struct PendingEvent {
     time: SystemTime,
 }
 
-#[cfg(any(feature = "module-stream", all(test, feature = "module-net")))]
+#[cfg(any(
+    feature = "module-stream",
+    all(test, any(feature = "module-net", feature = "module-gps"))
+))]
 impl PendingEvent {
     /// The event's type, such as `stream.live`.
     pub(crate) fn kind(&self) -> &str {

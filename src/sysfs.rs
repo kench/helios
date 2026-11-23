@@ -12,7 +12,7 @@ pub(crate) fn on_usb(device: &Path) -> bool {
 }
 
 /// Whether `port` is a USB port name: `<bus>-<port>[.<port>…]` (`1-1.3`).
-#[cfg(any(feature = "module-usb", feature = "module-net"))]
+#[cfg(any(feature = "module-usb", feature = "module-net", feature = "module-gps"))]
 pub(crate) fn is_port(port: &str) -> bool {
     let digits = |segment: &str| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit());
     port.split_once('-')
@@ -20,7 +20,7 @@ pub(crate) fn is_port(port: &str) -> bool {
 }
 
 /// The USB port a sysfs device path is below: its last component that names one.
-#[cfg(feature = "module-net")]
+#[cfg(any(feature = "module-net", feature = "module-gps"))]
 pub(crate) fn usb_port(device: &Path) -> Option<String> {
     device
         .components()
