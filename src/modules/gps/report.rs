@@ -168,6 +168,8 @@ pub(crate) struct State {
     last_fix: Option<Fix>,
     mode: Mode,
     since: SystemTime,
+    /// `[modules.gps] device`, and whether gpsd opened it when last asked.
+    device: Option<(String, Result<(), String>)>,
 }
 
 impl State {
@@ -178,7 +180,18 @@ impl State {
             last_fix: None,
             mode: Mode::None,
             since: now,
+            device: None,
         }
+    }
+
+    /// Records whether gpsd opened the configured receiver.
+    pub(crate) fn set_device(&mut self, path: &str, added: Result<(), String>) {
+        self.device = Some((path.to_owned(), added));
+    }
+
+    /// Whether gpsd has the receiver at `path`.
+    pub(crate) fn has_receiver(&self, path: &str) -> bool {
+        self.receivers.contains_key(path)
     }
 
     /// The fix the shadow reports: the first receiver (by path) that has one.
@@ -283,6 +296,7 @@ impl State {
             self.receivers.keys().cloned().collect(),
             self.mode,
             satellites,
+            self.device.as_ref().is_some_and(|(_, added)| added.is_ok()),
         )
     }
 
@@ -336,6 +350,15 @@ impl State {
             }
         }
         out.insert("since".into(), json!(timestamp(self.since)));
+        if let Some((path, added)) = &self.device {
+            let mut device = Map::new();
+            device.insert("path".into(), json!(path));
+            device.insert("added".into(), json!(added.is_ok()));
+            if let Err(error) = added {
+                device.insert("error".into(), json!(error));
+            }
+            out.insert("device".into(), Value::Object(device));
+        }
         out
     }
 }
@@ -357,8 +380,8 @@ pub(crate) struct Schedule {
     last: Option<Sent>,
 }
 
-/// gpsd connected, the receivers, the mode, satellites known.
-type Key = (bool, Vec<String>, Mode, bool);
+/// gpsd connected, the receivers, the mode, satellites known, the configured receiver added.
+type Key = (bool, Vec<String>, Mode, bool, bool);
 
 #[derive(Debug)]
 struct Sent {

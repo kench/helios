@@ -9,6 +9,12 @@
 //!
 //! When gpsd isn't there (not installed, stopped, restarting), the shadow says
 //! `"gpsd": "unavailable"` and the module tries again with backoff, 1 s doubling to 60 s.
+//!
+//! With `[modules.gps] device` set (owner, 2026-11-22), the module asks gpsd to open that
+//! receiver through gpsd's control socket (`+<device>`, as `gpsdctl add` does) each time it
+//! connects, and again every minute while gpsd doesn't have it (unplugged and plugged back in:
+//! gpsd's hotplug rules don't know every USB serial bridge). The helios package's `gpsd.socket`
+//! drop-in lets the `helios` group use the socket.
 
 pub(crate) mod gpsd;
 pub(crate) mod report;
@@ -28,6 +34,14 @@ use crate::backoff::Backoff;
 use report::{Mode, Schedule, State};
 
 const MODULE: &str = "gps";
+/// gpsd's control socket (Debian's `gpsd.socket`).
+const DEFAULT_CONTROL_SOCKET: &str = "/run/gpsd.sock";
+/// How often a configured receiver gpsd doesn't have is added again.
+const READD: Duration = Duration::from_secs(60);
+/// How long after connecting the module checks gpsd has the configured receiver.
+const FIRST_CHECK: Duration = Duration::from_secs(2);
+/// How long gpsd has to answer a control command.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// gpsd's default address (Debian's `gpsd.socket` listens on it).
 const DEFAULT_GPSD: &str = "127.0.0.1:2947";
 /// The longest line read from gpsd; a longer one ends the connection.
@@ -40,6 +54,10 @@ pub struct GpsSettings {
     pub(crate) enabled: bool,
     /// gpsd's address, `host:port`.
     gpsd: String,
+    /// The receiver gpsd should open, such as a `/dev/serial/by-id/...` path.
+    device: Option<std::path::PathBuf>,
+    /// gpsd's control socket.
+    control_socket: std::path::PathBuf,
 }
 
 impl Default for GpsSettings {
@@ -47,6 +65,8 @@ impl Default for GpsSettings {
         Self {
             enabled: true,
             gpsd: DEFAULT_GPSD.into(),
+            device: None,
+            control_socket: DEFAULT_CONTROL_SOCKET.into(),
         }
     }
 }
@@ -59,6 +79,18 @@ impl GpsSettings {
                 self.gpsd
             )
         })?;
+        if let Some(device) = &self.device {
+            let text = device.to_string_lossy();
+            if !device.is_absolute() || text.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err(format!(
+                    "modules.gps.device: {text:?} must be an absolute path without spaces, such \
+                     as /dev/serial/by-id/usb-..."
+                ));
+            }
+        }
+        if !self.control_socket.is_absolute() {
+            return Err("modules.gps.control_socket must be an absolute path".into());
+        }
         Ok(self.enabled.then_some(self))
     }
 
@@ -73,6 +105,10 @@ impl GpsSettings {
 pub struct GpsModule {
     address: SocketAddr,
     backoff: (Duration, Duration),
+    /// The receiver to add, and gpsd's control socket.
+    device: Option<(String, std::path::PathBuf)>,
+    /// How often a configured receiver gpsd doesn't have is added again.
+    readd: Duration,
 }
 
 impl GpsModule {
@@ -82,6 +118,13 @@ impl GpsModule {
         Self {
             address: settings.address(),
             backoff: (Duration::from_secs(1), Duration::from_secs(60)),
+            readd: READD,
+            device: settings.device.as_ref().map(|device| {
+                (
+                    device.to_string_lossy().into_owned(),
+                    settings.control_socket.clone(),
+                )
+            }),
         }
     }
 }
@@ -142,7 +185,15 @@ impl GpsModule {
                     backoff.reset();
                     warned = false;
                     tracing::info!(gpsd = %self.address, "connected to gpsd");
-                    if session(&ctx, stream, &mut reporter).await {
+                    if session(
+                        &ctx,
+                        stream,
+                        &mut reporter,
+                        self.device.as_ref(),
+                        self.readd,
+                    )
+                    .await
+                    {
                         return Ok(());
                     }
                     tracing::warn!(gpsd = %self.address, "gpsd closed the connection");
@@ -169,7 +220,13 @@ impl GpsModule {
 }
 
 /// One connection to gpsd. Returns whether it ended because the module was cancelled.
-async fn session(ctx: &ModuleContext, stream: TcpStream, reporter: &mut Reporter) -> bool {
+async fn session(
+    ctx: &ModuleContext,
+    stream: TcpStream,
+    reporter: &mut Reporter,
+    device: Option<&(String, std::path::PathBuf)>,
+    readd: Duration,
+) -> bool {
     let (read, mut write) = stream.into_split();
     if write.write_all(gpsd::WATCH.as_bytes()).await.is_err() {
         return false;
@@ -180,10 +237,25 @@ async fn session(ctx: &ModuleContext, stream: TcpStream, reporter: &mut Reporter
     let usb_port = move |path: &str| receiver_usb_port(&sysfs, Path::new(path));
     let mut lines = BufReader::new(read);
     let mut line = String::new();
+    // gpsd answers an add for a receiver it already has with an error, so the module first lets
+    // gpsd list its receivers (DEVICES comes right after the WATCH), then adds it only if missing.
+    let mut readd_at = Instant::now() + FIRST_CHECK.min(readd);
     loop {
         line.clear();
         tokio::select! {
             () = ctx.cancel.cancelled() => return true,
+            () = tokio::time::sleep_until(readd_at), if device.is_some() => {
+                readd_at = Instant::now() + readd;
+                if let Some((path, socket)) = device {
+                    let added = if reporter.state.has_receiver(path) {
+                        Ok(())
+                    } else {
+                        add_device(socket, path).await
+                    };
+                    reporter.state.set_device(path, added);
+                    reporter.publish(ctx);
+                }
+            }
             read = read_line(&mut lines, &mut line) => {
                 if !read {
                     return false;
@@ -194,6 +266,46 @@ async fn session(ctx: &ModuleContext, stream: TcpStream, reporter: &mut Reporter
             () = sleep_until(reporter.schedule.next()) => reporter.publish(ctx),
         }
     }
+}
+
+/// Asks gpsd to open `device` through its control socket: `+<device>`, answered `OK` or
+/// `ERROR` (gpsd's control protocol, as `gpsdctl add` uses it).
+async fn add_device(socket: &Path, device: &str) -> Result<(), String> {
+    let request = async {
+        let mut stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|error| {
+                format!(
+                    "can't reach gpsd's control socket {}: {error}",
+                    socket.display()
+                )
+            })?;
+        stream
+            .write_all(format!("+{device}\n").as_bytes())
+            .await
+            .map_err(|error| format!("can't send to gpsd's control socket: {error}"))?;
+        let mut answer = String::new();
+        BufReader::new(stream)
+            .read_line(&mut answer)
+            .await
+            .map_err(|error| format!("no answer from gpsd's control socket: {error}"))?;
+        // gpsd 3.25 answers in JSON (`{"class":"OK"}`, `{"class":"ERROR"}`, checked on the Orange
+        // Pi 2026-11-22); older ones in plain text.
+        match answer.trim() {
+            "OK" | r#"{"class":"OK"}"# => Ok(()),
+            other => Err(format!(
+                "gpsd couldn't open {device}: it answered {other:?}"
+            )),
+        }
+    };
+    let result = tokio::time::timeout(CONTROL_TIMEOUT, request)
+        .await
+        .unwrap_or_else(|_| Err("gpsd's control socket didn't answer".into()));
+    match &result {
+        Ok(()) => tracing::info!(device, "gpsd opened the receiver"),
+        Err(error) => tracing::warn!(device, %error, "can't add the receiver to gpsd"),
+    }
+    result
 }
 
 /// Reads one line into `line`; false at the end of the stream, on an error, or past

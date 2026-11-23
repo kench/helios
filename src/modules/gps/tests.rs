@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -246,10 +247,22 @@ fn checks_its_settings() {
     assert!(bad.check().unwrap_err().contains("modules.gps.gpsd"));
     let ipv6: GpsSettings = toml::from_str("gpsd = \"[::1]:2947\"").unwrap();
     assert!(ipv6.check().unwrap().is_some());
-    assert!(
-        toml::from_str::<GpsSettings>("device = \"/dev/x\"").is_err(),
-        "not yet"
+    let device: GpsSettings = toml::from_str(&format!("device = \"{PATH}\"")).unwrap();
+    let module = GpsModule::new(&device.check().unwrap().unwrap());
+    assert_eq!(
+        module.device,
+        Some((PATH.to_owned(), PathBuf::from("/run/gpsd.sock")))
     );
+    for bad in [
+        "device = \"ttyACM0\"",
+        "device = \"/dev/a b\"",
+        "control_socket = \"gpsd.sock\"",
+    ] {
+        assert!(
+            toml::from_str::<GpsSettings>(bad).unwrap().check().is_err(),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
@@ -318,6 +331,8 @@ async fn reads_gpsd_and_reconnects() {
     let module = Arc::new(GpsModule {
         address,
         backoff: (Duration::from_millis(10), Duration::from_millis(20)),
+        device: None,
+        readd: READD,
     });
     assert_eq!(module.name(), "gps");
     let (ctx, mut reports, mut requests) = context();
@@ -384,6 +399,8 @@ async fn reports_unavailable_without_gpsd() {
     let module = GpsModule {
         address: "127.0.0.1:9".parse().unwrap(),
         backoff: (Duration::from_millis(10), Duration::from_millis(20)),
+        device: None,
+        readd: READD,
     };
     let (ctx, mut reports, _requests) = context();
     let cancel = ctx.cancel.clone();
@@ -416,6 +433,8 @@ async fn live_gpsd() {
     let module = GpsModule {
         address: address.parse().expect("an IP address and port"),
         backoff: (Duration::from_secs(1), Duration::from_secs(2)),
+        device: None,
+        readd: READD,
     };
     let (ctx, mut reports, _requests) = context();
     let cancel = ctx.cancel.clone();
@@ -433,6 +452,174 @@ async fn live_gpsd() {
         fix["mode"],
         reported["satellites"]
     );
+    cancel.cancel();
+    assert_eq!(running.await.unwrap(), Ok(()));
+}
+
+/// A fake gpsd control socket: answers each request with `answer`, and records it.
+async fn control_socket(
+    dir: &Path,
+    answer: &'static str,
+) -> (PathBuf, mpsc::UnboundedReceiver<String>) {
+    let path = dir.join("gpsd.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            let _ = tx.send(line);
+            if !answer.is_empty() {
+                write.write_all(answer.as_bytes()).await.unwrap();
+            }
+            // Keep the connection open until the client hangs up.
+            let _ = write.shutdown().await;
+        }
+    });
+    (path, rx)
+}
+
+#[tokio::test]
+async fn adds_the_receiver_through_the_control_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ok, mut requests) = control_socket(dir.path(), "OK\n").await;
+    assert_eq!(add_device(&ok, PATH).await, Ok(()));
+    assert_eq!(requests.recv().await.unwrap(), format!("+{PATH}\n"));
+
+    let json = tempfile::tempdir().unwrap();
+    let (ok_json, _) = control_socket(json.path(), "{\"class\":\"OK\"}\r\n").await;
+    assert_eq!(
+        add_device(&ok_json, PATH).await,
+        Ok(()),
+        "gpsd 3.25's answer"
+    );
+
+    let refusing = tempfile::tempdir().unwrap();
+    let (error, _) = control_socket(refusing.path(), "{\"class\":\"ERROR\"}\r\n").await;
+    assert!(
+        add_device(&error, PATH)
+            .await
+            .unwrap_err()
+            .contains("ERROR")
+    );
+    let missing = add_device(&dir.path().join("none.sock"), PATH)
+        .await
+        .unwrap_err();
+    assert!(
+        missing.contains("can't reach gpsd's control socket"),
+        "{missing}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_control_socket_times_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gpsd.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let _hold = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+        drop(stream);
+    });
+    assert!(
+        add_device(&path, PATH)
+            .await
+            .unwrap_err()
+            .contains("didn't answer")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adds_its_receiver_on_connect_and_again_when_gpsd_loses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, mut added) = control_socket(dir.path(), "OK\n").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let module = Arc::new(GpsModule {
+        address: listener.local_addr().unwrap(),
+        backoff: (Duration::from_millis(10), Duration::from_millis(20)),
+        device: Some((PATH.to_owned(), socket)),
+        readd: Duration::from_millis(200),
+    });
+    let (ctx, mut reports, _requests) = context();
+    let cancel = ctx.cancel.clone();
+    let running = tokio::spawn({
+        let module = Arc::clone(&module);
+        async move { module.run(ctx).await }
+    });
+    // gpsd lists no receivers: the module adds it.
+    let (stream, _) = listener.accept().await.unwrap();
+    let (_read, mut write) = stream.into_split();
+    write
+        .write_all(b"{\"class\":\"DEVICES\",\"devices\":[]}\n")
+        .await
+        .unwrap();
+    assert_eq!(added.recv().await.unwrap(), format!("+{PATH}\n"));
+    let mut reported = next_report(&mut reports).await;
+    while reported.get("device").is_none() {
+        reported = next_report(&mut reports).await;
+    }
+    assert_eq!(reported["device"], json!({"path": PATH, "added": true}));
+
+    // gpsd opens it and lists it: no more requests. Then it's gone (unplugged): added again.
+    write
+        .write_all(format!("{DEVICES}\n").as_bytes())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(added.try_recv().is_err(), "gpsd has it");
+    let closed = format!("{{\"class\":\"DEVICE\",\"path\":\"{PATH}\",\"activated\":0}}\n");
+    write.write_all(closed.as_bytes()).await.unwrap();
+    let again = tokio::time::timeout(Duration::from_secs(5), added.recv()).await;
+    assert_eq!(again.unwrap().unwrap(), format!("+{PATH}\n"));
+    cancel.cancel();
+    assert_eq!(running.await.unwrap(), Ok(()));
+}
+
+#[test]
+fn reports_a_receiver_gpsd_refused() {
+    let mut state = state_after(&[DEVICES]);
+    state.set_device(PATH, Err("gpsd couldn't open it".into()));
+    let reported = Value::Object(state.reported());
+    assert_eq!(
+        reported["device"],
+        json!({"path": PATH, "added": false, "error": "gpsd couldn't open it"})
+    );
+    assert!(state.has_receiver(PATH));
+    assert!(!state.has_receiver("/dev/other"));
+    assert!(
+        Value::Object(state_after(&[]).reported())
+            .get("device")
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receiver_gpsd_already_has_is_not_added_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, mut added) = control_socket(dir.path(), "{\"class\":\"ERROR\"}\r\n").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let module = GpsModule {
+        address: listener.local_addr().unwrap(),
+        backoff: (Duration::from_millis(10), Duration::from_millis(20)),
+        device: Some((PATH.to_owned(), socket)),
+        readd: Duration::from_millis(100),
+    };
+    let (ctx, mut reports, _requests) = context();
+    let cancel = ctx.cancel.clone();
+    let running = tokio::spawn(async move { module.run(ctx).await });
+    let (stream, _) = listener.accept().await.unwrap();
+    let (_read, mut write) = stream.into_split();
+    write
+        .write_all(format!("{DEVICES}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut reported = next_report(&mut reports).await;
+    while reported.get("device").is_none() {
+        reported = next_report(&mut reports).await;
+    }
+    assert_eq!(reported["device"], json!({"path": PATH, "added": true}));
+    assert!(added.try_recv().is_err(), "never asked: gpsd had it");
     cancel.cancel();
     assert_eq!(running.await.unwrap(), Ok(()));
 }
