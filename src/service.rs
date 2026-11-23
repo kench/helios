@@ -202,6 +202,12 @@ impl Service {
             Probes::default(),
             cancel.clone(),
         );
+        // The egress echo is on the bootstrap API (LLD 3, section 3).
+        #[cfg(feature = "module-net")]
+        let egress_target = config
+            .bootstrap
+            .as_ref()
+            .map(|bootstrap| (bootstrap.url.clone(), bootstrap.roots.clone()));
         let pin = match config.bootstrap {
             Some(bootstrap) => {
                 let client =
@@ -312,10 +318,20 @@ impl Service {
         }
         #[cfg(feature = "module-net")]
         if let Some(settings) = config.net {
-            enabled.push(Arc::new(crate::modules::net::NetModule::new(
-                settings,
-                identity.watch(),
-            )));
+            let mut module = crate::modules::net::NetModule::new(settings, identity.watch());
+            if let Some((url, roots)) = egress_target {
+                match crate::modules::net::egress::EgressClient::new(
+                    &url,
+                    roots,
+                    Arc::new(credentials.clone()),
+                ) {
+                    Ok(client) => module = module.with_egress(client),
+                    Err(error) => {
+                        tracing::warn!(%error, "uplinks' public addresses won't be checked");
+                    }
+                }
+            }
+            enabled.push(Arc::new(module));
         }
         // Streams run in the stream daemon (helios-stream.service); here the module is its
         // client, so streams outlive Helios's restarts (LLD 4, section 15).

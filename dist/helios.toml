@@ -82,6 +82,8 @@ mp_sd_mount = "/init/efad/mp_sd" # scanner: where the platform mounts the PROXdo
 # feature. Read-only, and needs no extra permissions. `helios net list` prints the same.
 enabled = true
 exclude = ["veth*"]              # interface names to leave out; a trailing * matches a prefix
+public_address_check = true      # each source-routed uplink's public IPv4 (public_ipv4), from the
+                                 # bootstrap API's IAM-signed egress echo, every ~15 minutes
 
 [modules.gps]
 # The position, from gpsd (LLD 10): needs a Helios built with --features module-gps (the boards'
