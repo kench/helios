@@ -316,9 +316,16 @@ impl Service {
         if let Some(settings) = &config.gps {
             enabled.push(Arc::new(crate::modules::gps::GpsModule::new(settings)));
         }
+        // The net module's uplink view, for the stream daemon's standby (LLD 3, section 3.5.1).
+        #[cfg(all(feature = "module-net", feature = "module-stream"))]
+        let (uplink_view, uplink_view_rx) = tokio::sync::watch::channel(serde_json::Value::Null);
         #[cfg(feature = "module-net")]
         if let Some(settings) = config.net {
             let mut module = crate::modules::net::NetModule::new(settings, identity.watch());
+            #[cfg(feature = "module-stream")]
+            {
+                module = module.with_uplink_view(uplink_view);
+            }
             if let Some((url, roots)) = egress_target {
                 match crate::modules::net::egress::EgressClient::new(
                     &url,
@@ -337,9 +344,10 @@ impl Service {
         // client, so streams outlive Helios's restarts (LLD 4, section 15).
         #[cfg(feature = "module-stream")]
         if let Some(settings) = config.stream {
-            enabled.push(Arc::new(crate::modules::stream::StreamClient::new(
-                settings.control_socket.clone(),
-            )));
+            let client = crate::modules::stream::StreamClient::new(settings.control_socket.clone());
+            #[cfg(feature = "module-net")]
+            let client = client.with_uplink_view(uplink_view_rx);
+            enabled.push(Arc::new(client));
         }
         let (module_states, modules) = supervisor::start(
             enabled,

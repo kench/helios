@@ -18,6 +18,7 @@ use tokio::time::Instant;
 use super::addrs::Address;
 use super::process::{Job, JobEvent, JobSpec, Spawner, Tagged};
 use super::settings::{Output, StreamSettings};
+use super::standby::{self, Standby, View};
 use crate::backoff::Backoff;
 use crate::modules::usb::UsbSnapshot;
 
@@ -67,6 +68,8 @@ struct Sender {
     output: Output,
     port: u16,
     ips: Vec<Ipv4Addr>,
+    /// Uplinks left out because a preferred one shares their public address (LLD 3, 3.5.1).
+    standby: Vec<Standby>,
     job: Option<(u64, Box<dyn Job>)>,
     monitor: Option<JoinHandle<()>>,
     idle_since: Option<Instant>,
@@ -175,12 +178,26 @@ impl Senders {
         wanted: &[&str],
         usb: &UsbSnapshot,
         addresses: &[Address],
+        view: &View,
         now: Instant,
         spawning: Spawning<'_>,
     ) {
         let names: Vec<String> = self.senders.keys().cloned().collect();
         for name in names {
-            let ips = resolve_uplinks(&self.senders[&name].output.uplinks, usb, addresses);
+            let candidates =
+                resolve_uplink_interfaces(&self.senders[&name].output.uplinks, usb, addresses);
+            let (ips, standby) = standby::choose(&candidates, view);
+            if standby != self.senders[&name].standby {
+                for uplink in &standby {
+                    tracing::info!(
+                        output = %name,
+                        interface = %uplink.interface,
+                        shares_with = %uplink.shares_with,
+                        "uplink in standby: it shares a public address with a preferred one"
+                    );
+                }
+            }
+            self.senders.get_mut(&name).expect("listed").standby = standby;
             let needed = wanted.contains(&name.as_str());
             let idle = self.idle;
             let sender = self.senders.get_mut(&name).expect("listed");
@@ -363,6 +380,7 @@ impl Sender {
             output,
             port,
             ips: Vec::new(),
+            standby: Vec::new(),
             job: None,
             monitor: None,
             idle_since: None,
@@ -433,6 +451,7 @@ impl Sender {
             "state": self.state(now).as_str(),
             "local_port": self.port,
             "uplinks": self.ips.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "standby": self.standby.iter().map(Standby::json).collect::<Vec<_>>(),
             "active_links": figure("active_links"),
             "total_links": figure("total_links"),
             "last_error": self.last_error,
@@ -472,11 +491,27 @@ impl Sender {
 
 /// The IPv4 addresses of the configured uplinks: `usb:<category>` (the usb module's network
 /// devices in that category) or interface names.
+#[cfg(test)]
 pub(crate) fn resolve_uplinks(
     uplinks: &[String],
     usb: &UsbSnapshot,
     addresses: &[Address],
 ) -> Vec<Ipv4Addr> {
+    let mut ips: Vec<Ipv4Addr> = resolve_uplink_interfaces(uplinks, usb, addresses)
+        .into_iter()
+        .map(|(_, ip)| ip)
+        .collect();
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+/// [`resolve_uplinks`], with the interface each address is on.
+pub(crate) fn resolve_uplink_interfaces(
+    uplinks: &[String],
+    usb: &UsbSnapshot,
+    addresses: &[Address],
+) -> Vec<(String, Ipv4Addr)> {
     let mut interfaces: Vec<String> = Vec::new();
     for uplink in uplinks {
         match uplink.strip_prefix("usb:") {
@@ -499,23 +534,24 @@ pub(crate) fn resolve_uplinks(
             None => interfaces.push(uplink.clone()),
         }
     }
-    let mut ips: Vec<Ipv4Addr> = addresses
+    let mut found: Vec<(String, Ipv4Addr)> = addresses
         .iter()
-        .filter(|address| {
-            interfaces.iter().any(|name| {
-                address.interface == *name
+        .filter_map(|address| {
+            // An alias (eth0:1) belongs to its interface.
+            let interface = interfaces.iter().find(|name| {
+                address.interface == **name
                     || address
                         .interface
                         .strip_prefix(name.as_str())
                         .is_some_and(|alias| alias.starts_with(':'))
-            })
+            })?;
+            Some((interface.clone(), address.address))
         })
-        .map(|address| address.address)
-        .filter(|ip| !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified())
+        .filter(|(_, ip)| !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified())
         .collect();
-    ips.sort();
-    ips.dedup();
-    ips
+    found.sort_by_key(|(_, ip)| *ip);
+    found.dedup_by(|a, b| a.1 == b.1);
+    found
 }
 
 /// Writes `<dir>/<name>.ips` (one IP per line) through a temporary file and a rename, so

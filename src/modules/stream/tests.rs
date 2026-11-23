@@ -432,6 +432,8 @@ struct Harness {
     desired: mpsc::UnboundedSender<Value>,
     cancel: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<Result<(), crate::modules::ModuleError>>,
+    /// The uplink view, as the daemon would get it from Helios (`uplinks`).
+    uplinks: tokio::sync::watch::Sender<super::standby::View>,
 }
 
 fn harness(config: &str, encoders: Option<&[&str]>, refuse: bool) -> Harness {
@@ -467,9 +469,11 @@ fn harness_full(
         encoders: encoders.map(|names| names.iter().map(|name| (*name).to_owned()).collect()),
         refuse: AtomicBool::new(refuse),
     };
+    let (uplinks, uplinks_view) = tokio::sync::watch::channel(super::standby::View::new());
     let module =
         StreamModule::with_fakes(settings(config), usb.clone(), Arc::new(spawner), addresses)
-            .with_formats(formats);
+            .with_formats(formats)
+            .with_uplinks(uplinks_view);
     let (mqtt, published, _status) = MqttHandle::for_test();
     let (shadows, reports, _desired) = ShadowHandle::for_test();
     let (commands, commands_rx) = mpsc::channel(4);
@@ -493,6 +497,7 @@ fn harness_full(
         desired,
         cancel,
         task,
+        uplinks,
     }
 }
 
@@ -1110,7 +1115,7 @@ fn ethernet_adapter() -> (String, Arc<UsbDevice>) {
     )
 }
 
-fn address(interface: &str, ip: [u8; 4]) -> Address {
+pub(crate) fn address(interface: &str, ip: [u8; 4]) -> Address {
     Address {
         interface: interface.into(),
         address: ip.into(),
@@ -1206,6 +1211,68 @@ impl Harness {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn an_uplink_sharing_a_public_address_waits_in_standby() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
+    let addresses = Arc::new(std::sync::Mutex::new(vec![
+        address("eth1", [10, 0, 1, 2]),
+        address("wlan0", [10, 0, 2, 2]),
+    ]));
+    let source = addresses.clone();
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(move || Ok(source.lock().expect("addresses").clone())),
+    );
+    // The USB Ethernet and the Wi-Fi go out through the same router.
+    let view = super::standby::parse(&json!({"interfaces": {
+        "eth1": {"kind": "ethernet", "metric": 100, "public_ipv4": "203.0.113.7"},
+        "wlan0": {"kind": "wifi", "metric": 600, "public_ipv4": "203.0.113.7"},
+    }}));
+    harness.uplinks.send_replace(view);
+    harness
+        .usb
+        .set_for_test(UsbSnapshot::from([ethernet_adapter()]));
+
+    let sender = harness.next_start().await;
+    let dir = runtime.path().join("srtla");
+    let ips = dir.join("bond.ips");
+    assert_eq!(
+        std::fs::read_to_string(&ips).expect("ips"),
+        "10.0.1.2\n",
+        "only Ethernet bonds"
+    );
+    let stats = control_socket(dir.join("bond.sock")).await;
+    stats.send(snapshot(1)).expect("socket");
+    let up = harness.output_state("bond", "up").await;
+    assert_eq!(up["uplinks"], json!(["10.0.1.2"]));
+    assert_eq!(
+        up["standby"],
+        json!([{"interface": "wlan0", "address": "10.0.2.2",
+                "shares_public_address_with": "eth1"}])
+    );
+
+    // Ethernet loses its address: the Wi-Fi takes over, and the sender reloads.
+    addresses
+        .lock()
+        .expect("addresses")
+        .retain(|a| a.interface != "eth1");
+    harness
+        .usb
+        .set_for_test(UsbSnapshot::from([ethernet_adapter()]));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while sender.reloads.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reloaded");
+    assert_eq!(std::fs::read_to_string(&ips).expect("ips"), "10.0.2.2\n");
+    harness.cancel.cancel();
 }
 
 #[tokio::test]

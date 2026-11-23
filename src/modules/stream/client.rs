@@ -23,13 +23,25 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The `stream` module in Helios.
 pub struct StreamClient {
     socket: PathBuf,
+    /// The net module's uplink view, passed on to the daemon (`uplinks`) for standby.
+    uplinks: Option<tokio::sync::watch::Receiver<Value>>,
 }
 
 impl StreamClient {
     /// A client of the daemon listening on `socket`.
     #[must_use]
     pub fn new(socket: PathBuf) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            uplinks: None,
+        }
+    }
+
+    /// Passes the net module's uplink view on to the daemon, after each connect and on change.
+    #[must_use]
+    pub fn with_uplink_view(mut self, uplinks: tokio::sync::watch::Receiver<Value>) -> Self {
+        self.uplinks = Some(uplinks);
+        self
     }
 }
 
@@ -39,7 +51,18 @@ impl Module for StreamClient {
     }
 
     fn run(&self, ctx: ModuleContext) -> ModuleFuture<'_> {
-        Box::pin(run(self.socket.clone(), ctx))
+        Box::pin(run(self.socket.clone(), ctx, self.uplinks.clone()))
+    }
+}
+
+/// The uplink view's next change, or never without a view (or once its sender is gone).
+async fn changed(view: Option<&mut tokio::sync::watch::Receiver<Value>>) -> Option<Value> {
+    match view {
+        Some(view) => match view.changed().await {
+            Ok(()) => Some(view.borrow_and_update().clone()),
+            Err(_) => std::future::pending().await,
+        },
+        None => std::future::pending().await,
     }
 }
 
@@ -49,13 +72,17 @@ enum Ended {
     Lost(String),
 }
 
-async fn run(socket: PathBuf, mut ctx: ModuleContext) -> Result<(), ModuleError> {
+async fn run(
+    socket: PathBuf,
+    mut ctx: ModuleContext,
+    mut uplinks: Option<tokio::sync::watch::Receiver<Value>>,
+) -> Result<(), ModuleError> {
     let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
     // The latest desired state, sent again after each reconnect.
     let mut desired: Option<Value> = None;
     loop {
         let failure = match UnixStream::connect(&socket).await {
-            Ok(stream) => match session(stream, &mut ctx, &mut desired).await {
+            Ok(stream) => match session(stream, &mut ctx, &mut desired, uplinks.as_mut()).await {
                 Ended::Cancelled => return Ok(()),
                 Ended::Lost(why) => {
                     backoff.reset();
@@ -104,6 +131,7 @@ async fn session(
     stream: UnixStream,
     ctx: &mut ModuleContext,
     desired: &mut Option<Value>,
+    mut uplinks: Option<&mut tokio::sync::watch::Receiver<Value>>,
 ) -> Ended {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -149,9 +177,27 @@ async fn session(
             return Ended::Lost("the daemon closed the connection".into());
         }
     }
+    // The uplink view: the current one now, then each change.
+    if let Some(view) = uplinks.as_deref_mut() {
+        let current = view.borrow_and_update().clone();
+        if !current.is_null() {
+            next_id += 1;
+            let line = control::request(next_id, "uplinks", current);
+            if writer.write_all(line.as_bytes()).await.is_err() {
+                return Ended::Lost("the daemon closed the connection".into());
+            }
+        }
+    }
     let ended = loop {
         tokio::select! {
             () = ctx.cancel.cancelled() => break Ended::Cancelled,
+            Some(view) = changed(uplinks.as_deref_mut()) => {
+                next_id += 1;
+                let line = control::request(next_id, "uplinks", view);
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    break Ended::Lost("the daemon closed the connection".into());
+                }
+            }
             Some(pending) = ctx.commands.recv() => {
                 next_id += 1;
                 let params = json!({"name": pending.command.name, "args": pending.command.args});

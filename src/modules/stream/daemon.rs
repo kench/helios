@@ -85,7 +85,9 @@ impl Daemon {
             let _ = desired.send(saved);
         }
         let pending_restart = self.settings.runtime_dir.join("restart-pending");
-        let engine = (self.engine)(self.settings, usb);
+        // The uplink view Helios sends (`uplinks`), for standby (LLD 3, section 3.5.1).
+        let (uplinks, uplinks_view) = tokio::sync::watch::channel(super::standby::View::new());
+        let engine = (self.engine)(self.settings, usb).with_uplinks(uplinks_view);
         let engine_task = tokio::spawn(async move { engine.run(ctx).await });
 
         let (incoming_tx, mut incoming) = mpsc::unbounded_channel::<Incoming>();
@@ -151,6 +153,10 @@ impl Daemon {
                             }
                             "desired" => {
                                 let _ = desired.send(params.get("state").cloned().unwrap_or(Value::Null));
+                                Some(control::response(&id, Outcome::Ok(json!({}))))
+                            }
+                            "uplinks" => {
+                                uplinks.send_replace(super::standby::parse(&params));
                                 Some(control::response(&id, Outcome::Ok(json!({}))))
                             }
                             other => Some(control::response(
