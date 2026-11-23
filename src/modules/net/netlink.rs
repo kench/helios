@@ -1,5 +1,6 @@
 //! rtnetlink for the net module (LLD 3, section 2.1): dumps of the links, addresses, default
-//! routes and nexthops, and a socket that hears when any of them change.
+//! routes and nexthops, Helios's source-routing rules and routes (section 5.4), and a socket that
+//! hears when any of them change.
 //!
 //! Messages are built and parsed here on rustix, as `identity/bootstrap/netlink.rs` does, so no
 //! netlink crate is needed. Nothing here changes the kernel's state: it only reads.
@@ -18,6 +19,8 @@ const IFINFOMSG_LEN: usize = 16;
 const IFADDRMSG_LEN: usize = 8;
 const RTMSG_LEN: usize = 12;
 const NHMSG_LEN: usize = 8;
+/// `struct fib_rule_hdr`.
+const FIB_RULE_HDR_LEN: usize = 12;
 pub(super) const RTA_HDR_LEN: usize = 4;
 const RTNEXTHOP_LEN: usize = 8;
 
@@ -30,6 +33,8 @@ const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_GETROUTE: u16 = 26;
+const RTM_NEWRULE: u16 = 32;
+const RTM_GETRULE: u16 = 34;
 const RTM_NEWNEXTHOP: u16 = 104;
 const RTM_GETNEXTHOP: u16 = 106;
 
@@ -82,11 +87,12 @@ pub(crate) const IFA_F_DEPRECATED: u32 = 0x20;
 /// `IFA_F_TENTATIVE`: duplicate address detection hasn't finished.
 pub(crate) const IFA_F_TENTATIVE: u32 = 0x40;
 
-/// The groups the change socket joins: links, IPv4 and IPv6 addresses and routes
-/// (`RTMGRP_LINK`, `RTMGRP_IPV4_IFADDR`, `RTMGRP_IPV4_ROUTE`, `RTMGRP_IPV6_IFADDR`,
-/// `RTMGRP_IPV6_ROUTE`). Nexthop changes (group 32, past the bitmask) aren't joined: a nexthop
-/// that matters comes and goes with a route, and the module reads everything again then.
-const GROUPS: u32 = 0x1 | 0x10 | 0x40 | 0x100 | 0x400;
+/// The groups the change socket joins: links, IPv4 and IPv6 addresses and routes, and IPv4
+/// rules (`RTMGRP_LINK`, `RTMGRP_IPV4_IFADDR`, `RTMGRP_IPV4_ROUTE`, `RTMGRP_IPV4_RULE`,
+/// `RTMGRP_IPV6_IFADDR`, `RTMGRP_IPV6_ROUTE`); the route group covers every table, so source
+/// routing's changes are heard too. Nexthop changes (group 32, past the bitmask) aren't joined: a
+/// nexthop that matters comes and goes with a route, and the module reads everything again then.
+const GROUPS: u32 = 0x1 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400;
 
 /// How long the change socket waits before [`Watch::wait`] returns, so its thread can stop.
 const WAIT: Duration = Duration::from_secs(1);
@@ -159,6 +165,8 @@ pub(crate) struct Tables {
     pub(crate) addresses: Vec<Address>,
     pub(crate) routes: Vec<Route>,
     pub(crate) nexthops: Vec<Nexthop>,
+    /// The rules and routes `helios routes` keeps (section 5.4), as it reads them.
+    pub(crate) source: super::routes::plan::State,
 }
 
 impl Tables {
@@ -196,10 +204,18 @@ pub(crate) enum Dump {
     Addresses,
     Routes,
     Nexthops,
+    /// Policy rules, for source routing's (section 5.4).
+    Rules,
 }
 
 impl Dump {
-    const ALL: [Self; 4] = [Self::Links, Self::Addresses, Self::Routes, Self::Nexthops];
+    const ALL: [Self; 5] = [
+        Self::Links,
+        Self::Addresses,
+        Self::Routes,
+        Self::Nexthops,
+        Self::Rules,
+    ];
 
     fn request(self) -> (u16, usize) {
         match self {
@@ -207,6 +223,7 @@ impl Dump {
             Self::Addresses => (RTM_GETADDR, IFADDRMSG_LEN),
             Self::Routes => (RTM_GETROUTE, RTMSG_LEN),
             Self::Nexthops => (RTM_GETNEXTHOP, NHMSG_LEN),
+            Self::Rules => (RTM_GETRULE, FIB_RULE_HDR_LEN),
         }
     }
 }
@@ -275,8 +292,12 @@ fn clear(tables: &mut Tables, dump: Dump) {
     match dump {
         Dump::Links => tables.links.clear(),
         Dump::Addresses => tables.addresses.clear(),
-        Dump::Routes => tables.routes.clear(),
+        Dump::Routes => {
+            tables.routes.clear();
+            tables.source.routes.clear();
+        }
         Dump::Nexthops => tables.nexthops.clear(),
+        Dump::Rules => tables.source.rules.clear(),
     }
 }
 
@@ -415,7 +436,17 @@ fn parse_dump(dump: Dump, datagrams: &[Vec<u8>], tables: &mut Tables) -> io::Res
                 (Dump::Addresses, RTM_NEWADDR) => {
                     tables.addresses.extend(address(message.payload)?);
                 }
-                (Dump::Routes, RTM_NEWROUTE) => tables.routes.extend(route(message.payload)?),
+                (Dump::Routes, RTM_NEWROUTE) => {
+                    tables.routes.extend(route(message.payload)?);
+                    tables
+                        .source
+                        .routes
+                        .extend(super::routes::kernel::parse_route(message.payload)?);
+                }
+                (Dump::Rules, RTM_NEWRULE) => tables
+                    .source
+                    .rules
+                    .extend(super::routes::kernel::parse_rule(message.payload)?),
                 (Dump::Nexthops, RTM_NEWNEXTHOP) => {
                     tables.nexthops.extend(nexthop(message.payload)?);
                 }

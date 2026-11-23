@@ -123,6 +123,9 @@ fn board_tables() -> Vec<(Dump, Vec<u8>)> {
                 default_route(false, Some(3), Some(ip("192.168.5.1")), 100, None),
                 default_route(true, None, None, 100, Some(1_241_586_351)),
                 default_route(true, Some(7), None, 1024, None),
+                // helios routes: Ethernet's table, and the modem's (whose rule is missing below).
+                helios_route(10_003, Some("192.168.5.1"), 3, "192.168.5.31"),
+                helios_route(10_007, None, 7, "10.64.12.9"),
                 done(),
             ]
             .concat(),
@@ -131,7 +134,33 @@ fn board_tables() -> Vec<(Dump, Vec<u8>)> {
             Dump::Nexthops,
             [nexthop(1_241_586_351, 3, router6), done()].concat(),
         ),
+        (
+            Dump::Rules,
+            [helios_rule("192.168.5.31", 10_003), done()].concat(),
+        ),
     ]
+}
+
+/// A default route in one of `helios routes`'s tables, as the kernel dumps it.
+fn helios_route(table: u32, gateway: Option<&str>, interface: u32, source: &str) -> Vec<u8> {
+    let route = super::routes::plan::Route {
+        table,
+        destination: (std::net::Ipv4Addr::UNSPECIFIED, 0),
+        gateway: gateway.map(|gateway| gateway.parse().unwrap()),
+        interface,
+        source: source.parse().unwrap(),
+    };
+    super::routes::kernel::message(24, 0, &super::routes::kernel::route_body(&route))
+}
+
+/// A `from <source> lookup <table>` rule of `helios routes`'s, as the kernel dumps it.
+fn helios_rule(source: &str, table: u32) -> Vec<u8> {
+    let rule = super::routes::plan::Rule {
+        source: source.parse().unwrap(),
+        priority: table,
+        table,
+    };
+    super::routes::kernel::message(32, 0, &super::routes::kernel::rule_body(&rule))
 }
 
 fn board_sysfs() -> Sysfs {
@@ -202,11 +231,16 @@ impl Kernel for FakeKernel {
             return Err(io::Error::other("no tables"));
         }
         let replies = self.replies.lock().unwrap();
-        Ok(replies
+        let mut found: Vec<Vec<u8>> = replies
             .iter()
             .filter(|(kind, _)| *kind == dump)
             .map(|(_, reply)| reply.clone())
-            .collect())
+            .collect();
+        // Most tests have no source routing: an empty rules dump.
+        if found.is_empty() && dump == Dump::Rules {
+            found.push(done());
+        }
+        Ok(found)
     }
 
     fn watch(&self) -> io::Result<Box<dyn Watch>> {
@@ -286,9 +320,16 @@ fn reports_the_boards_interfaces() {
                 {"family": "ipv4", "gateway": "192.168.5.1", "metric": 100},
                 {"family": "ipv6", "gateway": "fe80::1", "metric": 100},
             ],
+            "source_route": {"table": 10_003, "rule": true},
         })
     );
+    assert_eq!(
+        interfaces["wwan0"]["source_route"],
+        json!({"table": 10_007, "rule": false}),
+        "a table without its rule doesn't steer anything"
+    );
     let down = &interfaces["enP3p49s0"];
+    assert_eq!(down["source_route"], Value::Null);
     assert_eq!(down["oper_state"], "down");
     assert_eq!(down["speed_mbps"], Value::Null, "speed -1 is unknown");
     assert_eq!(down["default_routes"], json!([]));

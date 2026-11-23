@@ -88,6 +88,7 @@ echo "before: $(out) $(reply)"
 echo "after: $(out) $(reply)"
 echo "rules: $(ip rule | grep -cE 'lookup 10[0-9]{3}')"
 "$0" --config "$2" net routes --once --sysfs "$1"
+echo "list-begin"; "$0" net list; echo "list-end"
 "$0" --config "$2" net routes --remove
 echo "removed: $(ip rule | grep -cE 'lookup 10[0-9]{3}') $(ip route show table all proto 222 | grep -c .)"
 "#;
@@ -140,6 +141,23 @@ fn source_routes_each_uplink_in_a_network_namespace() {
     );
     assert!(lines.contains(&"removed 6 rules and routes"), "{stdout}");
     assert!(lines.contains(&"removed: 0 0"), "{stdout}");
+    // The net module reports what the service set (LLD 3, section 5.4).
+    let list = stdout
+        .split_once("list-begin\n")
+        .and_then(|(_, rest)| rest.split_once("list-end"))
+        .map(|(list, _)| list)
+        .expect("helios net list's output");
+    let list: serde_json::Value = serde_json::from_str(list).unwrap();
+    for name in ["d0", "d1"] {
+        let source_route = &list["interfaces"][name]["source_route"];
+        assert_eq!(source_route["rule"], true, "{name}: {list}");
+        assert!(
+            source_route["table"]
+                .as_u64()
+                .is_some_and(|table| (10_000..11_000).contains(&table)),
+            "{name}: {list}"
+        );
+    }
 }
 
 /// The service: it routes the uplinks at start, follows a new address within its quiet period,

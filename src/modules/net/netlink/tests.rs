@@ -375,6 +375,7 @@ fn read_retries_interrupted_dumps_and_tolerates_missing_nexthops() {
         ),
         (Dump::Routes, vec![done()]),
         (Dump::Nexthops, vec![error(libc::EOPNOTSUPP)]),
+        (Dump::Rules, vec![done()]),
     ]));
     let tables = read(&kernel).unwrap();
     assert_eq!(tables.links.len(), 1);
@@ -428,6 +429,20 @@ fn clear_empties_one_table() {
             hop: None,
             group: vec![],
         }],
+        source: crate::modules::net::routes::plan::State {
+            rules: vec![crate::modules::net::routes::plan::Rule {
+                source: std::net::Ipv4Addr::new(10, 0, 0, 1),
+                priority: 10_001,
+                table: 10_001,
+            }],
+            routes: vec![crate::modules::net::routes::plan::Route {
+                table: 10_001,
+                destination: (std::net::Ipv4Addr::UNSPECIFIED, 0),
+                gateway: None,
+                interface: 1,
+                source: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            }],
+        },
     };
     for dump in Dump::ALL {
         clear(&mut tables, dump);

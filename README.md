@@ -145,9 +145,12 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   `mac` (and `permanent_mac` when it differs), `driver`, `usb_port`, `oper_state`, `carrier`,
   `admin_up`, `mtu`, `speed_mbps`, `since` (when `oper_state` last changed), `ipv4`
   (`a.b.c.d/n`), `ipv6` (address, prefix, scope and the temporary, deprecated, tentative and
-  DAD-failed flags) and `default_routes` (main table: family, gateway and metric, including IPv6
-  routes through nexthop objects). Read over rtnetlink, parsed in Helios; a thread listens for
-  link, address and route changes, and a change is reported after 1 s of quiet (5 s at most),
+  DAD-failed flags), `default_routes` (main table: family, gateway and metric, including IPv6
+  routes through nexthop objects) and `source_route`: `{"table": 10004, "rule": true}` when
+  `helios-routes` keeps a default route out of the interface in its own table, with `rule` true
+  once every IPv4 address on it has its `from <address>` rule (so srtla traffic from it leaves
+  through it), and `null` when there's none. Read over rtnetlink, parsed in Helios; a thread
+  listens for link, address, route and rule changes, and a change is reported after 1 s of quiet (5 s at most),
   with a `net.changed` event naming the interfaces added and removed and the fields that
   changed. Loopback and `exclude` (default `veth*`) are left out; at most 16 interfaces and 8
   addresses of each family, else `truncated`. Read-only, no extra permissions, no `unsafe`.

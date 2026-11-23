@@ -273,6 +273,7 @@ mod tests {
                 },
             ],
             nexthops: vec![],
+            source: State::default(),
         }
     }
 

@@ -3,7 +3,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
@@ -16,6 +16,7 @@ use super::netlink::{
 #[cfg(test)]
 use super::nl80211::NoWireless;
 use super::nl80211::Wireless;
+use super::routes::plan::BASE;
 use crate::sysfs::read_attr;
 
 /// At most this many interfaces are reported.
@@ -99,6 +100,7 @@ pub(crate) fn build_with(
             "ipv4": ipv4,
             "ipv6": ipv6,
             "default_routes": default_routes,
+            "source_route": source_route(tables, link.index),
         });
         if let Some(mac) = &link.mac {
             interface["mac"] = json!(hex(mac));
@@ -131,6 +133,40 @@ pub(crate) fn build_with(
         interfaces,
         truncated,
     }
+}
+
+/// Whether `helios routes` steers traffic from the interface's addresses through it (LLD 3,
+/// section 5.4): `{"table", "rule"}` when its table holds a default route out of it, with `rule`
+/// true when every IPv4 address it has also has its `from <address>` rule, and `null` when there's
+/// no such route (the service isn't running, or the interface isn't an uplink).
+fn source_route(tables: &Tables, index: u32) -> Value {
+    let table = BASE + index;
+    let routed = tables.source.routes.iter().any(|route| {
+        route.table == table
+            && route.interface == index
+            && route.destination == (Ipv4Addr::UNSPECIFIED, 0)
+    });
+    if !routed {
+        return Value::Null;
+    }
+    let mut ipv4 = tables
+        .addresses
+        .iter()
+        .filter(|a| a.index == index)
+        .filter_map(|a| match a.address {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .peekable();
+    let rule = ipv4.peek().is_some()
+        && ipv4.all(|address| {
+            tables
+                .source
+                .rules
+                .iter()
+                .any(|rule| rule.source == address && rule.table == table)
+        });
+    json!({"table": table, "rule": rule})
 }
 
 /// An interface's IPv4 addresses (`a.b.c.d/n`) and IPv6 addresses (objects), each list at most
