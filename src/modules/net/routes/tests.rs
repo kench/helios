@@ -31,7 +31,7 @@ impl Kernel for Network {
                 done(),
             ]
             .concat(),
-            Dump::Nexthops => done(),
+            Dump::Nexthops | Dump::Rules => done(),
         };
         Ok(vec![reply])
     }
