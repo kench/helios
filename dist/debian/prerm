@@ -4,7 +4,7 @@
 set -e
 
 if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
-    systemctl disable --now helios-wifi.path || true
+    systemctl disable --now helios-wifi.path helios-routes.service || true
     systemctl stop helios.service helios-rtmp.service helios-stream.service \
         helios-firewall.service || true
 fi

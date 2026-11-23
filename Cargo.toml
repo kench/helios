@@ -37,6 +37,8 @@ assets = [
     ["dist/systemd/helios-firewall.service", "lib/systemd/system/", "644"],
     ["dist/systemd/helios-wifi.path", "lib/systemd/system/", "644"],
     ["dist/systemd/helios-wifi.service", "lib/systemd/system/", "644"],
+    ["dist/systemd/helios-routes.service", "lib/systemd/system/", "644"],
+    ["dist/iproute2/helios.conf", "etc/iproute2/rt_protos.d/", "644"],
     ["dist/systemd/gpsd.socket.d/helios.conf", "lib/systemd/system/gpsd.socket.d/", "644"],
     ["dist/nftables/helios.nft", "etc/helios/firewall.nft", "644"],
     ["dist/helios.toml", "usr/share/doc/helios/examples/", "644"],

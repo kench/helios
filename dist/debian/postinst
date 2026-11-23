@@ -1,7 +1,7 @@
 #!/bin/sh
 # helios postinst: the helios, helios-stream and helios-rtmp system users, a restart on upgrade if Helios
 # is running, gpsd's control socket made again for the gpsd.socket drop-in, and helios-wifi.path
-# enabled on a device that has Helios enabled. The services aren't enabled or started on install: a device needs its config and
+# and helios-routes.service enabled on a device that has Helios enabled. The services aren't enabled or started on install: a device needs its config and
 # token first (provisioning), and then enables helios.service (and helios-stream.service where
 # it streams) itself. The stream daemon isn't restarted here: it's told an upgrade is waiting,
 # and restarts itself once no stream is live (LLD 4, section 15).
@@ -48,9 +48,13 @@ if [ "$1" = configure ]; then
                 systemctl start gpsd.service || true
             fi
         fi
-        # A provisioned device (Helios enabled) applies Wi-Fi networks from this version on.
+        # A provisioned device (Helios enabled) applies Wi-Fi networks from this version on, and
+        # keeps source routing for bonded uplinks (LLD 3, section 5; restarted to pick up a new
+        # Helios).
         if systemctl is-enabled --quiet helios.service; then
             systemctl enable --now helios-wifi.path || true
+            systemctl enable helios-routes.service || true
+            systemctl restart helios-routes.service || true
         fi
     fi
 fi
