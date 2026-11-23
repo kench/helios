@@ -29,6 +29,10 @@ fn setup(interval: Duration) -> Setup {
 }
 
 fn setup_with(interval: Duration, token: Value) -> Setup {
+    setup_report(interval, token, ClockReport::Full)
+}
+
+fn setup_report(interval: Duration, token: Value, clock_report: ClockReport) -> Setup {
     let (handle, published, mqtt) = MqttHandle::for_test();
     let (replies, incoming) = tokio::sync::mpsc::channel(4);
     let cancel = CancellationToken::new();
@@ -54,6 +58,7 @@ fn setup_with(interval: Duration, token: Value) -> Setup {
             credentials: credentials_rx,
             mqtt: mqtt.subscribe(),
             clock: clock_rx,
+            clock_report,
             modules: modules_rx,
             boot_id: Some("boot-1".into()),
             started_at: SystemTime::UNIX_EPOCH,
@@ -189,6 +194,46 @@ async fn reports_bootstrap_and_fatal_reasons() {
     let reported = next_report(&mut setup).await;
     assert_eq!(reported["identity"]["state"], "fatal");
     assert_eq!(reported["identity"]["reason"], "token PIN is locked");
+}
+
+#[tokio::test]
+async fn synced_mode_reports_only_whether_the_clock_is_synced() {
+    let mut setup = setup_report(DEFAULT_INTERVAL, Value::Null, ClockReport::Synced);
+    let first = next_report(&mut setup).await;
+    assert_eq!(first["clock"], json!({"synced": null}));
+
+    setup.clock.send_replace(ClockStatus {
+        synced: Some(true),
+        max_error_ms: Some(16_500),
+        drift_ppm: Some(-12.3),
+        offset: Some(crate::clock::offset::Offset {
+            offset_ms: 2_096_114,
+            uncertainty: Duration::from_millis(1801),
+            source: crate::clock::offset::Source::Bootstrap,
+            at: SystemTime::UNIX_EPOCH,
+        }),
+        boot_offset_s: Some(2_096),
+    });
+    assert_eq!(
+        next_report(&mut setup).await["clock"],
+        json!({"synced": true})
+    );
+
+    // Drift and error bounds move every minute; they don't make a report in this mode.
+    setup
+        .clock
+        .send_modify(|clock| clock.drift_ppm = Some(-12.9));
+    let quiet = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            if let Some(MqttRequest::Now { topic, .. }) = setup.published.recv().await
+                && topic.ends_with("/shadow/name/helios/update")
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "nothing to report");
 }
 
 #[tokio::test]

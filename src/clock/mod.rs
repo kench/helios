@@ -114,6 +114,18 @@ pub struct ClockSettings {
     pub warn_offset: Duration,
     /// Where to read the boot mark; `None` for no boot offset.
     pub boot_mark: Option<PathBuf>,
+    /// `clock.report`: what the `helios` shadow's clock block holds.
+    pub report: ClockReport,
+}
+
+/// `clock.report` (owner, 2026-11-22: whether the clock is synced is enough for most uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClockReport {
+    /// Only `clock.synced`: the details churn the shadow every interval.
+    #[default]
+    Synced,
+    /// Everything the checks measure: error bound, drift, server offset, boot offset.
+    Full,
 }
 
 impl Default for ClockSettings {
@@ -121,6 +133,7 @@ impl Default for ClockSettings {
         Self {
             warn_offset: DEFAULT_WARN_OFFSET,
             boot_mark: Some(PathBuf::from(boot::BOOT_MARK)),
+            report: ClockReport::default(),
         }
     }
 }

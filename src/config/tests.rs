@@ -172,6 +172,31 @@ fn reads_the_optional_identity_settings() {
 }
 
 #[test]
+fn reads_the_clock_report_setting() {
+    use crate::clock::ClockReport;
+    let files = Files::new();
+    let with = |section: &str| format!("{}\n[clock]\n{section}\n", files.local(""));
+    assert_eq!(
+        files.load(&files.local("")).unwrap().clock.report,
+        ClockReport::Synced
+    );
+    assert_eq!(
+        files.load(&with("report = \"full\"")).unwrap().clock.report,
+        ClockReport::Full
+    );
+    assert_eq!(
+        files
+            .load(&with("report = \"synced\""))
+            .unwrap()
+            .clock
+            .report,
+        ClockReport::Synced
+    );
+    let error = files.load(&with("report = \"all\"")).unwrap_err();
+    assert!(error.message.contains("clock.report"), "{error}");
+}
+
+#[test]
 fn reads_the_token_copy_mode() {
     use crate::identity::token_copy::TokenCopy;
     let files = Files::new();
