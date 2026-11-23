@@ -86,6 +86,11 @@ exclude = ["veth*"]              # interface names to leave out; a trailing * ma
 # gained or lost, every 25 m (at most every 10 s) while moving, and once an hour while still.
 enabled = false
 # gpsd = "127.0.0.1:2947"   # gpsd's address (IP and port)
+# The receiver gpsd should open, added through gpsd's control socket at start and whenever gpsd
+# loses it (a USB serial bridge gpsd's hotplug rules don't know, such as the MCP2221). Leave out
+# for a receiver gpsd finds by itself.
+# device = "/dev/serial/by-id/usb-Microchip_Technology_Inc._MCP2221_USB-I2C_UART_Combo-if00"
+# control_socket = "/run/gpsd.sock"   # gpsd's (the helios package's gpsd.socket drop-in opens it to helios)
 
 [modules.stream]
 # Video streams through ffmpeg to SRT listeners (LLD 4): directly, or bonded over several uplinks
