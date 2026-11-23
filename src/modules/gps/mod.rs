@@ -289,10 +289,11 @@ async fn add_device(socket: &Path, device: &str) -> Result<(), String> {
             .read_line(&mut answer)
             .await
             .map_err(|error| format!("no answer from gpsd's control socket: {error}"))?;
-        // gpsd 3.25 answers in JSON (`{"class":"OK"}`, `{"class":"ERROR"}`, checked on the Orange
-        // Pi 2026-11-22); older ones in plain text.
+        // gpsd 3.25 answers in JSON: `{"class":"ACK"}` when it opened the device and
+        // `{"class":"ERROR"}` when it didn't or already had it (both seen on the Orange Pi,
+        // 2026-11-22). Older gpsd answers `OK` or `ERROR` in plain text.
         match answer.trim() {
-            "OK" | r#"{"class":"OK"}"# => Ok(()),
+            "OK" | r#"{"class":"ACK"}"# | r#"{"class":"OK"}"# => Ok(()),
             other => Err(format!(
                 "gpsd couldn't open {device}: it answered {other:?}"
             )),

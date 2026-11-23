@@ -487,13 +487,13 @@ async fn adds_the_receiver_through_the_control_socket() {
     assert_eq!(add_device(&ok, PATH).await, Ok(()));
     assert_eq!(requests.recv().await.unwrap(), format!("+{PATH}\n"));
 
-    let json = tempfile::tempdir().unwrap();
-    let (ok_json, _) = control_socket(json.path(), "{\"class\":\"OK\"}\r\n").await;
-    assert_eq!(
-        add_device(&ok_json, PATH).await,
-        Ok(()),
-        "gpsd 3.25's answer"
-    );
+    // What gpsd 3.25 answers when it opens the device (seen on the Orange Pi), and the OK
+    // form some JSON-speaking versions use.
+    for answer in ["{\"class\":\"ACK\"}\r\n", "{\"class\":\"OK\"}\r\n"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _) = control_socket(dir.path(), answer).await;
+        assert_eq!(add_device(&socket, PATH).await, Ok(()), "{answer}");
+    }
 
     let refusing = tempfile::tempdir().unwrap();
     let (error, _) = control_socket(refusing.path(), "{\"class\":\"ERROR\"}\r\n").await;
