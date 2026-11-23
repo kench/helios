@@ -5,6 +5,10 @@
 //! rustls `ClientConfig`, so it decides the roots and whether a client certificate is
 //! presented. Redirects are never followed: a 3xx comes back as a response like any other.
 
+use std::collections::VecDeque;
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -17,6 +21,7 @@ use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
 use tokio::net::TcpStream;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsConnector;
 
 /// The `User-Agent` sent with every request.
@@ -182,7 +187,7 @@ async fn exchange(
 ) -> Result<Response, HttpsError> {
     let tcp = tokio::time::timeout(
         limits.connect_timeout,
-        TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
+        connect(endpoint.host.as_str(), endpoint.port),
     )
     .await
     .map_err(|_| HttpsError::Timeout(limits.connect_timeout))?
@@ -219,9 +224,219 @@ async fn exchange(
     })
 }
 
+/// RFC 8305's Connection Attempt Delay: how long an attempt gets before the next address is
+/// tried alongside it.
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// Connects to `host` with Happy Eyeballs (RFC 8305): its addresses alternate between IPv6 and
+/// IPv4, starting with the resolver's first choice, and each next one is tried
+/// [`ATTEMPT_DELAY`] after the previous (or as soon as it fails). The first to connect wins. So
+/// an endpoint with IPv6 addresses still connects promptly where IPv6 is advertised but broken.
+async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    race(interleave(addresses), ATTEMPT_DELAY, TcpStream::connect).await
+}
+
+/// `addresses` reordered to alternate between the address families, starting with the first
+/// address's family, each family keeping the resolver's order (RFC 8305, section 4).
+fn interleave(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(first) = addresses.first() else {
+        return addresses;
+    };
+    let first_v6 = first.is_ipv6();
+    let (mut preferred, mut other): (VecDeque<SocketAddr>, VecDeque<SocketAddr>) = addresses
+        .into_iter()
+        .partition(|address| address.is_ipv6() == first_v6);
+    let mut ordered = Vec::with_capacity(preferred.len() + other.len());
+    while !preferred.is_empty() || !other.is_empty() {
+        ordered.extend(preferred.pop_front());
+        ordered.extend(other.pop_front());
+    }
+    ordered
+}
+
+/// Starts an attempt on each address in turn, the next one `delay` after the previous or as
+/// soon as one fails, and returns the first that succeeds. The attempts still running are
+/// cancelled. When all fail, the last failure is returned.
+async fn race<C, F, T>(addresses: Vec<SocketAddr>, delay: Duration, connect: C) -> io::Result<T>
+where
+    C: Fn(SocketAddr) -> F,
+    F: Future<Output = io::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut queue = addresses.into_iter().peekable();
+    let mut attempts = JoinSet::new();
+    let mut last_error = None;
+    let mut next = queue.next();
+    loop {
+        if let Some(address) = next.take() {
+            attempts.spawn(connect(address));
+        }
+        let more = queue.peek().is_some();
+        if attempts.is_empty() {
+            return Err(last_error.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "the host has no addresses")
+            }));
+        }
+        tokio::select! {
+            Some(done) = attempts.join_next() => {
+                match done {
+                    Ok(Ok(stream)) => return Ok(stream),
+                    Ok(Err(error)) => last_error = Some(error),
+                    Err(error) => last_error = Some(io::Error::other(error)),
+                }
+                if more {
+                    next = queue.next();
+                }
+            }
+            () = tokio::time::sleep(delay), if more => next = queue.next(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    fn addr(text: &str) -> SocketAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn interleaves_the_families_starting_with_the_first() {
+        let v6 = [
+            "[2001:db8::1]:443",
+            "[2001:db8::2]:443",
+            "[2001:db8::3]:443",
+        ]
+        .map(addr);
+        let v4 = ["192.0.2.1:443", "192.0.2.2:443"].map(addr);
+        assert_eq!(
+            interleave(vec![v6[0], v6[1], v6[2], v4[0], v4[1]]),
+            vec![v6[0], v4[0], v6[1], v4[1], v6[2]]
+        );
+        assert_eq!(
+            interleave(vec![v4[0], v6[0], v6[1], v4[1]]),
+            vec![v4[0], v6[0], v4[1], v6[1]]
+        );
+        assert_eq!(interleave(vec![v4[1], v4[0]]), vec![v4[1], v4[0]]);
+        assert!(interleave(vec![]).is_empty());
+    }
+
+    /// A fake connector: addresses ending in .1 (or ::1) never answer, .2 fail at once, and the
+    /// rest connect, returning their address; it records when each attempt starts.
+    fn fake(
+        started: Arc<Mutex<Vec<(SocketAddr, tokio::time::Instant)>>>,
+    ) -> impl Fn(SocketAddr) -> std::pin::Pin<Box<dyn Future<Output = io::Result<SocketAddr>> + Send>>
+    {
+        move |address| {
+            started
+                .lock()
+                .unwrap()
+                .push((address, tokio::time::Instant::now()));
+            Box::pin(async move {
+                let last = match address.ip() {
+                    std::net::IpAddr::V4(ip) => u16::from(ip.octets()[3]),
+                    std::net::IpAddr::V6(ip) => ip.segments()[7],
+                };
+                match last {
+                    1 => std::future::pending().await,
+                    2 => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+                    _ => Ok(address),
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_address_gets_the_attempt_delay_then_the_next_one_wins() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let begin = tokio::time::Instant::now();
+        let winner = race(
+            vec![addr("[2001:db8::1]:443"), addr("192.0.2.9:443")],
+            ATTEMPT_DELAY,
+            fake(Arc::clone(&started)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, addr("192.0.2.9:443"));
+        let started = started.lock().unwrap();
+        assert_eq!(started[1].1 - begin, ATTEMPT_DELAY, "IPv4 after the delay");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_starts_the_next_attempt_at_once() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let begin = tokio::time::Instant::now();
+        let winner = race(
+            vec![addr("[2001:db8::2]:443"), addr("192.0.2.9:443")],
+            ATTEMPT_DELAY,
+            fake(Arc::clone(&started)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, addr("192.0.2.9:443"));
+        assert_eq!(started.lock().unwrap()[1].1 - begin, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn returns_the_last_failure_when_every_attempt_fails() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let error = race(
+            vec![addr("[2001:db8::2]:443"), addr("192.0.2.2:443")],
+            ATTEMPT_DELAY,
+            fake(Arc::clone(&started)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(started.lock().unwrap().len(), 2);
+        let error = race(vec![], ATTEMPT_DELAY, fake(started))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_success_wins_even_if_an_earlier_attempt_is_still_running() {
+        // The first never answers, the second fails, the third connects.
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let winner = race(
+            vec![
+                addr("192.0.2.1:443"),
+                addr("[2001:db8::2]:443"),
+                addr("192.0.2.3:443"),
+            ],
+            ATTEMPT_DELAY,
+            fake(Arc::clone(&started)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, addr("192.0.2.3:443"));
+        assert_eq!(started.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn connects_to_a_real_listener_past_an_address_that_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // 192.0.2.0/24 is reserved for documentation: nothing answers (or it's unreachable).
+        let stream = race(
+            vec![
+                SocketAddr::from(([192, 0, 2, 1], port)),
+                SocketAddr::from(([127, 0, 0, 1], port)),
+            ],
+            ATTEMPT_DELAY,
+            TcpStream::connect,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap().port(), port);
+        let stream = connect("localhost", port).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap().port(), port);
+    }
 
     #[test]
     fn parses_endpoints() {
