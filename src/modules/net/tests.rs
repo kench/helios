@@ -599,6 +599,7 @@ async fn next_report(reports: &mut crate::mqtt::shadow::TestReports) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reports_each_routed_uplinks_public_address() {
     let sysfs = board_sysfs();
+    let (view_tx, mut view) = tokio::sync::watch::channel(Value::Null);
     let (kernel, _changes) = FakeKernel::new(board_tables());
     let probe = Arc::new(super::egress::tests::FakeProbe {
         answer: Ok("203.0.113.7".parse().unwrap()),
@@ -610,7 +611,8 @@ async fn reports_each_routed_uplinks_public_address() {
             Arc::clone(&kernel) as Arc<dyn Kernel>,
             sysfs.path(),
         )
-        .with_probe(Arc::clone(&probe) as Arc<dyn super::egress::Probe>),
+        .with_probe(Arc::clone(&probe) as Arc<dyn super::egress::Probe>)
+        .with_uplink_view(view_tx),
     );
     let (ctx, mut reports, _requests) = context(sysfs.path());
     let cancel = ctx.cancel.clone();
@@ -639,6 +641,20 @@ async fn reports_each_routed_uplinks_public_address() {
         vec![std::net::Ipv4Addr::new(192, 168, 5, 31)],
         "asked once, from Ethernet's address"
     );
+    // The stream daemon's view follows: kind, metric and the public address.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        view.wait_for(|v| v["interfaces"]["enP4p65s0"]["public_ipv4"] == "203.0.113.7"),
+    )
+    .await
+    .expect("the view in time")
+    .expect("the sender");
+    let current = view.borrow().clone();
+    assert_eq!(
+        current["interfaces"]["enP4p65s0"],
+        json!({"kind": "ethernet", "metric": 100, "public_ipv4": "203.0.113.7"})
+    );
+    assert_eq!(current["interfaces"]["wwan0"]["public_ipv4"], Value::Null);
     cancel.cancel();
     running.await.unwrap().unwrap();
 }
@@ -1173,4 +1189,25 @@ async fn the_module_reports_the_joined_network() {
     assert_eq!(first["interfaces"]["wlP2p33s0"]["wifi"]["ssid"], "Home");
     cancel.cancel();
     assert_eq!(running.await.unwrap(), Ok(()));
+}
+
+#[test]
+fn the_uplink_view_leaves_out_a_failing_public_address() {
+    let interfaces = json!({
+        "eth0": {"kind": "ethernet",
+                 "default_routes": [{"family": "ipv6", "metric": 50},
+                                    {"family": "ipv4", "metric": 200},
+                                    {"family": "ipv4", "metric": 100}],
+                 "public_ipv4": {"address": "203.0.113.7", "checked_at": "x"}},
+        "wlan0": {"kind": "wifi", "default_routes": [],
+                  "public_ipv4": {"address": "203.0.113.7", "checked_at": "x",
+                                  "error": "timeout", "failed_at": "y"}},
+    });
+    assert_eq!(
+        super::uplink_view(interfaces.as_object().unwrap()),
+        json!({"interfaces": {
+            "eth0": {"kind": "ethernet", "metric": 100, "public_ipv4": "203.0.113.7"},
+            "wlan0": {"kind": "wifi", "metric": null, "public_ipv4": null},
+        }})
+    );
 }

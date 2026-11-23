@@ -131,6 +131,9 @@ pub struct NetModule {
     identity: Option<tokio::sync::watch::Receiver<IdentityState>>,
     /// The egress echo, for each uplink's public address (section 3); `None` turns it off.
     egress: Option<Arc<dyn egress::Probe>>,
+    /// Where the uplink view goes (kinds, metrics, public addresses), for the stream daemon's
+    /// standby (section 3.5.1).
+    uplink_view: Option<tokio::sync::watch::Sender<Value>>,
 }
 
 impl NetModule {
@@ -148,7 +151,15 @@ impl NetModule {
             wifi_status: wifi::STATUS.into(),
             identity: Some(identity),
             egress: None,
+            uplink_view: None,
         }
+    }
+
+    /// Publishes the uplink view to `view` after each reading.
+    #[must_use]
+    pub fn with_uplink_view(mut self, view: tokio::sync::watch::Sender<Value>) -> Self {
+        self.uplink_view = Some(view);
+        self
     }
 
     /// Checks the uplinks' public addresses with `client`, unless the settings turn it off.
@@ -174,6 +185,7 @@ impl NetModule {
             wifi_status: wifi_dir.join("status.json"),
             identity: None,
             egress: None,
+            uplink_view: None,
         }
     }
 
@@ -311,6 +323,14 @@ impl NetModule {
             for (name, interface) in &mut snapshot.interfaces {
                 interface["public_ipv4"] = checks.report(name);
             }
+        }
+        if let Some(view) = &self.uplink_view {
+            let current = uplink_view(&snapshot.interfaces);
+            view.send_if_modified(|last| {
+                let changed = *last != current;
+                *last = current;
+                changed
+            });
         }
         if let Some((reported, event)) = reporter.update(snapshot, wifi, SystemTime::now()) {
             ctx.shadows.report(MODULE, reported);
@@ -480,6 +500,34 @@ fn listen(mut watch: Box<dyn Watch>, changed: &mpsc::Sender<()>) {
             }
         }
     }
+}
+
+/// The view the stream daemon chooses standby uplinks from (section 3.5.1):
+/// `{"interfaces": {name: {kind, metric, public_ipv4}}}`, with `metric` the lowest IPv4
+/// default-route metric and `public_ipv4` only when the latest check found the address (a
+/// failing uplink counts as unknown, so its standby is bonded).
+fn uplink_view(interfaces: &Map<String, Value>) -> Value {
+    let entries: Map<String, Value> = interfaces
+        .iter()
+        .map(|(name, interface)| {
+            let metric = interface["default_routes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|route| route["family"] == "ipv4")
+                .filter_map(|route| route["metric"].as_u64())
+                .min();
+            let public = &interface["public_ipv4"];
+            let address = public["address"]
+                .as_str()
+                .filter(|_| public.get("error").is_none());
+            (
+                name.clone(),
+                json!({"kind": interface["kind"], "metric": metric, "public_ipv4": address}),
+            )
+        })
+        .collect();
+    json!({"interfaces": entries})
 }
 
 /// A public-address check in flight.

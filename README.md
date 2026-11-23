@@ -116,6 +116,15 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   else `srtla_uplinks`. Each stream reports the `destination` in use and its `overrides`, which
   the daemon saves with the rest of the desired state.
 
+  **Standby for shared public addresses** (LLD 3, section 3.5.1): Helios passes the net
+  module's view of the uplinks (kind, lowest IPv4 metric, public IPv4) to the daemon over the
+  control socket (`uplinks`). Of uplinks that share a public address, only one bonds:
+  Ethernet first, then cellular, Wi-Fi last, then the lower metric, then the name. The others
+  are left out of the sender's IP file and listed in the output's `standby`
+  (`{interface, address, shares_public_address_with}`). When the bonded one loses its address
+  (or its public check fails), the next takes its place and the sender reloads. An uplink whose
+  public address isn't known bonds as before.
+
   So the Control API can offer only what's there, the shadow also has `profiles` (each one's
   encoder, bitrates, scale and audio) and `inputs`: the attached USB cameras (selector, port,
   product, whether they record audio, and their capture `formats`: pixel format in ffmpeg's
