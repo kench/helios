@@ -28,6 +28,7 @@ mod process;
 mod rtmp;
 pub(crate) mod settings;
 mod srtla;
+mod standby;
 mod v4l2;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -158,6 +159,9 @@ pub struct StreamModule {
     spawner: Arc<dyn Spawner>,
     addresses: Arc<Addresses>,
     formats: Arc<FormatReader>,
+    /// The net module's view of the uplinks (kinds, metrics, public addresses), from Helios over
+    /// the control socket, for standby (LLD 3, section 3.5.1). Empty until Helios sends it.
+    uplinks: tokio::sync::watch::Receiver<standby::View>,
 }
 
 /// Where uplink addresses come from: rtnetlink, or a fake in tests.
@@ -182,7 +186,18 @@ impl StreamModule {
             spawner: Arc::new(process::System),
             addresses: Arc::new(addrs::ipv4_addresses),
             formats: Arc::new(v4l2::formats),
+            uplinks: tokio::sync::watch::channel(standby::View::new()).1,
         }
+    }
+
+    /// Follows the uplink view the daemon receives from Helios.
+    #[must_use]
+    pub(crate) fn with_uplinks(
+        mut self,
+        uplinks: tokio::sync::watch::Receiver<standby::View>,
+    ) -> Self {
+        self.uplinks = uplinks;
+        self
     }
 
     #[cfg(test)]
@@ -198,6 +213,7 @@ impl StreamModule {
             spawner,
             addresses,
             formats: Arc::new(|_| Ok(Vec::new())),
+            uplinks: tokio::sync::watch::channel(standby::View::new()).1,
         }
     }
 
@@ -948,10 +964,12 @@ impl<'a> Streams<'a> {
         }
         let wanted: Vec<String> = wanted.into_iter().map(str::to_owned).collect();
         let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        let view = self.module.uplinks.borrow().clone();
         self.senders.reconcile(
             &wanted,
             devices,
             &self.addresses,
+            &view,
             now,
             srtla::Spawning {
                 spawner: self.module.spawner.as_ref(),

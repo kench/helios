@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::super::control::{self, Message};
-use super::super::tests::{FakeSpawner, Started, settings};
+use super::super::tests::{FakeSpawner, Started, address, settings};
 use super::super::{StreamClient, StreamModule};
 use super::{Daemon, busy, desired_state, uid_of};
 use crate::modules::usb::UsbSettings;
@@ -155,6 +155,14 @@ struct Agent {
 
 /// Helios's side: the stream module as a client of the daemon at `socket`.
 fn agent(socket: std::path::PathBuf) -> Agent {
+    agent_with(socket, None)
+}
+
+/// Helios's client, passing on `uplinks` (the net module's view) when given.
+fn agent_with(
+    socket: std::path::PathBuf,
+    uplinks: Option<tokio::sync::watch::Receiver<Value>>,
+) -> Agent {
     let (mqtt, published, _status) = MqttHandle::for_test();
     let (shadows, reports, _desired) = ShadowHandle::for_test();
     let (commands, commands_rx) = mpsc::channel(4);
@@ -167,7 +175,10 @@ fn agent(socket: std::path::PathBuf) -> Agent {
         sysfs: "/sys".into(),
         cancel: cancel.clone(),
     };
-    let client = StreamClient::new(socket);
+    let client = match uplinks {
+        Some(view) => StreamClient::new(socket).with_uplink_view(view),
+        None => StreamClient::new(socket),
+    };
     let task = tokio::spawn(async move { client.run(ctx).await });
     Agent {
         published,
@@ -232,6 +243,11 @@ struct Running {
 }
 
 fn daemon(config: &str) -> Running {
+    daemon_with(config, Arc::new(|| Ok(Vec::new())))
+}
+
+/// The daemon, with interface addresses from `addresses`.
+fn daemon_with(config: &str, addresses: Arc<super::super::Addresses>) -> Running {
     let (started_tx, started) = mpsc::unbounded_channel();
     let spawner = Arc::new(FakeSpawner {
         started: started_tx,
@@ -243,7 +259,7 @@ fn daemon(config: &str) -> Running {
         usb: UsbSettings::default(),
         sysfs: "/nonexistent/sys".into(),
         engine: Box::new(move |settings, usb| {
-            StreamModule::with_fakes(settings, usb, spawner, Arc::new(|| Ok(Vec::new())))
+            StreamModule::with_fakes(settings, usb, spawner, addresses)
         }),
     };
     let cancel = CancellationToken::new();
@@ -392,4 +408,96 @@ async fn a_bad_socket_path_is_an_error() {
         .expect("ended")
         .expect("task");
     assert!(result.is_err_and(|e| e.contains("/nonexistent")));
+}
+
+const BONDED: &str = r#"
+ffmpeg = "/opt/ffmpeg"
+srtla_send = "/opt/srtla_send"
+control_socket = "DIR/control.sock"
+state_dir = "DIR/state"
+runtime_dir = "DIR/run"
+
+[outputs.bond]
+mode = "srtla"
+host = "rec.example.com"
+port = 5000
+latency_ms = 2000
+uplinks = ["eth1", "wlan0"]
+
+[profiles.test]
+video = "libx264"
+audio = "aac"
+
+[streams.pattern]
+source = { type = "test" }
+profile = "test"
+output = "bond"
+streamid = "publish/live/pattern"
+"#;
+
+fn view(wifi_public: &str) -> Value {
+    json!({"interfaces": {
+        "eth1": {"kind": "ethernet", "metric": 100, "public_ipv4": "203.0.113.7"},
+        "wlan0": {"kind": "wifi", "metric": 600, "public_ipv4": wifi_public},
+    }})
+}
+
+async fn ips_become(path: &std::path::Path, want: &str) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if std::fs::read_to_string(path).is_ok_and(|text| text == want) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} never became {want:?}", path.display()));
+}
+
+#[tokio::test]
+async fn helios_uplink_view_puts_a_shared_uplink_in_standby() {
+    let dir = tempfile::tempdir().expect("directory");
+    let config = BONDED.replace("DIR", &dir.path().display().to_string());
+    let socket = dir.path().join("control.sock");
+    let ips = dir.path().join("run/srtla/bond.ips");
+    let mut running = daemon_with(
+        &config,
+        Arc::new(|| {
+            Ok(vec![
+                address("eth1", [10, 0, 1, 2]),
+                address("wlan0", [10, 0, 2, 2]),
+            ])
+        }),
+    );
+    // Ethernet and Wi-Fi share a public address: Wi-Fi waits.
+    let (uplinks, uplinks_view) = tokio::sync::watch::channel(view("203.0.113.7"));
+    let mut helios = agent_with(socket, Some(uplinks_view));
+    let sender = next_start(&mut running.started).await;
+    assert_eq!(
+        sender.spec.program,
+        std::path::PathBuf::from("/opt/srtla_send")
+    );
+    let shadow = helios
+        .shadow_where("Wi-Fi in standby", |r| {
+            r["outputs"]["bond"]["standby"][0]["interface"] == "wlan0"
+        })
+        .await;
+    assert_eq!(
+        shadow["outputs"]["bond"]["standby"],
+        json!([{"interface": "wlan0", "address": "10.0.2.2",
+                "shares_public_address_with": "eth1"}])
+    );
+    ips_become(&ips, "10.0.1.2\n").await;
+
+    // Wi-Fi turns out to have its own public address: both bond.
+    uplinks.send_replace(view("198.51.100.9"));
+    helios
+        .shadow_where("no standby", |r| {
+            r["outputs"]["bond"]["standby"] == json!([])
+        })
+        .await;
+    ips_become(&ips, "10.0.1.2\n10.0.2.2\n").await;
+    helios.stop().await;
+    running.cancel.cancel();
 }
