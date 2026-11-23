@@ -488,6 +488,7 @@ fn settings_check_patterns() {
         let settings = NetSettings {
             enabled: true,
             exclude: vec![bad.into()],
+            public_address_check: true,
         };
         assert!(settings.check().is_err(), "{bad:?}");
     }
@@ -593,6 +594,53 @@ async fn next_report(reports: &mut crate::mqtt::shadow::TestReports) -> Value {
         .expect("reports open");
     assert_eq!(shadow, "net");
     Value::Object(reported)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reports_each_routed_uplinks_public_address() {
+    let sysfs = board_sysfs();
+    let (kernel, _changes) = FakeKernel::new(board_tables());
+    let probe = Arc::new(super::egress::tests::FakeProbe {
+        answer: Ok("203.0.113.7".parse().unwrap()),
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    let module = Arc::new(
+        NetModule::with_kernel(
+            NetSettings::default(),
+            Arc::clone(&kernel) as Arc<dyn Kernel>,
+            sysfs.path(),
+        )
+        .with_probe(Arc::clone(&probe) as Arc<dyn super::egress::Probe>),
+    );
+    let (ctx, mut reports, _requests) = context(sysfs.path());
+    let cancel = ctx.cancel.clone();
+    let running = tokio::spawn({
+        let module = Arc::clone(&module);
+        async move { module.run(ctx).await }
+    });
+    let first = next_report(&mut reports).await;
+    assert_eq!(
+        first["interfaces"]["enP4p65s0"]["public_ipv4"],
+        Value::Null,
+        "not yet checked"
+    );
+    let second = next_report(&mut reports).await;
+    assert_eq!(
+        second["interfaces"]["enP4p65s0"]["public_ipv4"]["address"],
+        "203.0.113.7"
+    );
+    assert_eq!(
+        second["interfaces"]["wwan0"]["public_ipv4"],
+        Value::Null,
+        "its table has no rule, so it isn't checked"
+    );
+    assert_eq!(
+        *probe.asked.lock().unwrap(),
+        vec![std::net::Ipv4Addr::new(192, 168, 5, 31)],
+        "asked once, from Ethernet's address"
+    );
+    cancel.cancel();
+    running.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

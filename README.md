@@ -149,7 +149,13 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   routes through nexthop objects) and `source_route`: `{"table": 10004, "rule": true}` when
   `helios-routes` keeps a default route out of the interface in its own table, with `rule` true
   once every IPv4 address on it has its `from <address>` rule (so srtla traffic from it leaves
-  through it), and `null` when there's none. Read over rtnetlink, parsed in Helios; a thread
+  through it), and `null` when there's none. With a bootstrap service and
+  `public_address_check` (on by default), each interface with `rule: true` also gets
+  `public_ipv4`: `{"address", "checked_at"}` from the bootstrap API's egress echo, asked with the
+  request bound to the uplink's address (LLD 3, section 3). It's checked at start, when the
+  uplink's address or route changes, and every ~15 minutes, with renewals of the same address
+  reported at most hourly. After a failure the last address stays, with `error` and `failed_at`.
+  Public addresses go to the shadow only, never the log. Read over rtnetlink, parsed in Helios; a thread
   listens for link, address, route and rule changes, and a change is reported after 1 s of quiet (5 s at most),
   with a `net.changed` event naming the interfaces added and removed and the fields that
   changed. Loopback and `exclude` (default `veth*`) are left out; at most 16 interfaces and 8

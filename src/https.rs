@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -20,7 +20,7 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsConnector;
 
@@ -173,7 +173,34 @@ pub async fn send(
         .body(Full::new(body))?;
     tokio::time::timeout(
         limits.total_timeout,
-        exchange(endpoint, tls, request, limits),
+        exchange(endpoint, tls, request, limits, None),
+    )
+    .await
+    .map_err(|_| HttpsError::Timeout(limits.total_timeout))?
+}
+
+/// [`send`], with the connection's source address bound to `source`, so it leaves through the
+/// uplink that has that address when source routing is set up (LLD 3, sections 3.3 and 5).
+/// Only the endpoint's addresses in `source`'s family are tried.
+///
+/// # Errors
+///
+/// [`HttpsError`] if there is no complete response within the limits.
+pub async fn send_from(
+    endpoint: &Endpoint,
+    tls: Arc<ClientConfig>,
+    request: Builder,
+    body: Bytes,
+    limits: Limits,
+    source: IpAddr,
+) -> Result<Response, HttpsError> {
+    let request = request
+        .header(HOST, &endpoint.authority)
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .body(Full::new(body))?;
+    tokio::time::timeout(
+        limits.total_timeout,
+        exchange(endpoint, tls, request, limits, Some(source)),
     )
     .await
     .map_err(|_| HttpsError::Timeout(limits.total_timeout))?
@@ -184,10 +211,11 @@ async fn exchange(
     tls: Arc<ClientConfig>,
     request: Request<Full<Bytes>>,
     limits: Limits,
+    source: Option<IpAddr>,
 ) -> Result<Response, HttpsError> {
     let tcp = tokio::time::timeout(
         limits.connect_timeout,
-        connect(endpoint.host.as_str(), endpoint.port),
+        connect(endpoint.host.as_str(), endpoint.port, source),
     )
     .await
     .map_err(|_| HttpsError::Timeout(limits.connect_timeout))?
@@ -232,9 +260,32 @@ const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 /// IPv4, starting with the resolver's first choice, and each next one is tried
 /// [`ATTEMPT_DELAY`] after the previous (or as soon as it fails). The first to connect wins. So
 /// an endpoint with IPv6 addresses still connects promptly where IPv6 is advertised but broken.
-async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
+/// With a `source`, each socket is bound to it and only addresses in its family are tried.
+async fn connect(host: &str, port: u16, source: Option<IpAddr>) -> io::Result<TcpStream> {
     let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
-    race(interleave(addresses), ATTEMPT_DELAY, TcpStream::connect).await
+    let Some(source) = source else {
+        return race(interleave(addresses), ATTEMPT_DELAY, TcpStream::connect).await;
+    };
+    let addresses: Vec<SocketAddr> = addresses
+        .into_iter()
+        .filter(|address| address.is_ipv4() == source.is_ipv4())
+        .collect();
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the host has no address in the source address's family",
+        ));
+    }
+    race(addresses, ATTEMPT_DELAY, move |address| async move {
+        let socket = if address.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        socket.bind(SocketAddr::new(source, 0))?;
+        socket.connect(address).await
+    })
+    .await
 }
 
 /// `addresses` reordered to alternate between the address families, starting with the first
@@ -434,8 +485,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stream.peer_addr().unwrap().port(), port);
-        let stream = connect("localhost", port).await.unwrap();
+        let stream = connect("localhost", port, None).await.unwrap();
         assert_eq!(stream.peer_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test]
+    async fn binds_the_source_address() {
+        // Linux routes all of 127.0.0.0/8 to loopback, so 127.0.0.2 can be bound and seen.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let source: IpAddr = "127.0.0.2".parse().unwrap();
+        let (connected, accepted) =
+            tokio::join!(connect("127.0.0.1", port, Some(source)), listener.accept());
+        assert_eq!(connected.unwrap().local_addr().unwrap().ip(), source);
+        assert_eq!(
+            accepted.unwrap().1.ip(),
+            source,
+            "the server sees the bound source"
+        );
+        let error = connect("127.0.0.1", port, Some("::1".parse().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "no IPv6 address for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_from_times_out_like_send() {
+        let endpoint = Endpoint::new("192.0.2.1", 443).unwrap();
+        let tls = crate::identity::tls::server_auth_config(
+            rustls::RootCertStore::empty(),
+            crate::identity::tls::Alpn::Http1,
+        )
+        .unwrap();
+        let limits = Limits {
+            connect_timeout: Duration::from_millis(50),
+            total_timeout: Duration::from_secs(5),
+            max_body: 1024,
+        };
+        let error = send_from(
+            &endpoint,
+            tls,
+            Request::get("/"),
+            Bytes::new(),
+            limits,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, HttpsError::Timeout(_) | HttpsError::Connect(_)),
+            "{error:?}"
+        );
     }
 
     #[test]

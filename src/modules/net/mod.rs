@@ -11,6 +11,7 @@
 //! socket is read on its own thread, so registering it with tokio (an `unsafe` operation) isn't
 //! needed.
 
+pub mod egress;
 pub(crate) mod netlink;
 pub(crate) mod nl80211;
 pub(crate) mod routes;
@@ -19,6 +20,7 @@ pub(crate) mod wifi;
 
 use std::collections::BTreeMap;
 use std::future::pending;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -56,6 +58,9 @@ pub struct NetSettings {
     pub(crate) enabled: bool,
     /// Interface names to leave out; a trailing `*` matches a prefix.
     exclude: Vec<String>,
+    /// Check each source-routed uplink's public IPv4 address with the bootstrap API's egress
+    /// echo (LLD 3, section 3), when Helios has a bootstrap service.
+    pub(crate) public_address_check: bool,
 }
 
 impl Default for NetSettings {
@@ -63,6 +68,7 @@ impl Default for NetSettings {
         Self {
             enabled: true,
             exclude: vec!["veth*".into()],
+            public_address_check: true,
         }
     }
 }
@@ -123,6 +129,8 @@ pub struct NetModule {
     wifi_status: PathBuf,
     /// The identity, for opening passphrases sealed to the device.
     identity: Option<tokio::sync::watch::Receiver<IdentityState>>,
+    /// The egress echo, for each uplink's public address (section 3); `None` turns it off.
+    egress: Option<Arc<dyn egress::Probe>>,
 }
 
 impl NetModule {
@@ -139,7 +147,17 @@ impl NetModule {
             wifi: Store::new(wifi::STORE),
             wifi_status: wifi::STATUS.into(),
             identity: Some(identity),
+            egress: None,
         }
+    }
+
+    /// Checks the uplinks' public addresses with `client`, unless the settings turn it off.
+    #[must_use]
+    pub fn with_egress(mut self, client: egress::EgressClient) -> Self {
+        if self.settings.public_address_check {
+            self.egress = Some(Arc::new(client));
+        }
+        self
     }
 
     #[cfg(test)]
@@ -155,12 +173,19 @@ impl NetModule {
             wifi: Store::new(wifi_dir.join("networks.json")),
             wifi_status: wifi_dir.join("status.json"),
             identity: None,
+            egress: None,
         }
     }
 
     #[cfg(test)]
     fn with_wireless(mut self, wireless: Arc<dyn Wireless>) -> Self {
         self.wireless = wireless;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_probe(mut self, probe: Arc<dyn egress::Probe>) -> Self {
+        self.egress = Some(probe);
         self
     }
 
@@ -193,20 +218,49 @@ impl NetModule {
             .spawn(move || listen(watch, &changed))
             .map_err(|error| ModuleError(format!("can't start the network listener: {error}")))?;
         let mut reporter = Reporter::default();
-        self.refresh(&ctx, &mut reporter).await?;
+        let mut checks = egress::Checks::default();
+        // The public-address check in flight: the uplink, its source address and the task.
+        let mut running: Option<Running> = None;
+        self.refresh(&ctx, &mut reporter, &mut checks).await?;
         let mut first_change: Option<Instant> = None;
         let mut quiet_until = Instant::now();
         let mut resync_at = Instant::now() + RESYNC;
         let mut commands_open = true;
         loop {
             let due = first_change.map(|first| quiet_until.min(first + MAX_DELAY));
+            let next_check = match (&self.egress, &running) {
+                (Some(_), None) => checks.next().map(|(_, _, at)| at),
+                _ => None,
+            };
             tokio::select! {
-                () = ctx.cancel.cancelled() => return Ok(()),
+                () = ctx.cancel.cancelled() => {
+                    if let Some(check) = running.take() {
+                        check.task.abort();
+                    }
+                    return Ok(());
+                }
+                () = sleep_until(next_check) => {
+                    if let (Some(probe), Some((name, source, _))) = (&self.egress, checks.next()) {
+                        let probe = Arc::clone(probe);
+                        running = Some(Running {
+                            name,
+                            source,
+                            task: tokio::spawn(async move { probe.check(source).await }),
+                        });
+                    }
+                }
+                done = finished(&mut running) => {
+                    if let Some(check) = running.take() {
+                        let result = done.unwrap_or_else(|error| Err(format!("check failed: {error}")));
+                        checks.record(&check.name, check.source, result, Instant::now(), SystemTime::now());
+                        self.refresh(&ctx, &mut reporter, &mut checks).await?;
+                    }
+                }
                 command = ctx.commands.recv(), if commands_open => match command {
                     Some(command) => {
                         let changed = self.command(command, &reporter).await;
                         if changed {
-                            self.refresh(&ctx, &mut reporter).await?;
+                            self.refresh(&ctx, &mut reporter, &mut checks).await?;
                         }
                     }
                     None => commands_open = false,
@@ -221,11 +275,11 @@ impl NetModule {
                 }
                 () = sleep_until(due) => {
                     first_change = None;
-                    self.refresh(&ctx, &mut reporter).await?;
+                    self.refresh(&ctx, &mut reporter, &mut checks).await?;
                     resync_at = Instant::now() + RESYNC;
                 }
                 () = tokio::time::sleep_until(resync_at) => {
-                    self.refresh(&ctx, &mut reporter).await?;
+                    self.refresh(&ctx, &mut reporter, &mut checks).await?;
                     resync_at = Instant::now() + RESYNC;
                 }
             }
@@ -237,6 +291,7 @@ impl NetModule {
         &self,
         ctx: &ModuleContext,
         reporter: &mut Reporter,
+        checks: &mut egress::Checks,
     ) -> Result<(), ModuleError> {
         let kernel = Arc::clone(&self.kernel);
         let wireless = Arc::clone(&self.wireless);
@@ -250,6 +305,13 @@ impl NetModule {
         .await
         .map_err(|error| ModuleError(format!("reading the network tables: {error}")))?
         .map_err(|error| ModuleError(format!("reading the network tables: {error}")))?;
+        let mut snapshot = snapshot;
+        if self.egress.is_some() {
+            checks.sync(&egress::uplinks(&snapshot.interfaces), Instant::now());
+            for (name, interface) in &mut snapshot.interfaces {
+                interface["public_ipv4"] = checks.report(name);
+            }
+        }
         if let Some((reported, event)) = reporter.update(snapshot, wifi, SystemTime::now()) {
             ctx.shadows.report(MODULE, reported);
             if let Some(event) = event {
@@ -417,6 +479,23 @@ fn listen(mut watch: Box<dyn Watch>, changed: &mpsc::Sender<()>) {
                 return;
             }
         }
+    }
+}
+
+/// A public-address check in flight.
+struct Running {
+    name: String,
+    source: Ipv4Addr,
+    task: tokio::task::JoinHandle<Result<IpAddr, String>>,
+}
+
+/// The running check's result, or never when none is running.
+async fn finished(
+    running: &mut Option<Running>,
+) -> Result<Result<IpAddr, String>, tokio::task::JoinError> {
+    match running {
+        Some(check) => (&mut check.task).await,
+        None => pending().await,
     }
 }
 
