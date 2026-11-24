@@ -4,6 +4,7 @@ use std::time::Duration;
 
 pub mod envelope;
 pub mod helios_shadow;
+pub mod local_address;
 pub mod manager;
 mod queue;
 pub mod shadow;
