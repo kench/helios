@@ -604,7 +604,7 @@ mod tests {
 
     fn status() -> StatusInfo {
         StatusInfo {
-            thing: Some("t-01M7Y7K4GVVSN6PX39F0NWAF4F".to_owned()),
+            thing: Some("t-01M0000000000000000000TEST".to_owned()),
             connected: true,
             connected_since: Some("13:58".to_owned()),
             address: Some("192.168.5.61".parse().unwrap()),

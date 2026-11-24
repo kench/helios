@@ -39,7 +39,7 @@ mod tests {
     #[test]
     fn stays_within_aws_iot_limits() {
         // 256 bytes and at most 7 slashes per topic filter.
-        let thing = "t-01M7Y7K4GVVSN6PX39F0NWAF4F";
+        let thing = "t-01M0000000000000000000TEST";
         for filter in shadow_filters(thing) {
             assert!(filter.len() <= 256, "{filter}");
             assert!(filter.matches('/').count() <= 7, "{filter}");

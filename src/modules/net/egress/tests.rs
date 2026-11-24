@@ -11,10 +11,10 @@ fn client(url: &str) -> Result<EgressClient, String> {
 
 #[test]
 fn reads_the_echo_location_from_the_bootstrap_url() {
-    let echo = client("https://p3u8fqa24c.execute-api.us-west-2.amazonaws.com/dev/v1").unwrap();
+    let echo = client("https://a1b2c3d4e5.execute-api.us-west-2.amazonaws.com/dev/v1").unwrap();
     assert_eq!(echo.path, "/dev/v1/device/egress");
     assert_eq!(echo.region, "us-west-2");
-    assert_eq!(echo.host, "p3u8fqa24c.execute-api.us-west-2.amazonaws.com");
+    assert_eq!(echo.host, "a1b2c3d4e5.execute-api.us-west-2.amazonaws.com");
     let trailing = client("https://a.execute-api.eu-west-1.amazonaws.com/dev/v1/").unwrap();
     assert_eq!(trailing.path, "/dev/v1/device/egress");
     let local = client("https://a.execute-api.local:8443/v1").unwrap();
