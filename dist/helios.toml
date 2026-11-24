@@ -118,8 +118,8 @@ srtla_port_base = 6000             # srtla outputs get local ports from here, in
                                    # then each stream one for an srtla:// destination
 # srtla_uplinks = ["usb:ethernet", "usb:cellular", "usb:wifi"]  # what an srtla:// destination
                                    # set through the shadow bonds when its output is direct
-# srtla_standby = true             # uplinks sharing a public address with a preferred one wait
-                                   # in standby; false bonds them all (faster failover)
+# srtla_standby = false            # true holds uplinks sharing a public address with a preferred
+                                   # one in standby (slower failover); false bonds them all
 sender_idle_s = 60                 # 1 to 3600: how long a sender outlives its last stream
 stats_interval_s = 30              # 5 to 3600: stream.stats while live
 

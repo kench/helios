@@ -116,7 +116,8 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   else `srtla_uplinks`. Each stream reports the `destination` in use and its `overrides`, which
   the daemon saves with the rest of the desired state.
 
-  **Standby for shared public addresses** (LLD 3, section 3.5.1): Helios passes the net
+  **Standby for shared public addresses** (LLD 3, section 3.5.1; off by default, turned on with
+  `modules.stream.srtla_standby = true`): Helios passes the net
   module's view of the uplinks (kind, lowest IPv4 metric, public IPv4) to the daemon over the
   control socket (`uplinks`). Of uplinks that share a public address, only one bonds:
   Ethernet first, then cellular, Wi-Fi last, then the lower metric, then the name. The others
@@ -126,8 +127,9 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   public address isn't known bonds as before. A working link stays bonded until its replacement
   has registered. A link joining from standby waits out srtla_send's 5-second startup grace,
   longer than SRT's peer timeout, so a bonded uplink that dies outright still drops the stream
-  for a few seconds. `modules.stream.srtla_standby = false` turns standby off and bonds every
-  uplink, so one is always registered.
+  for a few seconds. That's why standby is off by default: every uplink bonds, so one is always
+  registered (measured on the Orange Pi on 2026-11-24: no drop with the Ethernet cable pulled, and
+  the same bitrate as with standby).
 
   So the Control API can offer only what's there, the shadow also has `profiles` (each one's
   encoder, bitrates, scale and audio) and `inputs`: the attached USB cameras (selector, port,
