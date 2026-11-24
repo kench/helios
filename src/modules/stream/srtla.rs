@@ -98,6 +98,8 @@ pub(crate) struct Senders {
     dir: PathBuf,
     program: PathBuf,
     idle: Duration,
+    /// `modules.stream.srtla_standby`.
+    standby: bool,
     stats_tx: mpsc::UnboundedSender<(u64, Value)>,
 }
 
@@ -122,6 +124,7 @@ impl Senders {
             dir: settings.runtime_dir.join("srtla"),
             program: settings.srtla_send.clone(),
             idle: settings.sender_idle(),
+            standby: settings.srtla_standby,
             stats_tx,
         }
     }
@@ -188,7 +191,11 @@ impl Senders {
         for name in names {
             let candidates =
                 resolve_uplink_interfaces(&self.senders[&name].output.uplinks, usb, addresses);
-            let (mut ips, mut standby) = standby::choose(&candidates, view);
+            let (mut ips, mut standby) = if self.standby {
+                standby::choose(&candidates, view)
+            } else {
+                (candidates.iter().map(|(_, ip)| *ip).collect(), Vec::new())
+            };
             // Make before break: while none of the uplinks to bond has a link yet, a working one
             // that's still up stays in, so srtla_send never drops to no links.
             let held = self.senders[&name].held_links(&ips, &candidates);
