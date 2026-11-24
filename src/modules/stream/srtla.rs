@@ -70,6 +70,8 @@ struct Sender {
     ips: Vec<Ipv4Addr>,
     /// Uplinks left out because a preferred one shares their public address (LLD 3, 3.5.1).
     standby: Vec<Standby>,
+    /// Working links kept in the bond until one of the uplinks replacing them registers.
+    held: Vec<Ipv4Addr>,
     job: Option<(u64, Box<dyn Job>)>,
     monitor: Option<JoinHandle<()>>,
     idle_since: Option<Instant>,
@@ -186,7 +188,22 @@ impl Senders {
         for name in names {
             let candidates =
                 resolve_uplink_interfaces(&self.senders[&name].output.uplinks, usb, addresses);
-            let (ips, standby) = standby::choose(&candidates, view);
+            let (mut ips, mut standby) = standby::choose(&candidates, view);
+            // Make before break: while none of the uplinks to bond has a link yet, a working one
+            // that's still up stays in, so srtla_send never drops to no links.
+            let held = self.senders[&name].held_links(&ips, &candidates);
+            if !held.is_empty() {
+                standby.retain(|uplink| !held.contains(&uplink.address));
+                if held != self.senders[&name].held {
+                    tracing::info!(
+                        output = %name,
+                        ?held,
+                        "keeping working links until a new link registers"
+                    );
+                }
+                ips.extend(held.iter().copied());
+            }
+            self.senders.get_mut(&name).expect("listed").held = held;
             if standby != self.senders[&name].standby {
                 for uplink in &standby {
                     tracing::info!(
@@ -381,6 +398,7 @@ impl Sender {
             port,
             ips: Vec::new(),
             standby: Vec::new(),
+            held: Vec::new(),
             job: None,
             monitor: None,
             idle_since: None,
@@ -391,6 +409,40 @@ impl Sender {
             last_error: None,
             lines: VecDeque::new(),
         }
+    }
+
+    /// The working links to keep while none of `bond` has a link yet: those srtla_send reports
+    /// connected and not timed out, whose uplink still has its address (`present`). Without this,
+    /// a switch that replaces every link (Wi-Fi back to standby as Ethernet returns) leaves
+    /// srtla_send with no registered link, and its fresh handshake outlasts SRT's 5-second peer
+    /// timeout, so the stream drops.
+    fn held_links(&self, bond: &[Ipv4Addr], present: &[(String, Ipv4Addr)]) -> Vec<Ipv4Addr> {
+        if self.job.is_none() {
+            return Vec::new();
+        }
+        let live: Vec<Ipv4Addr> = self
+            .stats
+            .as_ref()
+            .and_then(|stats| stats.get("links"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|link| {
+                link["connected"].as_bool() == Some(true)
+                    && link["timed_out"].as_bool() != Some(true)
+            })
+            .filter_map(|link| link["ip"].as_str()?.parse().ok())
+            .collect();
+        if live.iter().any(|ip| bond.contains(ip)) {
+            return Vec::new();
+        }
+        let mut held: Vec<Ipv4Addr> = live
+            .into_iter()
+            .filter(|ip| present.iter().any(|(_, address)| address == ip))
+            .collect();
+        held.sort_unstable();
+        held.dedup();
+        held
     }
 
     fn state(&self, now: Instant) -> OutputState {
