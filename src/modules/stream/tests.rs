@@ -1216,7 +1216,12 @@ impl Harness {
 #[tokio::test]
 async fn an_uplink_sharing_a_public_address_waits_in_standby() {
     let runtime = tempfile::tempdir().expect("runtime directory");
-    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
+    let config = SRTLA
+        .replace("RUNTIME", &runtime.path().display().to_string())
+        .replace(
+            "sender_idle_s = 1\n",
+            "sender_idle_s = 1\nsrtla_standby = true\n",
+        );
     let addresses = Arc::new(std::sync::Mutex::new(vec![
         address("eth1", [10, 0, 1, 2]),
         address("wlan0", [10, 0, 2, 2]),
@@ -1276,14 +1281,10 @@ async fn an_uplink_sharing_a_public_address_waits_in_standby() {
 }
 
 #[tokio::test]
-async fn without_standby_uplinks_sharing_a_public_address_all_bond() {
+async fn by_default_uplinks_sharing_a_public_address_all_bond() {
     let runtime = tempfile::tempdir().expect("runtime directory");
-    let config = SRTLA
-        .replace("RUNTIME", &runtime.path().display().to_string())
-        .replace(
-            "sender_idle_s = 1\n",
-            "sender_idle_s = 1\nsrtla_standby = false\n",
-        );
+    // Standby is off by default.
+    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
     let addresses = vec![
         address("eth1", [10, 0, 1, 2]),
         address("wlan0", [10, 0, 2, 2]),
@@ -1330,7 +1331,12 @@ fn links_snapshot(connected: &[&str], all: &[&str]) -> Value {
 #[tokio::test]
 async fn a_working_link_stays_bonded_until_its_replacement_registers() {
     let runtime = tempfile::tempdir().expect("runtime directory");
-    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
+    let config = SRTLA
+        .replace("RUNTIME", &runtime.path().display().to_string())
+        .replace(
+            "sender_idle_s = 1\n",
+            "sender_idle_s = 1\nsrtla_standby = true\n",
+        );
     // Ethernet is out: the Wi-Fi carries the bond.
     let addresses = Arc::new(std::sync::Mutex::new(vec![address("wlan0", [10, 0, 2, 2])]));
     let source = addresses.clone();

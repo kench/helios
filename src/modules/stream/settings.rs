@@ -45,9 +45,9 @@ pub struct StreamSettings {
     /// configured output is `direct` (an `srtla` output's own uplinks come first).
     pub(crate) srtla_uplinks: Vec<String>,
     /// Whether uplinks that share a public address with a preferred one wait in standby (LLD 3,
-    /// section 3.5.1). `false` bonds them all: a link that's already registered takes over at
-    /// once when another fails, where one joining from standby waits out srtla_send's 5-second
-    /// startup grace first.
+    /// section 3.5.1). Off by default (owner, 2026-11-24): bonding them all keeps a registered
+    /// link ready to take over at once when another fails, where one joining from standby waits
+    /// out srtla_send's 5-second startup grace first, longer than SRT's peer timeout.
     pub(crate) srtla_standby: bool,
     /// How long a sender stays up after its last stream stops, so a source that comes back
     /// keeps a warm bond.
@@ -108,7 +108,7 @@ impl Default for StreamSettings {
                 "usb:cellular".into(),
                 "usb:wifi".into(),
             ],
-            srtla_standby: true,
+            srtla_standby: false,
             sender_idle_s: 60,
             stats_interval_s: 30,
             outputs: BTreeMap::new(),

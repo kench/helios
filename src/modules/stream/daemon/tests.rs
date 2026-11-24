@@ -458,7 +458,12 @@ async fn ips_become(path: &std::path::Path, want: &str) {
 #[tokio::test]
 async fn helios_uplink_view_puts_a_shared_uplink_in_standby() {
     let dir = tempfile::tempdir().expect("directory");
-    let config = BONDED.replace("DIR", &dir.path().display().to_string());
+    let config = BONDED
+        .replace("DIR", &dir.path().display().to_string())
+        .replace(
+            "ffmpeg = \"/opt/ffmpeg\"\n",
+            "ffmpeg = \"/opt/ffmpeg\"\nsrtla_standby = true\n",
+        );
     let socket = dir.path().join("control.sock");
     let ips = dir.path().join("run/srtla/bond.ips");
     let mut running = daemon_with(
