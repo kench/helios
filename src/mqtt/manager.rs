@@ -456,9 +456,9 @@ impl Manager {
         let port = self.options.settings.port;
         let mut address_check = tokio::time::interval(watch.interval);
         address_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The endpoint's addresses, to find the connection among this process's sockets, and the
-        // connection's local address once found.
-        let mut remotes: Vec<std::net::IpAddr> = Vec::new();
+        // The sockets this process had before connecting, to tell the session's apart, and its
+        // local address once found.
+        let before = (watch.sockets)();
         let mut local: Option<std::net::IpAddr> = None;
         loop {
             tokio::select! {
@@ -491,10 +491,6 @@ impl Manager {
                 polled = eventloop.poll() => match polled {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
                         connected = Some(Instant::now());
-                        remotes = tokio::net::lookup_host((target.endpoint.as_str(), port))
-                            .await
-                            .map(|addresses| addresses.map(|a| a.ip()).collect())
-                            .unwrap_or_default();
                         phase = Phase::Subscribing;
                         // AWS IoT takes at most 8 filters in one SUBSCRIBE.
                         subscribing = self
@@ -544,7 +540,7 @@ impl Manager {
                 _ = address_check.tick(), if connected.is_some() => match local {
                     // The address stays out of the reason, which goes to the cloud: a cellular
                     // uplink's address can be public.
-                    None => local = (watch.find)(&remotes, port),
+                    None => local = (watch.find)(port, &before),
                     Some(address) if !(watch.exists)(address) => {
                         return failed(
                             "the connection's local address went away".to_owned(),

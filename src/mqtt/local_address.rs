@@ -6,8 +6,10 @@
 //! soon as it's gone.
 //!
 //! `rumqttc` doesn't expose its socket, so the connection is found in `/proc/self/net/tcp{,6}`:
-//! an established socket of this process to the endpoint's port and one of its addresses. An
-//! address exists if a UDP socket can bind to it (`EADDRNOTAVAIL` otherwise).
+//! the one established socket of this process to the MQTT port that it didn't have before the
+//! session started. Not by the endpoint's addresses: AWS IoT's DNS answers with a rotating few
+//! (one IPv4, one IPv6), so a lookup after connecting rarely has the address rumqttc connected
+//! to. An address exists if a UDP socket can bind to it (`EADDRNOTAVAIL` otherwise).
 
 use std::collections::HashSet;
 use std::io;
@@ -19,8 +21,10 @@ use std::time::Duration;
 pub struct AddressWatch {
     /// How often the address is checked while connected.
     pub interval: Duration,
-    /// The local address of this process's connection to one of `remotes` on `port`.
-    pub find: fn(remotes: &[IpAddr], port: u16) -> Option<IpAddr>,
+    /// This process's sockets before the session connects, to tell its connection apart.
+    pub sockets: fn() -> HashSet<u64>,
+    /// The local address of the connection to `port` that isn't one of `before`.
+    pub find: fn(port: u16, before: &HashSet<u64>) -> Option<IpAddr>,
     /// Whether the host still has `address`.
     pub exists: fn(address: IpAddr) -> bool,
 }
@@ -29,6 +33,7 @@ impl Default for AddressWatch {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(2),
+            sockets: socket_inodes,
             find: connection_local,
             exists: address_exists,
         }
@@ -44,22 +49,24 @@ pub(crate) struct Entry {
     pub(crate) inode: u64,
 }
 
-/// The local address of this process's established TCP connection to one of `remotes` on
-/// `port`, if there is one.
+/// The local address of this process's established TCP connection to `port` among the sockets
+/// it didn't have `before`. Only when there's exactly one: with MQTT on 443, an HTTPS connection
+/// opened meanwhile could be taken for it otherwise, so a doubt waits for the next check.
 #[must_use]
-pub fn connection_local(remotes: &[IpAddr], port: u16) -> Option<IpAddr> {
+pub fn connection_local(port: u16, before: &HashSet<u64>) -> Option<IpAddr> {
     let inodes = socket_inodes();
-    ["/proc/self/net/tcp", "/proc/self/net/tcp6"]
+    let mut found = ["/proc/self/net/tcp", "/proc/self/net/tcp6"]
         .iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
         .flat_map(|text| parse(&text))
-        .find(|entry| {
+        .filter(|entry| {
             entry.established
-                && inodes.contains(&entry.inode)
                 && entry.remote.port() == port
-                && remotes.contains(&canonical(entry.remote.ip()))
-        })
-        .map(|entry| canonical(entry.local.ip()))
+                && inodes.contains(&entry.inode)
+                && !before.contains(&entry.inode)
+        });
+    let entry = found.next()?;
+    found.next().is_none().then(|| canonical(entry.local.ip()))
 }
 
 /// Whether the host has `address`: binding to an address it doesn't have fails with
@@ -73,7 +80,8 @@ pub fn address_exists(address: IpAddr) -> bool {
 }
 
 /// The inodes of this process's sockets, from its file descriptors (`socket:[<inode>]`).
-fn socket_inodes() -> HashSet<u64> {
+#[must_use]
+pub fn socket_inodes() -> HashSet<u64> {
     std::fs::read_dir("/proc/self/fd")
         .into_iter()
         .flatten()
@@ -192,16 +200,25 @@ mod tests {
     }
 
     #[test]
-    fn finds_its_own_connection() {
+    fn finds_its_own_new_connection() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
         let port = listener.local_addr().expect("address").port();
+        let before = socket_inodes();
         let _client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert_eq!(connection_local(&[localhost], port), Some(localhost));
         assert_eq!(
-            connection_local(&["192.0.2.1".parse().unwrap()], port),
+            connection_local(port, &before),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            connection_local(port, &socket_inodes()),
             None,
-            "another remote address"
+            "a socket it already had isn't the session's"
+        );
+        let _second = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        assert_eq!(
+            connection_local(port, &before),
+            None,
+            "two new connections to the port: no guess"
         );
     }
 }
