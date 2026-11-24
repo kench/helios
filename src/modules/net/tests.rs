@@ -102,12 +102,7 @@ fn board_tables() -> Vec<(Dump, Vec<u8>)> {
                 address(3, ip("192.168.5.31"), 24, 0),
                 address(3, ip("192.168.5.31"), 24, 0),
                 address(3, ip("fe80::c274:2bff:fe00:1"), 64, 0),
-                address(
-                    3,
-                    ip("2001:db8:5:1::1"),
-                    64,
-                    IFA_F_TEMPORARY,
-                ),
+                address(3, ip("2001:db8:5:1::1"), 64, IFA_F_TEMPORARY),
                 address(3, ip("2001:db8:5:1:c274:2bff:fe00:1"), 64, 0),
                 address(3, ip("::1"), 128, 0),
                 address(7, ip("10.64.12.9"), 30, 0),
