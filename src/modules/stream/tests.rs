@@ -1275,6 +1275,90 @@ async fn an_uplink_sharing_a_public_address_waits_in_standby() {
     harness.cancel.cancel();
 }
 
+/// A srtla_send snapshot in which only `connected` links are registered.
+fn links_snapshot(connected: &[&str], all: &[&str]) -> Value {
+    let links: Vec<Value> = all
+        .iter()
+        .map(|ip| json!({"ip": ip, "connected": connected.contains(ip), "timed_out": false}))
+        .collect();
+    json!({"active_links": connected.len(), "total_links": all.len(), "links": links})
+}
+
+#[tokio::test]
+async fn a_working_link_stays_bonded_until_its_replacement_registers() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
+    // Ethernet is out: the Wi-Fi carries the bond.
+    let addresses = Arc::new(std::sync::Mutex::new(vec![address("wlan0", [10, 0, 2, 2])]));
+    let source = addresses.clone();
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(move || Ok(source.lock().expect("addresses").clone())),
+    );
+    let view = super::standby::parse(&json!({"interfaces": {
+        "eth1": {"kind": "ethernet", "metric": 100, "public_ipv4": "203.0.113.7"},
+        "wlan0": {"kind": "wifi", "metric": 600, "public_ipv4": "203.0.113.7"},
+    }}));
+    harness.uplinks.send_replace(view);
+    harness
+        .usb
+        .set_for_test(UsbSnapshot::from([ethernet_adapter()]));
+    let sender = harness.next_start().await;
+    let dir = runtime.path().join("srtla");
+    let ips = dir.join("bond.ips");
+    assert_eq!(std::fs::read_to_string(&ips).expect("ips"), "10.0.2.2\n");
+    let stats = control_socket(dir.join("bond.sock")).await;
+    stats
+        .send(links_snapshot(&["10.0.2.2"], &["10.0.2.2"]))
+        .expect("socket");
+    harness.output_state("bond", "up").await;
+
+    // Ethernet comes back. It's preferred, but the Wi-Fi stays in until Ethernet's link registers.
+    addresses
+        .lock()
+        .expect("addresses")
+        .push(address("eth1", [10, 0, 1, 2]));
+    harness
+        .usb
+        .set_for_test(UsbSnapshot::from([ethernet_adapter()]));
+    let wait_for_reloads = |n: usize| {
+        let reloads = sender.reloads.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while reloads.load(Ordering::SeqCst) < n {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("reloaded");
+        }
+    };
+    wait_for_reloads(1).await;
+    assert_eq!(
+        std::fs::read_to_string(&ips).expect("ips"),
+        "10.0.1.2\n10.0.2.2\n",
+        "both, while only the Wi-Fi has a link"
+    );
+    stats
+        .send(links_snapshot(&["10.0.2.2"], &["10.0.1.2", "10.0.2.2"]))
+        .expect("socket");
+    let held = harness.output_state("bond", "degraded").await;
+    assert_eq!(held["standby"], json!([]), "the Wi-Fi isn't in standby yet");
+
+    // Ethernet registers: now the Wi-Fi goes to standby.
+    stats
+        .send(links_snapshot(
+            &["10.0.1.2", "10.0.2.2"],
+            &["10.0.1.2", "10.0.2.2"],
+        ))
+        .expect("socket");
+    wait_for_reloads(2).await;
+    assert_eq!(std::fs::read_to_string(&ips).expect("ips"), "10.0.1.2\n");
+    harness.cancel.cancel();
+}
+
 #[tokio::test]
 async fn an_srtla_output_runs_its_sender_first_and_follows_its_uplinks() {
     let runtime = tempfile::tempdir().expect("runtime directory");
