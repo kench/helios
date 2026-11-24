@@ -684,3 +684,48 @@ async fn publishes_now_only_while_connected() {
     cancel.cancel();
     identity_cancel.cancel();
 }
+
+/// Whether the fake local address exists, for `reconnects_when_its_local_address_goes_away`.
+static LOCAL_ADDRESS_GONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[tokio::test]
+async fn reconnects_when_its_local_address_goes_away() {
+    let running = start_with(
+        |options| {
+            options.timing.address_watch = AddressWatch {
+                interval: Duration::from_millis(20),
+                // The real lookup finds the test's connection to the broker on localhost.
+                find: crate::mqtt::local_address::connection_local,
+                exists: |_| !LOCAL_ADDRESS_GONE.load(std::sync::atomic::Ordering::SeqCst),
+            };
+        },
+        |_| {},
+    )
+    .await;
+    let mut status = running.handle.status();
+    tokio::time::timeout(WAIT, status.wait_for(|s| s.connected && s.session == 1))
+        .await
+        .unwrap()
+        .unwrap();
+    // Let the watch find the connection first.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The uplink carrying the connection goes away (the socket itself stays up).
+    LOCAL_ADDRESS_GONE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let ended = tokio::time::timeout(WAIT, status.wait_for(|s| !s.connected))
+        .await
+        .unwrap()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        ended.last_disconnect_reason.as_deref(),
+        Some("the connection's local address went away")
+    );
+    LOCAL_ADDRESS_GONE.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(WAIT, status.wait_for(|s| s.connected && s.session == 2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.broker.state().connects.len(), 2);
+}
