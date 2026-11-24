@@ -123,7 +123,11 @@ Modules (HLD section 6), each turned on in its `[modules.<name>]` section:
   are left out of the sender's IP file and listed in the output's `standby`
   (`{interface, address, shares_public_address_with}`). When the bonded one loses its address
   (or its public check fails), the next takes its place and the sender reloads. An uplink whose
-  public address isn't known bonds as before.
+  public address isn't known bonds as before. A working link stays bonded until its replacement
+  has registered. A link joining from standby waits out srtla_send's 5-second startup grace,
+  longer than SRT's peer timeout, so a bonded uplink that dies outright still drops the stream
+  for a few seconds. `modules.stream.srtla_standby = false` turns standby off and bonds every
+  uplink, so one is always registered.
 
   So the Control API can offer only what's there, the shadow also has `profiles` (each one's
   encoder, bitrates, scale and audio) and `inputs`: the attached USB cameras (selector, port,
