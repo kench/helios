@@ -695,7 +695,8 @@ async fn reconnects_when_its_local_address_goes_away() {
         |options| {
             options.timing.address_watch = AddressWatch {
                 interval: Duration::from_millis(20),
-                // The real lookup finds the test's connection to the broker on localhost.
+                // The real lookups find the session's new connection to the broker on localhost.
+                sockets: crate::mqtt::local_address::socket_inodes,
                 find: crate::mqtt::local_address::connection_local,
                 exists: |_| !LOCAL_ADDRESS_GONE.load(std::sync::atomic::Ordering::SeqCst),
             };
