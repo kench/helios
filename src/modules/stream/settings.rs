@@ -44,6 +44,11 @@ pub struct StreamSettings {
     /// The uplinks an `srtla://` destination set through the shadow bonds when the stream's
     /// configured output is `direct` (an `srtla` output's own uplinks come first).
     pub(crate) srtla_uplinks: Vec<String>,
+    /// Whether uplinks that share a public address with a preferred one wait in standby (LLD 3,
+    /// section 3.5.1). `false` bonds them all: a link that's already registered takes over at
+    /// once when another fails, where one joining from standby waits out srtla_send's 5-second
+    /// startup grace first.
+    pub(crate) srtla_standby: bool,
     /// How long a sender stays up after its last stream stops, so a source that comes back
     /// keeps a warm bond.
     sender_idle_s: u64,
@@ -103,6 +108,7 @@ impl Default for StreamSettings {
                 "usb:cellular".into(),
                 "usb:wifi".into(),
             ],
+            srtla_standby: true,
             sender_idle_s: 60,
             stats_interval_s: 30,
             outputs: BTreeMap::new(),

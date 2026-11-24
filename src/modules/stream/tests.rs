@@ -1275,6 +1275,49 @@ async fn an_uplink_sharing_a_public_address_waits_in_standby() {
     harness.cancel.cancel();
 }
 
+#[tokio::test]
+async fn without_standby_uplinks_sharing_a_public_address_all_bond() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = SRTLA
+        .replace("RUNTIME", &runtime.path().display().to_string())
+        .replace(
+            "sender_idle_s = 1\n",
+            "sender_idle_s = 1\nsrtla_standby = false\n",
+        );
+    let addresses = vec![
+        address("eth1", [10, 0, 1, 2]),
+        address("wlan0", [10, 0, 2, 2]),
+    ];
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(move || Ok(addresses.clone())),
+    );
+    harness
+        .uplinks
+        .send_replace(super::standby::parse(&json!({"interfaces": {
+            "eth1": {"kind": "ethernet", "metric": 100, "public_ipv4": "203.0.113.7"},
+            "wlan0": {"kind": "wifi", "metric": 600, "public_ipv4": "203.0.113.7"},
+        }})));
+    harness
+        .usb
+        .set_for_test(UsbSnapshot::from([ethernet_adapter()]));
+
+    harness.next_start().await;
+    let dir = runtime.path().join("srtla");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("bond.ips")).expect("ips"),
+        "10.0.1.2\n10.0.2.2\n",
+        "both bond, though they share a public address"
+    );
+    let stats = control_socket(dir.join("bond.sock")).await;
+    stats.send(snapshot(2)).expect("socket");
+    let up = harness.output_state("bond", "up").await;
+    assert_eq!(up["standby"], json!([]));
+    harness.cancel.cancel();
+}
+
 /// A srtla_send snapshot in which only `connected` links are registered.
 fn links_snapshot(connected: &[&str], all: &[&str]) -> Value {
     let links: Vec<Value> = all
