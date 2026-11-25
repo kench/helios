@@ -269,6 +269,13 @@ impl Senders {
                 sender.fail(format!("can't write the IP file: {error}"), now);
                 continue;
             }
+            let receiver = match receiver_ipv4(&sender.output.host, sender.output.port, lookup) {
+                Ok(receiver) => receiver,
+                Err(reason) => {
+                    sender.fail(reason, now);
+                    continue;
+                }
+            };
             let socket = self.dir.join(format!("{name}.sock"));
             let _ = std::fs::remove_file(&socket);
             let conn_timeout = (u64::from(sender.output.latency_ms) * 2).clamp(5000, 60_000);
@@ -281,7 +288,7 @@ impl Senders {
                     "--conn-timeout-ms".into(),
                     conn_timeout.to_string(),
                     sender.port.to_string(),
-                    sender.output.host.clone(),
+                    receiver.to_string(),
                     sender.output.port.to_string(),
                     self.dir.join(format!("{name}.ips")).display().to_string(),
                 ],
@@ -626,6 +633,52 @@ pub(crate) fn resolve_uplink_interfaces(
     found.sort_by_key(|(_, ip)| *ip);
     found.dedup_by(|a, b| a.1 == b.1);
     found
+}
+
+/// The receiver's IPv4 address, which srtla_send is given instead of its name. srtla_send binds
+/// one socket per uplink address, all IPv4, but sends to the first address its lookup returns:
+/// with a dual-stack receiver that's often IPv6, and every packet then fails with
+/// `EAFNOSUPPORT`, so the bond never registers (found with the ingest server, 2026-11-25).
+pub(crate) fn receiver_ipv4(
+    host: &str,
+    port: u16,
+    lookup: fn(&str, u16) -> io::Result<Vec<std::net::SocketAddr>>,
+) -> Result<Ipv4Addr, String> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => Ok(v4),
+            std::net::IpAddr::V6(_) => Err(format!(
+                "{host}: srtla needs an IPv4 receiver (the uplinks are IPv4)"
+            )),
+        };
+    }
+    let addresses = lookup(host, port).map_err(|error| format!("can't resolve {host}: {error}"))?;
+    addresses
+        .iter()
+        .find_map(|address| match address.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .ok_or_else(|| format!("{host} has no IPv4 address (the uplinks are IPv4)"))
+}
+
+/// The system resolver. Tests resolve only `*.example.com` names, to documentation addresses.
+#[cfg(not(test))]
+fn lookup(host: &str, port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    Ok((host, port).to_socket_addrs()?.collect())
+}
+
+#[cfg(test)]
+fn lookup(host: &str, port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
+    if host.ends_with(".example.com") {
+        Ok(vec![
+            std::net::SocketAddr::new("2001:db8::10".parse().expect("v6"), port),
+            std::net::SocketAddr::new([192, 0, 2, 10].into(), port),
+        ])
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, "no such host"))
+    }
 }
 
 /// Writes `<dir>/<name>.ips` (one IP per line) through a temporary file and a rename, so

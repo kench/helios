@@ -1229,6 +1229,77 @@ fn tells_the_boards_own_ports_from_sysfs() {
 }
 
 #[test]
+fn gives_srtla_send_the_receivers_ipv4_address() {
+    use std::net::SocketAddr;
+    let dual = |_: &str, port: u16| -> std::io::Result<Vec<SocketAddr>> {
+        Ok(vec![
+            SocketAddr::new("2001:db8::10".parse().expect("v6"), port),
+            SocketAddr::new([192, 0, 2, 10].into(), port),
+        ])
+    };
+    let only_v6 = |_: &str, port: u16| -> std::io::Result<Vec<SocketAddr>> {
+        Ok(vec![SocketAddr::new(
+            "2001:db8::10".parse().expect("v6"),
+            port,
+        )])
+    };
+    let missing = |_: &str, _: u16| -> std::io::Result<Vec<SocketAddr>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such host",
+        ))
+    };
+    assert_eq!(
+        srtla::receiver_ipv4("rec.example.com", 5000, dual),
+        Ok([192, 0, 2, 10].into()),
+        "the IPv4 address, even when IPv6 comes first"
+    );
+    assert_eq!(
+        srtla::receiver_ipv4("198.51.100.7", 5000, missing),
+        Ok([198, 51, 100, 7].into()),
+        "a literal needs no lookup"
+    );
+    for (host, lookup, want) in [
+        (
+            "v6.example.com",
+            only_v6 as fn(&str, u16) -> _,
+            "has no IPv4 address",
+        ),
+        (
+            "gone.example.com",
+            missing,
+            "can't resolve gone.example.com",
+        ),
+        ("2001:db8::1", missing, "srtla needs an IPv4 receiver"),
+    ] {
+        let error = srtla::receiver_ipv4(host, 5000, lookup).expect_err(host);
+        assert!(error.contains(want), "{host}: {error}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_receiver_without_an_ipv4_address_fails_the_sender_instead_of_starting_it() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(|| Ok(vec![address("wlan0", [10, 0, 2, 2])])),
+    );
+    let _first = harness.next_start().await;
+    harness.desire(json!({"destination": "srtla://gone.invalid:5000"}));
+    let reported = harness
+        .report_where(|r| {
+            r["outputs"]["stream:pattern"]["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("can't resolve gone.invalid"))
+        })
+        .await;
+    assert_eq!(reported["outputs"]["stream:pattern"]["state"], "down");
+}
+
+#[test]
 fn reads_stats_update_notifications_only() {
     let update = r#"{"jsonrpc":"2.0","method":"stats.update","params":{"subscription_id":"sub-0","data":{"active_links":2}}}"#;
     assert_eq!(
@@ -1526,7 +1597,8 @@ async fn an_srtla_output_runs_its_sender_first_and_follows_its_uplinks() {
             "--conn-timeout-ms".into(),
             "5000".into(),
             "6000".into(),
-            "rec.example.com".into(),
+            // rec.example.com is dual-stack in tests: srtla_send gets its IPv4 address.
+            "192.0.2.10".into(),
             "5000".into(),
             ips.display().to_string(),
         ]
@@ -2472,7 +2544,8 @@ async fn an_srtla_destination_runs_its_own_sender() {
             "--conn-timeout-ms".into(),
             "5000".into(),
             "6001".into(),
-            "rec.example.com".into(),
+            // rec.example.com is dual-stack in tests: srtla_send gets its IPv4 address.
+            "192.0.2.10".into(),
             "5000".into(),
             dir.join("stream:pattern.ips").display().to_string(),
         ],
