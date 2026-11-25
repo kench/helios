@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::addrs::Address;
+use super::addrs::{Address, Onboard};
 use super::process::{Job, JobEvent, JobSpec, Spawner, Tagged};
 use super::settings::{Output, StreamSettings};
 use super::standby::{self, Standby, View};
@@ -548,8 +548,9 @@ impl Sender {
     }
 }
 
-/// The IPv4 addresses of the configured uplinks: `usb:<category>` (the usb module's network
-/// devices in that category) or interface names.
+/// The IPv4 addresses of the configured uplinks: `net:ethernet` and `net:wifi` (the board's own
+/// ports of that kind), `usb:<category>` (the usb module's network devices in that category) or
+/// interface names.
 #[cfg(test)]
 pub(crate) fn resolve_uplinks(
     uplinks: &[String],
@@ -573,6 +574,20 @@ pub(crate) fn resolve_uplink_interfaces(
 ) -> Vec<(String, Ipv4Addr)> {
     let mut interfaces: Vec<String> = Vec::new();
     for uplink in uplinks {
+        let onboard = match uplink.as_str() {
+            "net:ethernet" => Some(Onboard::Ethernet),
+            "net:wifi" => Some(Onboard::Wifi),
+            _ => None,
+        };
+        if let Some(kind) = onboard {
+            interfaces.extend(
+                addresses
+                    .iter()
+                    .filter(|address| address.onboard == Some(kind))
+                    .map(|address| address.interface.clone()),
+            );
+            continue;
+        }
         match uplink.strip_prefix("usb:") {
             Some(category) => {
                 for device in usb.values() {

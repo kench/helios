@@ -4,6 +4,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::path::Path;
 
 use rustix::net::netlink::SocketAddrNetlink;
 use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketType};
@@ -28,6 +29,37 @@ const IFA_LABEL: u16 = 3;
 pub(crate) struct Address {
     pub interface: String,
     pub address: Ipv4Addr,
+    /// Whether the interface is one of the board's own ports, for `net:ethernet` and
+    /// `net:wifi`.
+    pub onboard: Option<Onboard>,
+}
+
+/// A port of the board itself (PCIe or platform, not USB), from sysfs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Onboard {
+    Ethernet,
+    Wifi,
+}
+
+impl Onboard {
+    /// The kind of the interface `name` under `sysfs` (`/sys`), if it's the board's own: it has
+    /// a device that isn't below a USB hub, and it's Wi-Fi (`wireless` or `phy80211`) or
+    /// Ethernet (`type` 1, not a cellular modem). Bridges, tunnels, WireGuard and `veth` have
+    /// no device, so they're never onboard.
+    pub(crate) fn of(sysfs: &Path, name: &str) -> Option<Self> {
+        let dir = sysfs.join("class/net").join(name);
+        let device = std::fs::canonicalize(dir.join("device")).ok()?;
+        if crate::sysfs::on_usb(&device) {
+            return None;
+        }
+        if dir.join("wireless").exists() || dir.join("phy80211").exists() {
+            return Some(Self::Wifi);
+        }
+        let wwan = crate::sysfs::read_attr(&dir.join("uevent"))
+            .is_some_and(|uevent| uevent.lines().any(|line| line == "DEVTYPE=wwan"));
+        (!wwan && crate::sysfs::read_attr(&dir.join("type")).as_deref() == Some("1"))
+            .then_some(Self::Ethernet)
+    }
 }
 
 /// Every IPv4 address on the system, by interface label.
@@ -51,6 +83,11 @@ pub(crate) fn ipv4_addresses() -> io::Result<Vec<Address>> {
             .get(..len)
             .ok_or_else(|| invalid("reply truncated"))?;
         if parse_dump(reply, &mut addresses)? {
+            for address in &mut addresses {
+                // An alias (eth0:1) is a port's if its interface is.
+                let name = address.interface.split(':').next().unwrap_or_default();
+                address.onboard = Onboard::of(Path::new("/sys"), name);
+            }
             addresses.sort();
             addresses.dedup();
             return Ok(addresses);
@@ -140,7 +177,11 @@ fn parse_address(message: &[u8]) -> io::Result<Option<Address>> {
     Ok(local
         .or(address)
         .zip(label)
-        .map(|(address, interface)| Address { interface, address }))
+        .map(|(address, interface)| Address {
+            interface,
+            address,
+            onboard: None,
+        }))
 }
 
 fn invalid(message: &str) -> io::Error {
