@@ -83,14 +83,32 @@ cameras' formats are left out.
 
 **Desired state** (written by the Control API) can:
 - start and stop streams, and override the bitrate;
-- change a stream's `source`, `profile`, `destination` (`srt://` or `srtla://`) and
-  `source_ceiling_percent`. Setting `null` goes back to `helios.toml`'s value.
+- change a stream's `source`, `profile`, `destination` (`srt://` or `srtla://`),
+  `source_ceiling_percent` and `record`. Setting `null` goes back to `helios.toml`'s value.
 
 Each value is checked the same way `helios.toml` is. A refused value shows in the stream's
 `rejected`, with the reason. Desired state for a stream `helios.toml` doesn't have (one removed from
 the config) is removed from the shadow by the device, so it doesn't come back in every delta. A destination keeps the output's latency and the stream's
 `streamid` unless the URL gives them. It runs as output `stream:<id>`, and an `srtla://`
 destination gets its own sender over the output's uplinks (or `srtla_uplinks`).
+
+**Recordings** (LLD 4, section 16). A stream with `record = true` (or the desired state's
+`record`) is recorded as sent, with no second encode: ffmpeg's `tee` muxer, or a `tee` into
+`splitmuxsink` behind a leaky queue for belacoder and ceracoder. Segments are MPEG-TS,
+`segment_s` long (10 minutes by default), at `<dir>/<stream>/<UTC start>-<n>.ts`, each starting
+on a keyframe. A recording that fails never stops the stream. Switching `record` restarts the
+encoder (a few seconds' gap).
+- Only when `dir` is a mounted filesystem (`require_mountpoint`), so a missing SSD can't fill
+  the SD card.
+- Every minute, above `max_usage_percent` the oldest closed segments (any stream) are deleted.
+- The shadow shows each stream's `recording` (`off`, `idle`, `recording`, `unavailable`,
+  `disk_full`, `error`; its files, newest segment and start) and a top-level `recording` (mounted,
+  total and free bytes, segments, oldest).
+- Retrieval is over SSH for now: `scp` from `dir` (files are `0644`; the folder is group
+  `helios`). To join segments into one MP4 without re-encoding: list them in order
+  (`file '<path>'` lines) and run `ffmpeg -f concat -safe 0 -i list.txt -c copy -tag:v hvc1
+  out.mp4`. Each encoder run (a start, restart or `record` switch) gets a new name prefix and
+  starts its timestamps again; the concat demuxer joins runs end to end.
 
 **Uplinks.** An output's `uplinks` (and `srtla_uplinks`) take three kinds of entry:
 

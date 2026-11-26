@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::encoder::{Backend, BitrateMode};
+use super::recording::Recording;
 
 /// The stream module's settings.
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +57,8 @@ pub struct StreamSettings {
     /// How often `stream.stats` goes out while a stream is live.
     stats_interval_s: u64,
     pub(crate) rtmp_ingest: RtmpIngest,
+    /// Local recordings (LLD 4, section 16), for streams with `record = true`.
+    pub(crate) recording: Recording,
     pub(crate) outputs: BTreeMap<String, Output>,
     pub(crate) profiles: BTreeMap<String, Profile>,
     pub(crate) streams: BTreeMap<String, Stream>,
@@ -117,6 +120,7 @@ impl Default for StreamSettings {
             outputs: BTreeMap::new(),
             profiles: BTreeMap::new(),
             rtmp_ingest: RtmpIngest::default(),
+            recording: Recording::default(),
             streams: BTreeMap::new(),
         }
     }
@@ -273,6 +277,10 @@ pub struct Stream {
     /// `live` (run whenever the source is ready) or `stopped`.
     #[serde(default = "default_desired")]
     pub(crate) desired: String,
+    /// Whether the stream is recorded as sent, to `[modules.stream.recording] dir`. The desired
+    /// state's `record` overrides it.
+    #[serde(default)]
+    pub(crate) record: bool,
 }
 
 fn default_desired() -> String {
@@ -296,6 +304,7 @@ impl StreamSettings {
     ///
     /// A message naming the setting that's wrong.
     pub(crate) fn check(self) -> Result<Option<Self>, String> {
+        self.recording.check()?;
         if !(5..=3600).contains(&self.stats_interval_s) {
             return Err("modules.stream.stats_interval_s must be 5 to 3600".into());
         }
