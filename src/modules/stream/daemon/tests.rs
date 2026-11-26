@@ -148,6 +148,8 @@ streamid = "publish/live/pattern"
 struct Agent {
     published: mpsc::UnboundedReceiver<MqttRequest>,
     reports: TestReports,
+    /// The shadow's desired state, as the shadow manager would hand it to the module.
+    desired: mpsc::UnboundedSender<Value>,
     commands: mpsc::Sender<PendingCommand>,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<Result<(), crate::modules::ModuleError>>,
@@ -166,10 +168,11 @@ fn agent_with(
     let (mqtt, published, _status) = MqttHandle::for_test();
     let (shadows, reports, _desired) = ShadowHandle::for_test();
     let (commands, commands_rx) = mpsc::channel(4);
+    let (desired, desired_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     let ctx = ModuleContext {
         commands: commands_rx,
-        desired: mpsc::unbounded_channel().1,
+        desired: desired_rx,
         shadows,
         mqtt,
         sysfs: "/sys".into(),
@@ -183,6 +186,7 @@ fn agent_with(
     Agent {
         published,
         reports,
+        desired,
         commands,
         cancel,
         task,
@@ -202,6 +206,20 @@ impl Agent {
         })
         .await
         .unwrap_or_else(|_| panic!("the shadow never showed {what}"))
+    }
+
+    /// The next `clear_desired` path for the stream shadow, skipping reports.
+    async fn cleared(&mut self) -> Value {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let (shadow, value) = self.reports.recv().await.expect("shadow");
+                if shadow == "stream#desired" {
+                    return value["clear"].clone();
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("nothing was cleared from the desired state"))
     }
 
     async fn event(&mut self, kind: &str) -> String {
@@ -505,4 +523,46 @@ async fn helios_uplink_view_puts_a_shared_uplink_in_standby() {
     ips_become(&ips, "10.0.1.2\n10.0.2.2\n").await;
     helios.stop().await;
     running.cancel.cancel();
+}
+
+#[tokio::test]
+async fn desired_state_for_a_stream_helios_toml_lacks_is_removed_from_the_shadow() {
+    let dir = tempfile::tempdir().expect("directory");
+    let config = CONFIG.replace("DIR", &dir.path().display().to_string());
+    let socket = dir.path().join("control.sock");
+    let mut running = daemon(&config);
+    let _job = next_start(&mut running.started).await;
+    let mut helios = agent(socket);
+    helios
+        .shadow_where("daemon connected", |r| r["daemon"]["state"] == "connected")
+        .await;
+
+    // A stream removed from helios.toml, one already cleared (null), and one that exists.
+    helios
+        .desired
+        .send(json!({"streams": {
+            "gone": {"state": "live", "profile": "test"},
+            "cleared": null,
+            "pattern": {"state": "live"},
+        }}))
+        .expect("client running");
+    assert_eq!(helios.cleared().await, json!(["streams", "gone"]));
+    // Only that one: the known stream and the null are left alone.
+    let more = tokio::time::timeout(Duration::from_millis(500), helios.cleared()).await;
+    assert!(
+        more.is_err(),
+        "cleared more than the unknown stream: {more:?}"
+    );
+    helios.stop().await;
+    running.cancel.cancel();
+    let _ = running.task.await;
+}
+
+#[test]
+fn names_desired_streams_the_config_lacks() {
+    let configured: std::collections::BTreeSet<String> = ["pattern".to_owned()].into();
+    let state = json!({"streams": {"pattern": {"state": "live"}, "gone": {}, "nulled": null}});
+    assert_eq!(super::unknown_streams(&state, &configured), ["gone"]);
+    assert!(super::unknown_streams(&json!({}), &configured).is_empty());
+    assert!(super::unknown_streams(&Value::Null, &configured).is_empty());
 }

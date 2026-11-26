@@ -9,7 +9,9 @@
 //! goes for nested keys too (`streams.<id>`), since the service merges an update into what it
 //! holds and keeps a nested key until it's set to `null`. The
 //! reply's `desired` state, and every later `update/delta`, go to the module if it asked for
-//! them with [`ShadowHandle::desired`].
+//! them with [`ShadowHandle::desired`]. A module can also remove desired state it can't use (for
+//! a stream its config doesn't have) with [`ShadowHandle::clear_desired`]: the next update sets
+//! that key to `null` in `desired`, until an update carrying it is accepted.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,6 +65,10 @@ enum Request {
         shadow: String,
         sender: mpsc::UnboundedSender<Value>,
     },
+    ClearDesired {
+        shadow: String,
+        path: Path,
+    },
 }
 
 impl ShadowHandle {
@@ -85,6 +91,16 @@ impl ShadowHandle {
             sender,
         });
         receiver
+    }
+
+    /// Removes `path` (`["streams", "<id>"]`) from `shadow`'s desired state: desired state the
+    /// module can't apply, which the service would otherwise send in every delta. Only for keys
+    /// the module knows are wrong: the cloud owns the rest of the desired state.
+    pub fn clear_desired(&self, shadow: &str, path: &[&str]) {
+        let _ = self.requests.send(Request::ClearDesired {
+            shadow: shadow.to_owned(),
+            path: path.iter().map(|&key| key.to_owned()).collect(),
+        });
     }
 }
 
@@ -158,6 +174,8 @@ struct InFlight {
     sent_at: SystemTime,
     /// The stale keys it set to `null`; once accepted, they're gone from the shadow.
     nulls: Vec<Path>,
+    /// The desired keys it set to `null`.
+    desired_nulls: Vec<Path>,
 }
 
 #[derive(Debug, Default)]
@@ -166,6 +184,8 @@ struct Shadow {
     reported: Map<String, Value>,
     /// Keys the service holds that the snapshot no longer has, by path: sent as `null`.
     stale: Vec<Path>,
+    /// Desired keys to remove ([`ShadowHandle::clear_desired`]), until an update is accepted.
+    clear_desired: Vec<Path>,
     /// Whether the snapshot hasn't been sent since it changed (or since connecting).
     dirty: bool,
     /// The update waiting for a reply.
@@ -258,6 +278,13 @@ impl Manager {
                         .publish_now(format!("{}/get", base(&thing, &shadow)), b"{}".to_vec());
                 }
             }
+            Request::ClearDesired { shadow, path } => {
+                let entry = self.shadows.entry(shadow).or_default();
+                if !entry.clear_desired.contains(&path) {
+                    entry.clear_desired.push(path);
+                    entry.dirty = true;
+                }
+            }
             Request::Desired { shadow, sender } => {
                 self.shadows.entry(shadow.clone()).or_default().desired = Some(sender);
                 // Asked for while connected (a module restarted): read the shadow again, so the
@@ -292,6 +319,9 @@ impl Manager {
                 if let Some(in_flight) = shadow.in_flight.take() {
                     // Only the keys this update removed: others may have gone stale since.
                     shadow.stale.retain(|path| !in_flight.nulls.contains(path));
+                    shadow
+                        .clear_desired
+                        .retain(|path| !in_flight.desired_nulls.contains(path));
                     if let Some(seconds) = document["timestamp"].as_u64() {
                         self.clock.offer(Sample {
                             source: Source::Shadow,
@@ -369,9 +399,17 @@ impl Manager {
             for path in &shadow.stale {
                 set_null(&mut reported, path);
             }
+            let mut state = json!({"reported": reported});
+            if !shadow.clear_desired.is_empty() {
+                let mut desired = Map::new();
+                for path in &shadow.clear_desired {
+                    null_at(&mut desired, path);
+                }
+                state["desired"] = Value::Object(desired);
+            }
             let sent_at = SystemTime::now();
             let token = crate::ulid::new(sent_at);
-            let document = json!({"state": {"reported": reported}, "clientToken": token});
+            let document = json!({"state": state, "clientToken": token});
             let bytes = document.to_string().into_bytes();
             shadow.dirty = false;
             if bytes.len() > MAX_DOCUMENT_BYTES {
@@ -391,6 +429,7 @@ impl Manager {
                 sent: now,
                 sent_at,
                 nulls: shadow.stale.clone(),
+                desired_nulls: shadow.clear_desired.clone(),
             });
             shadow.last_sent = Some(now);
         }
@@ -414,7 +453,9 @@ pub(crate) type DetachedDesired = mpsc::UnboundedReceiver<(String, mpsc::Unbound
 impl ShadowHandle {
     #[cfg(any(test, feature = "module-stream"))]
     /// A handle that isn't connected to a shadow manager: reports arrive on the first channel
-    /// as (shadow, reported), and each `desired` call gets its sender from the second. For
+    /// as (shadow, reported), and each `desired` call gets its sender from the second. A
+    /// `clear_desired(shadow, path)` arrives on the first as (`<shadow>#desired`, `{"clear":
+    /// path}`). For
     /// components run outside the agent, such as the stream daemon's engine, and for tests.
     ///
     /// # Panics
@@ -432,6 +473,12 @@ impl ShadowHandle {
                     }
                     Request::Desired { shadow, sender } => {
                         let _ = desired_tx.send((shadow, sender));
+                    }
+                    // Arrives with the reports, as `<shadow>#desired` with `{"clear": path}`.
+                    Request::ClearDesired { shadow, path } => {
+                        let mut cleared = Map::new();
+                        cleared.insert("clear".into(), json!(path));
+                        let _ = reports_tx.send((format!("{shadow}#desired"), cleared));
                     }
                 }
             }
@@ -499,6 +546,27 @@ fn set_null(reported: &mut Map<String, Value>, path: &[String]) {
         }
     }
     object.entry(key.clone()).or_insert(Value::Null);
+}
+
+/// Sets `path` to `null` in `object`, adding the objects above it.
+fn null_at(object: &mut Map<String, Value>, path: &[String]) {
+    let Some((key, parents)) = path.split_last() else {
+        return;
+    };
+    let mut object = object;
+    for parent in parents {
+        let entry = object
+            .entry(parent.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        let Value::Object(inner) = entry else {
+            return;
+        };
+        object = inner;
+    }
+    object.insert(key.clone(), Value::Null);
 }
 
 fn base(thing: &str, name: &str) -> String {

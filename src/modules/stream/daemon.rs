@@ -6,7 +6,7 @@
 //! socket, or wait in a buffer while none is connected. Commands and desired state come the
 //! other way. The daemon runs its own usb monitor for cameras, which reports nowhere.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -87,6 +87,9 @@ impl Daemon {
         let pending_restart = self.settings.runtime_dir.join("restart-pending");
         // The uplink view Helios sends (`uplinks`), for standby (LLD 3, section 3.5.1).
         let (uplinks, uplinks_view) = tokio::sync::watch::channel(super::standby::View::new());
+        // The streams helios.toml defines: desired state for any other is answered as unknown, so
+        // Helios can remove it from the shadow.
+        let configured: BTreeSet<String> = self.settings.streams.keys().cloned().collect();
         let engine = (self.engine)(self.settings, usb).with_uplinks(uplinks_view);
         let engine_task = tokio::spawn(async move { engine.run(ctx).await });
 
@@ -152,8 +155,10 @@ impl Daemon {
                                 }
                             }
                             "desired" => {
-                                let _ = desired.send(params.get("state").cloned().unwrap_or(Value::Null));
-                                Some(control::response(&id, Outcome::Ok(json!({}))))
+                                let state = params.get("state").cloned().unwrap_or(Value::Null);
+                                let unknown = unknown_streams(&state, &configured);
+                                let _ = desired.send(state);
+                                Some(control::response(&id, Outcome::Ok(json!({"unknown_streams": unknown}))))
                             }
                             "uplinks" => {
                                 uplinks.send_replace(super::standby::parse(&params));
@@ -371,6 +376,18 @@ pub(crate) fn busy(shadow: &Map<String, Value>) -> bool {
                 .values()
                 .any(|status| status["state"].as_str().is_some_and(|s| BUSY.contains(&s)))
         })
+}
+
+/// The streams in a desired state (`{"streams": {"<id>": …}}`) that `configured` doesn't have.
+pub(crate) fn unknown_streams(state: &Value, configured: &BTreeSet<String>) -> Vec<String> {
+    state
+        .get("streams")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(id, value)| !value.is_null() && !configured.contains(id.as_str()))
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 fn load_desired(file: &Path) -> Option<Value> {

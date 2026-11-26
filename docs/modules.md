@@ -87,7 +87,8 @@ cameras' formats are left out.
   `source_ceiling_percent`. Setting `null` goes back to `helios.toml`'s value.
 
 Each value is checked the same way `helios.toml` is. A refused value shows in the stream's
-`rejected`, with the reason. A destination keeps the output's latency and the stream's
+`rejected`, with the reason. Desired state for a stream `helios.toml` doesn't have (one removed from
+the config) is removed from the shadow by the device, so it doesn't come back in every delta. A destination keeps the output's latency and the stream's
 `streamid` unless the URL gives them. It runs as output `stream:<id>`, and an `srtla://`
 destination gets its own sender over the output's uplinks (or `srtla_uplinks`).
 

@@ -3,7 +3,7 @@
 //! over its control socket, and the daemon's events and shadow to MQTT. Streams themselves run
 //! in the daemon, so they keep going while Helios restarts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -170,12 +170,16 @@ async fn session(
         publish(ctx, event);
     }
     let mut waiting: BTreeMap<u64, PendingCommand> = BTreeMap::new();
+    // `desired` requests not answered yet: the answer names streams helios.toml doesn't have.
+    let mut desired_requests: BTreeSet<u64> = BTreeSet::new();
+    let mut cleared: BTreeSet<String> = BTreeSet::new();
     if let Some(state) = desired.take() {
         next_id += 1;
         let line = control::request(next_id, "desired", json!({"state": state}));
         if writer.write_all(line.as_bytes()).await.is_err() {
             return Ended::Lost("the daemon closed the connection".into());
         }
+        desired_requests.insert(next_id);
     }
     // The uplink view: the current one now, then each change.
     if let Some(view) = uplinks.as_deref_mut() {
@@ -214,12 +218,15 @@ async fn session(
                     *desired = Some(state);
                     break Ended::Lost("the daemon closed the connection".into());
                 }
+                desired_requests.insert(next_id);
             }
             line = lines.next_line() => match line {
                 Ok(Some(line)) => match control::parse(&line) {
                     Some(Message::Response { id, outcome }) => {
                         if let Some(pending) = waiting.remove(&id) {
                             pending.respond(outcome);
+                        } else if desired_requests.remove(&id) {
+                            clear_unknown(ctx, &outcome, &mut cleared);
                         }
                     }
                     Some(Message::Notification { method, params }) => match method.as_str() {
@@ -243,6 +250,25 @@ async fn session(
         ));
     }
     ended
+}
+
+/// Removes from the shadow the desired state of streams the daemon answered as unknown (not in
+/// helios.toml): the service would otherwise send it in every delta. Each is logged once.
+fn clear_unknown(ctx: &ModuleContext, outcome: &Outcome, cleared: &mut BTreeSet<String>) {
+    let Outcome::Ok(result) = outcome else {
+        return;
+    };
+    for id in result["unknown_streams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if cleared.insert(id.to_owned()) {
+            tracing::info!(stream = %id, "removing desired state for a stream helios.toml doesn't have");
+        }
+        ctx.shadows.clear_desired(MODULE, &["streams", id]);
+    }
 }
 
 fn publish(ctx: &ModuleContext, event: &Value) {
