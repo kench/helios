@@ -116,8 +116,9 @@ client_user = "helios"             # who may use the control socket (besides roo
 runtime_dir = "/run/helios-stream" # senders' IP files and control sockets go in <runtime_dir>/srtla
 srtla_port_base = 6000             # srtla outputs get local ports from here, in name order,
                                    # then each stream one for an srtla:// destination
-# srtla_uplinks = ["usb:ethernet", "usb:cellular", "usb:wifi"]  # what an srtla:// destination
-                                   # set through the shadow bonds when its output is direct
+# srtla_uplinks = ["net:ethernet", "net:wifi", "usb:ethernet", "usb:cellular", "usb:wifi"]
+                                   # what an srtla:// destination set through the shadow bonds
+                                   # when its output is direct (this is the default)
 # srtla_standby = false            # true holds uplinks sharing a public address with a preferred
                                    # one in standby (slower failover); false bonds them all
 sender_idle_s = 60                 # 1 to 3600: how long a sender outlives its last stream
@@ -140,7 +141,8 @@ stat_url = "http://127.0.0.1:1937/stat"  # rtmp_stat, read at start and every 30
 # host = "ingest.example.com"
 # port = 5000
 # latency_ms = 2000
-# uplinks = ["usb:ethernet", "usb:cellular"]  # usb categories or interface names
+# uplinks = ["net:ethernet", "usb:cellular"]  # the board's own ports by kind (net:ethernet,
+#                                  # net:wifi), usb categories, or interface names
 # passphrase = "…"                 # 10 to 79 characters; SRT URLs aren't secrets
 #
 # [modules.stream.profiles.hevc]

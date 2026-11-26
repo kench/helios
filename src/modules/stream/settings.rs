@@ -42,7 +42,8 @@ pub struct StreamSettings {
     /// each stream one for an SRTLA destination set through the shadow, in name order.
     pub(crate) srtla_port_base: u16,
     /// The uplinks an `srtla://` destination set through the shadow bonds when the stream's
-    /// configured output is `direct` (an `srtla` output's own uplinks come first).
+    /// configured output is `direct` (an `srtla` output's own uplinks come first). By default
+    /// the board's own Ethernet and Wi-Fi ports and any USB uplink.
     pub(crate) srtla_uplinks: Vec<String>,
     /// Whether uplinks that share a public address with a preferred one wait in standby (LLD 3,
     /// section 3.5.1). Off by default (owner, 2026-11-24): bonding them all keeps a registered
@@ -104,6 +105,8 @@ impl Default for StreamSettings {
             runtime_dir: "/run/helios-stream".into(),
             srtla_port_base: 6000,
             srtla_uplinks: vec![
+                "net:ethernet".into(),
+                "net:wifi".into(),
                 "usb:ethernet".into(),
                 "usb:cellular".into(),
                 "usb:wifi".into(),
@@ -340,8 +343,8 @@ impl StreamSettings {
         for uplink in &self.srtla_uplinks {
             if !valid_uplink(uplink) {
                 return Err(format!(
-                    "modules.stream.srtla_uplinks: {uplink:?} must be usb:ethernet, \
-                     usb:cellular, usb:wifi or an interface name"
+                    "modules.stream.srtla_uplinks: {uplink:?} must be net:ethernet, \
+                     net:wifi, usb:ethernet, usb:cellular, usb:wifi or an interface name"
                 ));
             }
         }
@@ -361,8 +364,8 @@ impl StreamSettings {
                     for uplink in &output.uplinks {
                         if !valid_uplink(uplink) {
                             return Err(format!(
-                                "{at}.uplinks: {uplink:?} must be usb:ethernet, usb:cellular, \
-                                 usb:wifi or an interface name"
+                                "{at}.uplinks: {uplink:?} must be net:ethernet, net:wifi, \
+                                 usb:ethernet, usb:cellular, usb:wifi or an interface name"
                             ));
                         }
                     }
@@ -605,14 +608,16 @@ fn valid_selector(selector: &str) -> bool {
     hex4(parts.next()) && hex4(parts.next()) && parts.next().is_some_and(|s| !s.is_empty())
 }
 
-/// `usb:ethernet`, `usb:cellular`, `usb:wifi`, or an interface name.
+/// `net:ethernet`, `net:wifi`, `usb:ethernet`, `usb:cellular`, `usb:wifi`, or an interface name.
 fn valid_uplink(uplink: &str) -> bool {
-    matches!(uplink, "usb:ethernet" | "usb:cellular" | "usb:wifi")
-        || (!uplink.is_empty()
-            && uplink.len() <= 15
-            && uplink
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+    matches!(
+        uplink,
+        "net:ethernet" | "net:wifi" | "usb:ethernet" | "usb:cellular" | "usb:wifi"
+    ) || (!uplink.is_empty()
+        && uplink.len() <= 15
+        && uplink
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
 }
 
 /// `WIDTHxHEIGHT`, each 16 to 8192.

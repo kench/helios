@@ -91,6 +91,19 @@ Each value is checked the same way `helios.toml` is. A refused value shows in th
 `streamid` unless the URL gives them. It runs as output `stream:<id>`, and an `srtla://`
 destination gets its own sender over the output's uplinks (or `srtla_uplinks`).
 
+**Uplinks.** An output's `uplinks` (and `srtla_uplinks`) take three kinds of entry:
+
+| Entry | Matches |
+| --- | --- |
+| `net:ethernet`, `net:wifi` | the board's own ports of that kind (PCIe or platform, not USB), whatever they're called |
+| `usb:ethernet`, `usb:cellular`, `usb:wifi` | USB network devices in that category, from the usb module |
+| an interface name, such as `enP4p65s0` | that interface |
+
+They're resolved again on every reconcile, so a port that gets a cable or a USB modem that's
+plugged in joins the bond once it has an address, and leaves when it loses it. Bridges, tunnels,
+WireGuard and `veth` have no device, so `net:*` never matches them. `srtla_uplinks` defaults to
+all five kinds.
+
 **Bonding and standby.** By default, every uplink with a source route bonds. With
 `srtla_standby = true` (LLD 3, 3.5.1), only one of the uplinks that share a public address
 bonds, chosen by kind (Ethernet, then cellular, then Wi-Fi), then metric, then name. The others

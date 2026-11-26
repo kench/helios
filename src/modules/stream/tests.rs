@@ -968,11 +968,11 @@ fn checks_srtla_outputs_test_sources_and_sender_settings() {
             "uplinks = []",
             "at least one uplink",
         ),
-        ("\"wlan0\"", "\"usb:modem\"", "must be usb:ethernet"),
+        ("\"wlan0\"", "\"usb:modem\"", "must be net:ethernet"),
         (
             "\"wlan0\"",
             "\"this-name-is-far-too-long\"",
-            "must be usb:ethernet",
+            "must be net:ethernet",
         ),
         (
             "video = \"libx264\"",
@@ -1071,14 +1071,8 @@ fn parses_the_kernels_address_dump() {
     assert_eq!(
         addresses,
         [
-            Address {
-                interface: "eth1".into(),
-                address: [10, 0, 1, 2].into()
-            },
-            Address {
-                interface: "wlan0".into(),
-                address: [10, 0, 2, 2].into()
-            },
+            address("eth1", [10, 0, 1, 2]),
+            address("wlan0", [10, 0, 2, 2]),
         ]
     );
     let mut error = 36u32.to_ne_bytes().to_vec();
@@ -1119,6 +1113,7 @@ pub(crate) fn address(interface: &str, ip: [u8; 4]) -> Address {
     Address {
         interface: interface.into(),
         address: ip.into(),
+        onboard: None,
     }
 }
 
@@ -1144,6 +1139,164 @@ fn resolves_uplinks_from_usb_categories_and_interface_names() {
         [[10, 0, 1, 2], [10, 0, 2, 2], [10, 0, 2, 3]].map(std::net::Ipv4Addr::from)
     );
     assert!(srtla::resolve_uplinks(&["usb:cellular".into()], &usb, &addresses).is_empty());
+}
+
+#[test]
+fn resolves_the_boards_own_ports_by_kind() {
+    let onboard = |interface: &str, ip: [u8; 4], kind| Address {
+        onboard: Some(kind),
+        ..address(interface, ip)
+    };
+    let usb = UsbSnapshot::from([ethernet_adapter()]);
+    let addresses = [
+        onboard("enP3p49s0", [10, 0, 3, 2], addrs::Onboard::Ethernet),
+        onboard("enP4p65s0", [10, 0, 4, 2], addrs::Onboard::Ethernet),
+        onboard("wlP2p33s0", [10, 0, 5, 2], addrs::Onboard::Wifi),
+        address("eth1", [10, 0, 1, 2]),
+        address("wg0", [10, 1, 1, 2]),
+    ];
+    let ethernet = srtla::resolve_uplinks(&["net:ethernet".into()], &usb, &addresses);
+    assert_eq!(
+        ethernet,
+        [[10, 0, 3, 2], [10, 0, 4, 2]].map(std::net::Ipv4Addr::from),
+        "every onboard Ethernet port, whatever it's called; not USB, not WireGuard"
+    );
+    let all = srtla::resolve_uplinks(&StreamSettings::default().srtla_uplinks, &usb, &addresses);
+    assert_eq!(
+        all,
+        [[10, 0, 1, 2], [10, 0, 3, 2], [10, 0, 4, 2], [10, 0, 5, 2]].map(std::net::Ipv4Addr::from),
+        "by default, the board's own ports and the USB adapter"
+    );
+    let later = [
+        onboard("enP4p65s0", [10, 0, 4, 2], addrs::Onboard::Ethernet),
+        onboard("enP3p49s0", [10, 0, 3, 9], addrs::Onboard::Ethernet),
+    ];
+    assert_eq!(
+        srtla::resolve_uplinks(&["net:ethernet".into()], &usb, &later),
+        [[10, 0, 3, 9], [10, 0, 4, 2]].map(std::net::Ipv4Addr::from),
+        "a port that gets its address later joins"
+    );
+}
+
+#[test]
+fn tells_the_boards_own_ports_from_sysfs() {
+    use addrs::Onboard;
+    let root = tempfile::tempdir().expect("tempdir");
+    let sys = root.path();
+    let port = |name: &str, device: &str, files: &[(&str, &str)]| {
+        let dir = sys.join("class/net").join(name);
+        std::fs::create_dir_all(&dir).expect("dir");
+        if !device.is_empty() {
+            let target = sys.join("devices").join(device);
+            std::fs::create_dir_all(&target).expect("device");
+            std::os::unix::fs::symlink(&target, dir.join("device")).expect("link");
+        }
+        for (file, text) in files {
+            if file.ends_with('/') {
+                std::fs::create_dir_all(dir.join(file)).expect("dir");
+            } else {
+                std::fs::write(dir.join(file), text).expect("write");
+            }
+        }
+    };
+    port(
+        "enP3p49s0",
+        "platform/fe1c0000.pcie/pci0003:31/0003:31:00.0",
+        &[("type", "1\n")],
+    );
+    port(
+        "wlP2p33s0",
+        "platform/fe180000.pcie/pci0002:21/0002:21:00.0",
+        &[("type", "1\n"), ("wireless/", "")],
+    );
+    port(
+        "eth1",
+        "platform/fc800000.usb/usb1/1-1/1-1:1.0",
+        &[("type", "1\n")],
+    );
+    port(
+        "wwan0",
+        "platform/fe1d0000.pcie/pci0004:41/0004:41:00.0",
+        &[("type", "1\n"), ("uevent", "DEVTYPE=wwan\n")],
+    );
+    port("wg0", "", &[("type", "65534\n")]);
+    port("br0", "", &[("type", "1\n")]);
+    assert_eq!(Onboard::of(sys, "enP3p49s0"), Some(Onboard::Ethernet));
+    assert_eq!(Onboard::of(sys, "wlP2p33s0"), Some(Onboard::Wifi));
+    for other in ["eth1", "wwan0", "wg0", "br0", "missing"] {
+        assert_eq!(Onboard::of(sys, other), None, "{other}");
+    }
+}
+
+#[test]
+fn gives_srtla_send_the_receivers_ipv4_address() {
+    use std::net::SocketAddr;
+    let dual = |_: &str, port: u16| -> std::io::Result<Vec<SocketAddr>> {
+        Ok(vec![
+            SocketAddr::new("2001:db8::10".parse().expect("v6"), port),
+            SocketAddr::new([192, 0, 2, 10].into(), port),
+        ])
+    };
+    let only_v6 = |_: &str, port: u16| -> std::io::Result<Vec<SocketAddr>> {
+        Ok(vec![SocketAddr::new(
+            "2001:db8::10".parse().expect("v6"),
+            port,
+        )])
+    };
+    let missing = |_: &str, _: u16| -> std::io::Result<Vec<SocketAddr>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such host",
+        ))
+    };
+    assert_eq!(
+        srtla::receiver_ipv4("rec.example.com", 5000, dual),
+        Ok([192, 0, 2, 10].into()),
+        "the IPv4 address, even when IPv6 comes first"
+    );
+    assert_eq!(
+        srtla::receiver_ipv4("198.51.100.7", 5000, missing),
+        Ok([198, 51, 100, 7].into()),
+        "a literal needs no lookup"
+    );
+    for (host, lookup, want) in [
+        (
+            "v6.example.com",
+            only_v6 as fn(&str, u16) -> _,
+            "has no IPv4 address",
+        ),
+        (
+            "gone.example.com",
+            missing,
+            "can't resolve gone.example.com",
+        ),
+        ("2001:db8::1", missing, "srtla needs an IPv4 receiver"),
+    ] {
+        let error = srtla::receiver_ipv4(host, 5000, lookup).expect_err(host);
+        assert!(error.contains(want), "{host}: {error}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_receiver_without_an_ipv4_address_fails_the_sender_instead_of_starting_it() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(|| Ok(vec![address("wlan0", [10, 0, 2, 2])])),
+    );
+    let _first = harness.next_start().await;
+    harness.desire(json!({"destination": "srtla://gone.invalid:5000"}));
+    let reported = harness
+        .report_where(|r| {
+            r["outputs"]["stream:pattern"]["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("can't resolve gone.invalid"))
+        })
+        .await;
+    assert_eq!(reported["outputs"]["stream:pattern"]["state"], "down");
 }
 
 #[test]
@@ -1444,7 +1597,8 @@ async fn an_srtla_output_runs_its_sender_first_and_follows_its_uplinks() {
             "--conn-timeout-ms".into(),
             "5000".into(),
             "6000".into(),
-            "rec.example.com".into(),
+            // rec.example.com is dual-stack in tests: srtla_send gets its IPv4 address.
+            "192.0.2.10".into(),
             "5000".into(),
             ips.display().to_string(),
         ]
@@ -1537,6 +1691,61 @@ async fn a_sender_that_exits_is_restarted() {
     assert_eq!(
         again.spec.program,
         std::path::PathBuf::from("/opt/srtla_send")
+    );
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sender_no_link_registers_with_says_why() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(|| Ok(vec![address("wlan0", [10, 0, 2, 2])])),
+    );
+    let sender = harness.next_start().await;
+    assert!(
+        sender
+            .spec
+            .env
+            .contains(&("RUST_LOG".to_owned(), "warn".to_owned())),
+        "srtla_send's warnings are what explain a stuck link"
+    );
+    // What srtla_send printed when the receiver resolved to IPv6 (2026-11-25), colours and all.
+    sender.send(JobEvent::Stderr(
+        "\u{1b}[2m2026-11-25T23:40:23.925784Z\u{1b}[0m \u{1b}[33m WARN\u{1b}[0m Failed to send REG1 to \
+         uplink #0: Os { code: 97 }"
+            .into(),
+    ));
+    sender.send(JobEvent::Stdout("still trying".into()));
+    tokio::time::advance(Duration::from_secs(16)).await;
+    let reported = harness
+        .report_where(|r| r["outputs"]["bond"]["last_error"].is_string())
+        .await;
+    let error = reported["outputs"]["bond"]["last_error"]
+        .as_str()
+        .expect("error");
+    assert!(
+        error.starts_with("no link has registered in 1")
+            && error.ends_with("Failed to send REG1 to uplink #0: Os { code: 97 }"),
+        "the last warning, without colour codes: {error}"
+    );
+    assert!(!error.contains('\u{1b}'), "{error}");
+    assert_eq!(reported["outputs"]["bond"]["state"], "starting");
+    let stream = harness
+        .report_where(|r| {
+            r["streams"]["pattern"]["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("no link has registered"))
+        })
+        .await;
+    assert!(
+        stream["streams"]["pattern"]["last_error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("waiting for output bond: starting (no link")),
+        "{stream}"
     );
     harness.stop().await;
 }
@@ -2188,7 +2397,17 @@ fn checks_srtla_uplinks_and_leaves_a_sender_port_per_stream() {
     assert_eq!(parsed.stream_sender_port("nope"), None);
     assert_eq!(
         settings(&config.replace("srtla_uplinks = [\"wlan0\"]\n", "")).srtla_uplinks,
-        ["usb:ethernet", "usb:cellular", "usb:wifi"]
+        [
+            "net:ethernet",
+            "net:wifi",
+            "usb:ethernet",
+            "usb:cellular",
+            "usb:wifi"
+        ]
+    );
+    assert!(
+        refused(&config.replace("[\"wlan0\"]", "[\"net:cellular\"]"))
+            .contains("srtla_uplinks: \"net:cellular\" must be net:ethernet, net:wifi")
     );
     assert!(
         refused(&config.replace("[\"wlan0\"]", "[\"usb:modem\"]"))
@@ -2380,7 +2599,8 @@ async fn an_srtla_destination_runs_its_own_sender() {
             "--conn-timeout-ms".into(),
             "5000".into(),
             "6001".into(),
-            "rec.example.com".into(),
+            // rec.example.com is dual-stack in tests: srtla_send gets its IPv4 address.
+            "192.0.2.10".into(),
             "5000".into(),
             dir.join("stream:pattern.ips").display().to_string(),
         ],

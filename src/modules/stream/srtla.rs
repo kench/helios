@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::addrs::Address;
+use super::addrs::{Address, Onboard};
 use super::process::{Job, JobEvent, JobSpec, Spawner, Tagged};
 use super::settings::{Output, StreamSettings};
 use super::standby::{self, Standby, View};
@@ -28,6 +28,9 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 const DOWN_AFTER: Duration = Duration::from_secs(10);
 /// Log lines kept per sender.
 const LOG_LINES: usize = 20;
+/// A running sender with no registered link this long after it started is reported as stuck,
+/// with its last warning: srtla_send keeps retrying quietly, so otherwise nothing says why.
+const STUCK_AFTER: Duration = Duration::from_secs(15);
 
 /// An output's state, as streams and the shadow see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +83,8 @@ struct Sender {
     stats: Option<Value>,
     /// When a snapshot last showed an active link.
     active_at: Option<Instant>,
+    /// When the running sender started.
+    started_at: Option<Instant>,
     last_error: Option<String>,
     lines: VecDeque<String>,
 }
@@ -166,6 +171,11 @@ impl Senders {
         self.senders
             .get(output)
             .map_or(OutputState::Stopped, |sender| sender.state(now))
+    }
+
+    /// Why `output`'s running sender has no link yet, once it's been [`STUCK_AFTER`].
+    pub(crate) fn problem(&self, output: &str, now: Instant) -> Option<String> {
+        self.senders.get(output)?.problem(now)
     }
 
     pub(crate) fn active_links(&self, output: &str) -> Option<u64> {
@@ -269,6 +279,13 @@ impl Senders {
                 sender.fail(format!("can't write the IP file: {error}"), now);
                 continue;
             }
+            let receiver = match receiver_ipv4(&sender.output.host, sender.output.port, lookup) {
+                Ok(receiver) => receiver,
+                Err(reason) => {
+                    sender.fail(reason, now);
+                    continue;
+                }
+            };
             let socket = self.dir.join(format!("{name}.sock"));
             let _ = std::fs::remove_file(&socket);
             let conn_timeout = (u64::from(sender.output.latency_ms) * 2).clamp(5000, 60_000);
@@ -281,11 +298,12 @@ impl Senders {
                     "--conn-timeout-ms".into(),
                     conn_timeout.to_string(),
                     sender.port.to_string(),
-                    sender.output.host.clone(),
+                    receiver.to_string(),
                     sender.output.port.to_string(),
                     self.dir.join(format!("{name}.ips")).display().to_string(),
                 ],
-                env: Vec::new(),
+                // srtla_send logs only errors without RUST_LOG, and a failing link is a warning.
+                env: vec![("RUST_LOG".into(), "warn".into())],
             };
             *spawning.next_job += 1;
             let id = *spawning.next_job;
@@ -295,6 +313,7 @@ impl Senders {
                     sender.job = Some((id, job));
                     sender.stats = None;
                     sender.active_at = None;
+                    sender.started_at = Some(now);
                     sender.monitor = Some(tokio::spawn(monitor(socket, id, self.stats_tx.clone())));
                 }
                 Err(error) => {
@@ -316,14 +335,16 @@ impl Senders {
         };
         match &tagged.event {
             JobEvent::Stdout(line) | JobEvent::Stderr(line) => {
+                let line = without_ansi(line);
                 tracing::debug!(output = %name, "srtla_send: {line}");
                 if sender.lines.len() == LOG_LINES {
                     sender.lines.pop_front();
                 }
-                sender.lines.push_back(line.clone());
+                sender.lines.push_back(line);
             }
             JobEvent::Exited(code) => {
                 sender.job = None;
+                sender.started_at = None;
                 if let Some(monitor) = sender.monitor.take() {
                     monitor.abort();
                 }
@@ -369,6 +390,10 @@ impl Senders {
                     sender.restart_at,
                     sender.idle_since.map(|since| since + self.idle),
                     sender.active_at.map(|at| at + DOWN_AFTER),
+                    sender
+                        .started_at
+                        .filter(|_| sender.active_at.is_none())
+                        .map(|at| at + STUCK_AFTER),
                 ]
             })
             .flatten()
@@ -413,6 +438,7 @@ impl Sender {
             backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(60)),
             stats: None,
             active_at: None,
+            started_at: None,
             last_error: None,
             lines: VecDeque::new(),
         }
@@ -479,6 +505,32 @@ impl Sender {
         }
     }
 
+    /// A running sender that no link has registered with since it started [`STUCK_AFTER`]
+    /// ago, with srtla_send's last warning or error.
+    fn problem(&self, now: Instant) -> Option<String> {
+        let started = self.started_at?;
+        if self.job.is_none()
+            || self.active_at.is_some()
+            || now.duration_since(started) < STUCK_AFTER
+        {
+            return None;
+        }
+        let mut reason = format!(
+            "no link has registered in {} s",
+            now.duration_since(started).as_secs()
+        );
+        if let Some(line) = self
+            .lines
+            .iter()
+            .rev()
+            .find(|line| line.contains("WARN") || line.contains("ERROR"))
+        {
+            reason.push_str(": ");
+            reason.push_str(line.trim());
+        }
+        Some(reason)
+    }
+
     fn stop(&mut self) {
         if let Some(monitor) = self.monitor.take() {
             monitor.abort();
@@ -488,6 +540,7 @@ impl Sender {
         }
         self.stats = None;
         self.active_at = None;
+        self.started_at = None;
         self.idle_since = None;
     }
 
@@ -495,6 +548,7 @@ impl Sender {
         self.last_error = Some(reason);
         self.stats = None;
         self.active_at = None;
+        self.started_at = None;
         self.restart_at = Some(now + self.backoff.next_delay());
     }
 
@@ -513,7 +567,7 @@ impl Sender {
             "standby": self.standby.iter().map(Standby::json).collect::<Vec<_>>(),
             "active_links": figure("active_links"),
             "total_links": figure("total_links"),
-            "last_error": self.last_error,
+            "last_error": self.last_error.clone().or_else(|| self.problem(now)),
         });
         if !significant {
             let links: Vec<Value> = stats
@@ -548,8 +602,9 @@ impl Sender {
     }
 }
 
-/// The IPv4 addresses of the configured uplinks: `usb:<category>` (the usb module's network
-/// devices in that category) or interface names.
+/// The IPv4 addresses of the configured uplinks: `net:ethernet` and `net:wifi` (the board's own
+/// ports of that kind), `usb:<category>` (the usb module's network devices in that category) or
+/// interface names.
 #[cfg(test)]
 pub(crate) fn resolve_uplinks(
     uplinks: &[String],
@@ -573,6 +628,20 @@ pub(crate) fn resolve_uplink_interfaces(
 ) -> Vec<(String, Ipv4Addr)> {
     let mut interfaces: Vec<String> = Vec::new();
     for uplink in uplinks {
+        let onboard = match uplink.as_str() {
+            "net:ethernet" => Some(Onboard::Ethernet),
+            "net:wifi" => Some(Onboard::Wifi),
+            _ => None,
+        };
+        if let Some(kind) = onboard {
+            interfaces.extend(
+                addresses
+                    .iter()
+                    .filter(|address| address.onboard == Some(kind))
+                    .map(|address| address.interface.clone()),
+            );
+            continue;
+        }
         match uplink.strip_prefix("usb:") {
             Some(category) => {
                 for device in usb.values() {
@@ -611,6 +680,73 @@ pub(crate) fn resolve_uplink_interfaces(
     found.sort_by_key(|(_, ip)| *ip);
     found.dedup_by(|a, b| a.1 == b.1);
     found
+}
+
+/// The receiver's IPv4 address, which srtla_send is given instead of its name. srtla_send binds
+/// one socket per uplink address, all IPv4, but sends to the first address its lookup returns:
+/// with a dual-stack receiver that's often IPv6, and every packet then fails with
+/// `EAFNOSUPPORT`, so the bond never registers (found with the ingest server, 2026-11-25).
+pub(crate) fn receiver_ipv4(
+    host: &str,
+    port: u16,
+    lookup: fn(&str, u16) -> io::Result<Vec<std::net::SocketAddr>>,
+) -> Result<Ipv4Addr, String> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => Ok(v4),
+            std::net::IpAddr::V6(_) => Err(format!(
+                "{host}: srtla needs an IPv4 receiver (the uplinks are IPv4)"
+            )),
+        };
+    }
+    let addresses = lookup(host, port).map_err(|error| format!("can't resolve {host}: {error}"))?;
+    addresses
+        .iter()
+        .find_map(|address| match address.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .ok_or_else(|| format!("{host} has no IPv4 address (the uplinks are IPv4)"))
+}
+
+/// The system resolver. Tests resolve only `*.example.com` names, to documentation addresses.
+#[cfg(not(test))]
+fn lookup(host: &str, port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    Ok((host, port).to_socket_addrs()?.collect())
+}
+
+#[cfg(test)]
+fn lookup(host: &str, port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
+    if host.ends_with(".example.com") {
+        Ok(vec![
+            std::net::SocketAddr::new("2001:db8::10".parse().expect("v6"), port),
+            std::net::SocketAddr::new([192, 0, 2, 10].into(), port),
+        ])
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, "no such host"))
+    }
+}
+
+/// `line` without ANSI escape sequences (srtla_send colours its log even when piped).
+fn without_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI: ESC [ parameters, then a final byte from @ to ~.
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Writes `<dir>/<name>.ips` (one IP per line) through a temporary file and a rename, so
