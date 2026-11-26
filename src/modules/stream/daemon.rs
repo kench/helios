@@ -80,8 +80,12 @@ impl Daemon {
         let (ctx, mut requests, mut reports, commands, desired) =
             detached_context(&self.sysfs, engine_cancel.clone());
         let state_file = self.settings.state_dir.join("desired.json");
-        if let Some(saved) = load_desired(&state_file) {
+        if let Some(mut saved) = load_desired(&state_file) {
             tracing::info!("resuming the saved desired state");
+            // The whole desired state, as a shadow `get` gives it.
+            if let Value::Object(object) = &mut saved {
+                object.insert(crate::mqtt::shadow::FULL_DESIRED.into(), Value::Bool(true));
+            }
             let _ = desired.send(saved);
         }
         let pending_restart = self.settings.runtime_dir.join("restart-pending");

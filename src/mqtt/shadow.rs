@@ -8,8 +8,8 @@
 //! no longer reports, and those are set to `null` in the next update, which removes them. That
 //! goes for nested keys too (`streams.<id>`), since the service merges an update into what it
 //! holds and keeps a nested key until it's set to `null`. The
-//! reply's `desired` state, and every later `update/delta`, go to the module if it asked for
-//! them with [`ShadowHandle::desired`]. A module can also remove desired state it can't use (for
+//! reply's `desired` state (marked [`FULL_DESIRED`]), and every later `update/delta`, go to the
+//! module if it asked for them with [`ShadowHandle::desired`]. A module can also remove desired state it can't use (for
 //! a stream its config doesn't have) with [`ShadowHandle::clear_desired`]: the next update sets
 //! that key to `null` in `desired`, until an update carrying it is accepted.
 
@@ -24,6 +24,11 @@ use tokio_util::sync::CancellationToken;
 use crate::clock::ClockSamples;
 use crate::clock::offset::{Sample, Source};
 use crate::mqtt::manager::{Incoming, MqttHandle, MqttStatus};
+
+/// The key the shadow manager adds (`true`) to desired state from a `get`: the whole desired
+/// state, where a delta holds only what changed. A module that merges deltas replaces what it
+/// has seen on a full read, so keys removed while the device was offline go too.
+pub const FULL_DESIRED: &str = "$full";
 
 /// AWS IoT's limit on a shadow document.
 pub const MAX_DOCUMENT_BYTES: usize = 8 * 1024;
@@ -361,7 +366,11 @@ impl Manager {
                 if let (Some(desired), Some(state)) =
                     (&shadow.desired, document["state"].get("desired"))
                 {
-                    let _ = desired.send(state.clone());
+                    let mut state = state.clone();
+                    if let Value::Object(object) = &mut state {
+                        object.insert(FULL_DESIRED.into(), Value::Bool(true));
+                    }
+                    let _ = desired.send(state);
                 }
             }
             // 404 just means the shadow doesn't exist yet.

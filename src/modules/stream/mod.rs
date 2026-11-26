@@ -43,6 +43,7 @@ use tokio::time::Instant;
 use crate::backoff::Backoff;
 use crate::modules::usb::{UsbHandle, UsbSnapshot};
 use crate::mqtt::envelope::timestamp;
+use crate::mqtt::shadow::FULL_DESIRED;
 use crate::router::{Outcome, codes};
 
 use super::{Module, ModuleContext, ModuleError, ModuleFuture};
@@ -440,6 +441,10 @@ struct Streams<'a> {
     /// Streams desired state named that the config doesn't have, each logged once (Helios
     /// removes them from the shadow).
     unknown_desired: BTreeSet<String>,
+    /// The whole desired state seen so far: the first full read, with each delta merged in. A
+    /// delta holds only what changed, down to nested keys (a source's `size` without its
+    /// `type`), so settings are applied from this.
+    desired_seen: Value,
 }
 
 impl<'a> Streams<'a> {
@@ -506,6 +511,7 @@ impl<'a> Streams<'a> {
             formats_rx,
             formats_left_out: false,
             unknown_desired: BTreeSet::new(),
+            desired_seen: Value::Null,
         }
     }
 
@@ -1372,10 +1378,18 @@ impl<'a> Streams<'a> {
     /// the new profile) or refused, and a refusal is reported in the stream's `rejected` until a
     /// value for that setting is accepted.
     fn desired(&mut self, state: &Value, ctx: &ModuleContext) {
+        // A full read (from the shadow's `get`, or the daemon's saved state) replaces what was
+        // seen; a delta merges into it.
+        if state.get(FULL_DESIRED) == Some(&Value::Bool(true)) {
+            self.desired_seen = Value::Null;
+        }
         let Some(streams) = state.get("streams").and_then(Value::as_object) else {
             return;
         };
-        for (id, desired) in streams {
+        merge_desired(&mut self.desired_seen, state);
+        for (id, changed) in streams {
+            // What the delta names, with each value whole from everything seen so far.
+            let desired = &whole(changed, &self.desired_seen["streams"][id]);
             let Some(index) = self.entries.iter().position(|entry| entry.id == *id) else {
                 if !desired.is_null() && self.unknown_desired.insert(id.clone()) {
                     tracing::warn!(stream = %id, "desired state for a stream helios.toml doesn't have");
@@ -1906,6 +1920,53 @@ fn resolve(source: &Source, devices: &UsbSnapshot) -> (Option<CameraNodes>, Valu
         audio,
     };
     (Some(nodes), report)
+}
+
+/// Merges a desired-state delta into `seen`, as the shadow service does: objects merge key by
+/// key, a `null` removes the key, anything else replaces it.
+pub(crate) fn merge_desired(seen: &mut Value, delta: &Value) {
+    match (seen, delta) {
+        (Value::Object(seen), Value::Object(delta)) => {
+            for (key, value) in delta {
+                if key == FULL_DESIRED {
+                    continue;
+                }
+                if value.is_null() {
+                    seen.remove(key);
+                } else if let Some(existing) = seen.get_mut(key) {
+                    merge_desired(existing, value);
+                } else {
+                    let mut fresh = Value::Null;
+                    merge_desired(&mut fresh, value);
+                    seen.insert(key.clone(), fresh);
+                }
+            }
+        }
+        (seen, delta) => {
+            // An object replaces a non-object; its own nulls are dropped as it goes in.
+            if let Value::Object(_) = delta {
+                *seen = Value::Object(serde_json::Map::new());
+                merge_desired(seen, delta);
+            } else {
+                *seen = delta.clone();
+            }
+        }
+    }
+}
+
+/// `changed` (a stream's entry in a delta) with each key's value taken whole from `seen` (the
+/// merged desired state for that stream), so `{"source": {"size": …}}` becomes the whole source.
+/// A key `seen` no longer has (set to `null`) stays `null`.
+pub(crate) fn whole(changed: &Value, seen: &Value) -> Value {
+    let Value::Object(changed) = changed else {
+        return changed.clone();
+    };
+    Value::Object(
+        changed
+            .keys()
+            .map(|key| (key.clone(), seen.get(key).cloned().unwrap_or(Value::Null)))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
