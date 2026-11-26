@@ -25,6 +25,7 @@ mod encoder;
 mod ffmpeg;
 mod inputs;
 mod process;
+mod recording;
 mod rtmp;
 pub(crate) mod settings;
 mod srtla;
@@ -160,6 +161,8 @@ pub struct StreamModule {
     spawner: Arc<dyn Spawner>,
     addresses: Arc<Addresses>,
     formats: Arc<FormatReader>,
+    /// Checks the recordings' filesystem and deletes old segments.
+    disk: Arc<DiskCheck>,
     /// The net module's view of the uplinks (kinds, metrics, public addresses), from Helios over
     /// the control socket, for standby (LLD 3, section 3.5.1). Empty until Helios sends it.
     uplinks: tokio::sync::watch::Receiver<standby::View>,
@@ -167,6 +170,12 @@ pub struct StreamModule {
 
 /// Where uplink addresses come from: rtnetlink, or a fake in tests.
 type Addresses = dyn Fn() -> std::io::Result<Vec<Address>> + Send + Sync;
+
+/// The recordings' filesystem: checked for real, or a fake in tests.
+type DiskCheck = dyn Fn(&recording::Recording) -> recording::Disk + Send + Sync;
+
+/// How often the recordings' filesystem is checked (and old segments deleted).
+const DISK_CHECK: Duration = Duration::from_secs(60);
 
 /// Where a camera's formats come from: V4L2, or a fake in tests.
 type FormatReader = dyn Fn(&std::path::Path) -> std::io::Result<Vec<v4l2::Format>> + Send + Sync;
@@ -187,6 +196,7 @@ impl StreamModule {
             spawner: Arc::new(process::System),
             addresses: Arc::new(addrs::ipv4_addresses),
             formats: Arc::new(v4l2::formats),
+            disk: Arc::new(recording::check),
             uplinks: tokio::sync::watch::channel(standby::View::new()).1,
         }
     }
@@ -214,6 +224,7 @@ impl StreamModule {
             spawner,
             addresses,
             formats: Arc::new(|_| Ok(Vec::new())),
+            disk: Arc::new(|_| recording::Disk::default()),
             uplinks: tokio::sync::watch::channel(standby::View::new()).1,
         }
     }
@@ -221,6 +232,12 @@ impl StreamModule {
     #[cfg(test)]
     fn with_formats(mut self, formats: Arc<FormatReader>) -> Self {
         self.formats = formats;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_disk(mut self, disk: Arc<DiskCheck>) -> Self {
+        self.disk = disk;
         self
     }
 }
@@ -245,6 +262,8 @@ struct Running {
     out_time_us: Option<i64>,
     backend: Backend,
     watch: Watch,
+    /// The run's recording, if it records: its files' name (the UTC start) and when it began.
+    recording: Option<(String, SystemTime)>,
 }
 
 impl Running {
@@ -285,8 +304,12 @@ struct Entry {
     destination: Option<(Destination, Output)>,
     /// A `source_ceiling_percent` set through the shadow.
     ceiling_override: Option<u32>,
+    /// `record` set through the shadow.
+    record_override: Option<bool>,
+    /// Why the last run that should have recorded couldn't.
+    record_error: Option<String>,
     /// Desired values refused, by setting: `source`, `profile`, `destination`,
-    /// `source_ceiling_percent`, `bitrate` or `state`.
+    /// `source_ceiling_percent`, `record`, `bitrate` or `state`.
     rejected: BTreeMap<&'static str, Rejected>,
     desired_live: bool,
     /// The bitrate in use: the override if there is one, else the profile's.
@@ -320,6 +343,41 @@ struct Entry {
 }
 
 impl Entry {
+    /// Whether the stream should record: the desired state's `record`, else `helios.toml`'s.
+    fn record(&self) -> bool {
+        self.record_override.unwrap_or(self.configured.record)
+    }
+
+    /// The stream's recording, for the shadow.
+    fn recording(&self, disk: &recording::Disk) -> Value {
+        let run = self.job.as_ref().and_then(|job| job.recording.as_ref());
+        let state = if !self.record() {
+            "off"
+        } else if run.is_some() {
+            if disk.full { "disk_full" } else { "recording" }
+        } else if self.record_error.is_some() || disk.error.is_some() {
+            "error"
+        } else if !disk.mounted {
+            "unavailable"
+        } else if disk.full {
+            "disk_full"
+        } else {
+            "idle"
+        };
+        let segment = run.and_then(|(name, _)| {
+            disk.latest
+                .get(&self.id)
+                .filter(|latest| latest.starts_with(name.as_str()))
+        });
+        json!({
+            "state": state,
+            "files": run.map(|(name, _)| format!("{}/{name}-*.ts", self.id)),
+            "segment": segment,
+            "since": run.map(|(_, since)| timestamp(*since)),
+            "last_error": self.record_error.as_ref().or(disk.error.as_ref()),
+        })
+    }
+
     fn set_state(&mut self, state: State) {
         if self.state != state {
             self.state = state;
@@ -386,6 +444,7 @@ impl Entry {
                 .then_some(&self.config.profile),
             "destination": self.destination.as_ref().map(|(destination, _)| destination.url()),
             "source_ceiling_percent": self.ceiling_override,
+            "record": self.record_override,
         });
         let mut status = json!({
             "state": self.state.as_str(),
@@ -445,6 +504,12 @@ struct Streams<'a> {
     /// delta holds only what changed, down to nested keys (a source's `size` without its
     /// `type`), so settings are applied from this.
     desired_seen: Value,
+    /// The recordings' filesystem as last checked, when, and whether a check is running.
+    disk: recording::Disk,
+    disk_at: Option<Instant>,
+    disk_checking: bool,
+    disk_tx: mpsc::UnboundedSender<recording::Disk>,
+    disk_rx: mpsc::UnboundedReceiver<recording::Disk>,
 }
 
 impl<'a> Streams<'a> {
@@ -459,6 +524,8 @@ impl<'a> Streams<'a> {
                 configured: config.clone(),
                 destination: None,
                 ceiling_override: None,
+                record_override: None,
+                record_error: None,
                 rejected: BTreeMap::new(),
                 desired_live: config.desired == "live",
                 bitrate_kbps: module
@@ -490,6 +557,7 @@ impl<'a> Streams<'a> {
             .collect();
         let (stats_tx, sender_stats) = mpsc::unbounded_channel();
         let (formats_tx, formats_rx) = mpsc::unbounded_channel();
+        let (disk_tx, disk_rx) = mpsc::unbounded_channel();
         Self {
             module,
             entries,
@@ -512,6 +580,69 @@ impl<'a> Streams<'a> {
             formats_left_out: false,
             unknown_desired: BTreeSet::new(),
             desired_seen: Value::Null,
+            disk: recording::Disk::default(),
+            disk_at: None,
+            disk_checking: false,
+            disk_tx,
+            disk_rx,
+        }
+    }
+
+    /// Checks the recordings' filesystem (deleting old segments) off the runtime, every
+    /// minute.
+    fn check_disk(&mut self, now: Instant) {
+        if self.disk_checking || self.disk_at.is_some_and(|at| now < at + DISK_CHECK) {
+            return;
+        }
+        self.disk_checking = true;
+        self.disk_at = Some(now);
+        let check = Arc::clone(&self.module.disk);
+        let settings = self.module.settings.recording.clone();
+        let results = self.disk_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = results.send(check(&settings));
+        });
+    }
+
+    /// A check's result. A filesystem that becomes usable again restarts the encoders of
+    /// streams that should be recording but aren't (a few seconds' gap in the stream).
+    fn disk_checked(&mut self, disk: recording::Disk) {
+        self.disk_checking = false;
+        let dir = self.module.settings.recording.dir.display().to_string();
+        let wanted = self.entries.iter().any(Entry::record);
+        if wanted && disk.mounted != self.disk.mounted {
+            if disk.mounted {
+                tracing::info!(%dir, "recordings: the filesystem is mounted");
+            } else {
+                tracing::warn!(%dir, "recordings: not a mounted filesystem; not recording");
+            }
+        }
+        if wanted && disk.full && !self.disk.full {
+            tracing::warn!(%dir, "recordings: the disk is full and no closed segment is left \
+                to delete; new runs won't record");
+        }
+        if let Some(error) = disk
+            .error
+            .as_ref()
+            .filter(|_| wanted && disk.error != self.disk.error)
+        {
+            tracing::warn!(%dir, %error, "recordings: can't check the filesystem");
+        }
+        let usable = disk.usable() && !self.disk.usable();
+        self.disk = disk;
+        if usable {
+            for index in 0..self.entries.len() {
+                let entry = &self.entries[index];
+                if entry.record()
+                    && entry
+                        .job
+                        .as_ref()
+                        .is_some_and(|job| job.recording.is_none())
+                {
+                    tracing::info!(stream = %entry.id, "restarting the encoder to record");
+                    self.stop_job(index);
+                }
+            }
         }
     }
 
@@ -794,6 +925,13 @@ impl<'a> Streams<'a> {
                 ingest_cancel.clone(),
             ))
         });
+        // The first check before any stream starts, so a stream resuming at once records.
+        let check = Arc::clone(&module.disk);
+        let recording = settings.recording.clone();
+        self.disk = tokio::task::spawn_blocking(move || check(&recording))
+            .await
+            .unwrap_or_default();
+        self.disk_at = Some(Instant::now());
         // Desired state queued before the start (the daemon's saved state) applies before the
         // first pass, so a stream saved as stopped doesn't start for a moment.
         while let Ok(state) = ctx.desired.try_recv() {
@@ -804,6 +942,7 @@ impl<'a> Streams<'a> {
             self.devices = Arc::clone(&devices);
             self.read_formats();
             let now = Instant::now();
+            self.check_disk(now);
             self.reconcile_senders(&devices, now);
             for index in 0..self.entries.len() {
                 self.reconcile(index, &devices, now, &ctx);
@@ -834,6 +973,7 @@ impl<'a> Streams<'a> {
                 Some(tagged) = self.events.recv() => self.job_event(tagged, &ctx),
                 Some(event) = ingest_rx.recv() => self.ingest_event(event),
                 Some((key, result)) = self.formats_rx.recv() => self.formats_read(key, result),
+                Some(disk) = self.disk_rx.recv() => self.disk_checked(disk),
                 Some((job, snapshot)) = self.sender_stats.recv() => {
                     self.senders.stats(job, snapshot, Instant::now());
                 }
@@ -1004,10 +1144,27 @@ impl<'a> Streams<'a> {
         else {
             return;
         };
+        // The run records if the stream should and the filesystem is usable; a recording that
+        // can't start never keeps the stream from starting.
+        let recording = &settings.recording;
+        let mut record_error = None;
+        let run = (entry.record() && self.disk.usable())
+            .then(|| recording.files(&entry.id, SystemTime::now()))
+            .and_then(|(dir, name, pattern)| match std::fs::create_dir_all(&dir) {
+                Ok(()) => Some((name, pattern)),
+                Err(error) => {
+                    record_error = Some(format!("can't create {}: {error}", dir.display()));
+                    None
+                }
+            });
         let target = ffmpeg::Target {
             output,
             streamid: &entry.config.streamid,
             sender_port: self.senders.port(&entry.config.output),
+            record: run.as_ref().map(|(_, pattern)| ffmpeg::Record {
+                pattern,
+                segment_s: recording.segment_s,
+            }),
         };
         let url = entry.config.source.rtmp_key().map(|key| {
             format!(
@@ -1030,6 +1187,10 @@ impl<'a> Streams<'a> {
             self.failed_run(index, message, Instant::now(), ctx);
             return;
         }
+        let recording = run.map(|(name, _)| (name, SystemTime::now()));
+        if let Some(error) = &record_error {
+            tracing::warn!(stream = %entry.id, %error, "not recording this run");
+        }
         let spec = JobSpec {
             name: entry.id.clone(),
             program: plan.program,
@@ -1040,9 +1201,14 @@ impl<'a> Streams<'a> {
         let id = self.next_job;
         let entry = &mut self.entries[index];
         entry.restart_at = None;
+        entry.record_error = record_error;
         match module.spawner.spawn(&spec, id, self.events_tx.clone()) {
             Ok(job) => {
-                tracing::info!(stream = %entry.id, encoder = backend.name(), "encoder started");
+                tracing::info!(
+                    stream = %entry.id, encoder = backend.name(),
+                    recording = recording.as_ref().map(|(name, _)| name.as_str()),
+                    "encoder started"
+                );
                 entry.job = Some(Running {
                     id,
                     job,
@@ -1051,6 +1217,7 @@ impl<'a> Streams<'a> {
                     out_time_us: None,
                     backend,
                     watch: Watch::new(backend),
+                    recording,
                 });
                 entry.progress = None;
                 if entry.state != State::Reconnecting {
@@ -1514,6 +1681,29 @@ impl<'a> Streams<'a> {
                 Err(reason) => self.reject(index, "source_ceiling_percent", value, reason),
             }
         }
+        if let Some(value) = desired.get("record") {
+            match value {
+                Value::Null | Value::Bool(_) => {
+                    self.accept(index, "record");
+                    let entry = &mut self.entries[index];
+                    let before = entry.record();
+                    entry.record_override = value.as_bool();
+                    if entry.record() != before {
+                        tracing::info!(stream = %entry.id, record = entry.record(),
+                            "recording switched by the desired state");
+                        entry.record_error = None;
+                        // The encoder starts again with or without its recording branch.
+                        if entry.job.is_some() {
+                            self.stop_job(index);
+                        }
+                    }
+                }
+                value => {
+                    let reason = "record must be true or false".to_owned();
+                    self.reject(index, "record", value, reason);
+                }
+            }
+        }
         if reconfigured {
             tracing::info!(
                 stream = %self.entries[index].id, profile = %self.entries[index].config.profile,
@@ -1696,10 +1886,9 @@ impl<'a> Streams<'a> {
             self.entries
                 .iter()
                 .map(|entry| {
-                    (
-                        entry.id.clone(),
-                        entry.status(&self.module.settings, with_log),
-                    )
+                    let mut status = entry.status(&self.module.settings, with_log);
+                    status["recording"] = entry.recording(&self.disk);
+                    (entry.id.clone(), status)
                 })
                 .collect(),
         )
@@ -1723,9 +1912,10 @@ impl<'a> Streams<'a> {
         let keys = self.rtmp_keys();
         let settings = &self.module.settings;
         let mut inputs = inputs::inputs(settings, &self.devices, &self.formats, &keys, true);
+        let dir = &settings.recording.dir;
         let mut full = json!({
             "streams": streams, "outputs": self.outputs_report(now, false), "rtmp_ingest": ingest,
-            "profiles": profiles, "inputs": inputs,
+            "profiles": profiles, "inputs": inputs, "recording": self.disk.report(dir, true),
         });
         let too_big = full.to_string().len() > REPORT_BUDGET;
         if too_big {
@@ -1743,6 +1933,7 @@ impl<'a> Streams<'a> {
         let significant = json!({
             "streams": quiet_streams, "outputs": self.outputs_report(now, true),
             "rtmp_ingest": ingest, "profiles": profiles, "inputs": inputs,
+            "recording": self.disk.report(dir, false),
         });
         let due = match &self.reported {
             None => true,
@@ -1792,6 +1983,9 @@ impl<'a> Streams<'a> {
         }
         if let Some(at) = self.addresses_at {
             wake = wake.min(at + ADDRESS_REFRESH);
+        }
+        if let Some(at) = self.disk_at.filter(|_| !self.disk_checking) {
+            wake = wake.min(at + DISK_CHECK);
         }
         wake
     }

@@ -23,6 +23,16 @@ pub(crate) struct Target<'a> {
     pub streamid: &'a str,
     /// The local sender's port, for `srtla` outputs.
     pub sender_port: Option<u16>,
+    /// Where this run records to, if it does.
+    pub record: Option<Record<'a>>,
+}
+
+/// A run's recording (LLD 4, section 16): the encoder's file pattern (`…/<start>-%05d.ts`) and
+/// how long each segment is. A new segment starts at the first keyframe after that.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Record<'a> {
+    pub pattern: &'a std::path::Path,
+    pub segment_s: u32,
 }
 
 const COMMON: [&str; 8] = [
@@ -218,15 +228,30 @@ fn audio_args(audio: &str) -> Vec<String> {
 }
 
 /// MPEG-TS (irl-srt-server accepts only that) to an SRT listener in caller mode. ffmpeg's SRT
-/// `latency` is in microseconds.
+/// `latency` is in microseconds. A recording run sends the same packets through the `tee`
+/// muxer to MPEG-TS segments as well; a failing recording (`onfail=ignore`) leaves the stream
+/// running, a failing stream (`onfail=abort`) ends the run.
 fn output_args(target: Target<'_>) -> Vec<String> {
-    vec![
-        "-f".into(),
-        "mpegts".into(),
-        "-mpegts_flags".into(),
-        "+resend_headers".into(),
-        srt_url(target),
-    ]
+    let url = srt_url(target);
+    match target.record {
+        None => vec![
+            "-f".into(),
+            "mpegts".into(),
+            "-mpegts_flags".into(),
+            "+resend_headers".into(),
+            url,
+        ],
+        Some(record) => vec![
+            "-f".into(),
+            "tee".into(),
+            format!(
+                "[f=mpegts:mpegts_flags=+resend_headers:onfail=abort]{url}|\
+                 [f=segment:segment_format=mpegts:segment_time={}:onfail=ignore]{}",
+                record.segment_s,
+                record.pattern.display()
+            ),
+        ],
+    }
 }
 
 pub(crate) fn srt_url(target: Target<'_>) -> String {

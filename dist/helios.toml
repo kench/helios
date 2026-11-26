@@ -136,6 +136,16 @@ stat_url = "http://127.0.0.1:1937/stat"  # rtmp_stat, read at start and every 30
 # publish_host = "192.168.8.1"     # what cameras publish to, for each key's publish_url in the
 #                                  # stream shadow (the Control API shows it); unset leaves it out
 
+[modules.stream.recording]
+# Local recordings of streams with record = true (or the desired state's record): the stream as
+# sent, no second encode, in MPEG-TS segments at <dir>/<stream>/<UTC start>-<n>.ts. To MP4:
+# ffmpeg -i seg.ts -c copy seg.mp4. A recording that fails never stops the stream.
+dir = "/var/lib/helios-stream/recordings"  # letters, digits, / . _ - only
+segment_s = 600                    # 60 to 3600: a new segment at the first keyframe after this
+max_usage_percent = 90             # 10 to 99: above it the oldest closed segments are deleted
+require_mountpoint = true          # record only when dir is a mounted filesystem (an SSD), so a
+                                   # missing disk can't fill the SD card
+
 # [modules.stream.outputs.bonded]
 # mode = "srtla"                   # srtla (to srtla_rec) or direct (to an SRT listener)
 # host = "ingest.example.com"
@@ -167,6 +177,7 @@ stat_url = "http://127.0.0.1:1937/stat"  # rtmp_stat, read at start and every 30
 # output = "bonded"
 # streamid = "publish/live/backpack"
 # desired = "live"
+# record = false                   # record it to [modules.stream.recording]
 #
 # [modules.stream.streams.pocket]
 # source = { type = "rtmp" }       # key ingest; { type = "rtmp", camera = 1 } is ingest-1

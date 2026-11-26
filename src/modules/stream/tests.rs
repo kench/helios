@@ -161,6 +161,7 @@ fn target<'a>(output: &'a super::settings::Output, streamid: &'a str) -> ffmpeg:
         output,
         streamid,
         sender_port: None,
+        record: None,
     }
 }
 
@@ -462,6 +463,24 @@ fn harness_full(
     addresses: Arc<super::Addresses>,
     formats: Arc<super::FormatReader>,
 ) -> Harness {
+    harness_disk(
+        config,
+        encoders,
+        refuse,
+        addresses,
+        formats,
+        Arc::new(|_| super::recording::Disk::default()),
+    )
+}
+
+fn harness_disk(
+    config: &str,
+    encoders: Option<&[&str]>,
+    refuse: bool,
+    addresses: Arc<super::Addresses>,
+    formats: Arc<super::FormatReader>,
+    disk: Arc<super::DiskCheck>,
+) -> Harness {
     let usb = UsbHandle::default();
     let (started_tx, started) = mpsc::unbounded_channel();
     let spawner = FakeSpawner {
@@ -473,6 +492,7 @@ fn harness_full(
     let module =
         StreamModule::with_fakes(settings(config), usb.clone(), Arc::new(spawner), addresses)
             .with_formats(formats)
+            .with_disk(disk)
             .with_uplinks(uplinks_view);
     let (mqtt, published, _status) = MqttHandle::for_test();
     let (shadows, reports, _desired) = ShadowHandle::for_test();
@@ -1011,6 +1031,7 @@ fn builds_test_pattern_arguments_and_srtla_urls() {
         output: &settings.outputs["bond"],
         streamid: "publish/live/pattern",
         sender_port: Some(6000),
+        record: None,
     };
     let args = ffmpeg::test_args(&settings.profiles["test"], target, "640x360", 25, 3000).join(" ");
     for part in [
@@ -2434,7 +2455,7 @@ async fn the_desired_state_sets_a_streams_profile_source_and_destination() {
     assert_eq!(status["rejected"], json!([]));
     assert_eq!(
         status["overrides"],
-        json!({"source": null, "profile": null, "destination": null, "source_ceiling_percent": null})
+        json!({"source": null, "profile": null, "destination": null, "source_ceiling_percent": null, "record": null})
     );
 
     // A new profile and destination together: one restart with both.
@@ -2558,7 +2579,7 @@ async fn the_desired_state_sets_a_streams_profile_source_and_destination() {
         status["overrides"],
         json!({
             "source": {"type": "test", "size": "640x360", "fps": 25}, "profile": null,
-            "destination": null, "source_ceiling_percent": null,
+            "destination": null, "source_ceiling_percent": null, "record": null,
         })
     );
     assert_eq!(
@@ -3043,6 +3064,173 @@ async fn leaves_formats_out_when_the_shadow_would_be_too_large() {
         last.to_string().len() < super::REPORT_BUDGET,
         "{}",
         last.to_string().len()
+    );
+    harness.stop().await;
+}
+
+/// A recordings filesystem that's mounted, or not, as the test says.
+fn fake_disk(mounted: Arc<AtomicBool>) -> Arc<super::DiskCheck> {
+    Arc::new(move |_| {
+        let mounted = mounted.load(Ordering::SeqCst);
+        super::recording::Disk {
+            mounted,
+            total_bytes: if mounted { 128_000_000_000 } else { 0 },
+            free_bytes: if mounted { 100_000_000_000 } else { 0 },
+            latest: if mounted {
+                [("camera".to_owned(), "x.ts".to_owned())].into()
+            } else {
+                Default::default()
+            },
+            ..super::recording::Disk::default()
+        }
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn records_the_stream_as_sent_and_switches_through_the_desired_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dir = temp.path().display().to_string();
+    let config = CONFIG.replace(
+        "streamid = \"publish/live/backpack\"",
+        "streamid = \"publish/live/backpack\"\nrecord = true",
+    ) + &format!("\n[recording]\ndir = \"{dir}\"\n");
+    let mounted = Arc::new(AtomicBool::new(true));
+    let mut harness = harness_disk(
+        &config,
+        None,
+        false,
+        Arc::new(|| Ok(Vec::new())),
+        Arc::new(|_| Ok(Vec::new())),
+        fake_disk(Arc::clone(&mounted)),
+    );
+    harness.plug(true);
+    let args = harness.next_start().await.spec.args.join(" ");
+    assert!(args.contains("-f tee"), "{args}");
+    assert!(
+        args.contains(&format!(
+            "|[f=segment:segment_format=mpegts:segment_time=600:onfail=ignore]{dir}/camera/"
+        )),
+        "{args}"
+    );
+    assert!(args.contains("[f=mpegts:mpegts_flags=+resend_headers:onfail=abort]srt://"));
+    let report = harness
+        .report_where(|r| r["streams"]["camera"]["recording"]["state"] == "recording")
+        .await;
+    let recording = &report["streams"]["camera"]["recording"];
+    assert!(
+        recording["files"]
+            .as_str()
+            .is_some_and(|f| f.starts_with("camera/") && f.ends_with("-*.ts"))
+    );
+    assert_eq!(report["recording"]["mounted"], true);
+    assert_eq!(report["recording"]["total_bytes"], 128_000_000_000_u64);
+
+    // Off through the desired state: the encoder restarts without its recording branch.
+    harness
+        .desired
+        .send(json!({"streams": {"camera": {"record": false}}}))
+        .expect("module running");
+    let args = harness.next_start().await.spec.args.join(" ");
+    assert!(
+        !args.contains("tee") && args.contains("-f mpegts"),
+        "{args}"
+    );
+    let report = harness
+        .report_where(|r| r["streams"]["camera"]["recording"]["state"] == "off")
+        .await;
+    assert_eq!(report["streams"]["camera"]["overrides"]["record"], false);
+
+    // A bad value is refused; null goes back to helios.toml's (on).
+    harness
+        .desired
+        .send(json!({"streams": {"camera": {"record": "yes"}}}))
+        .expect("module running");
+    harness
+        .report_where(|r| settings_of(&r["streams"]["camera"]["rejected"]) == ["record"])
+        .await;
+    harness
+        .desired
+        .send(json!({"streams": {"camera": {"record": null}}}))
+        .expect("module running");
+    assert!(
+        harness
+            .next_start()
+            .await
+            .spec
+            .args
+            .join(" ")
+            .contains("-f tee")
+    );
+
+    // The SSD goes: shown as unavailable, and the next run doesn't record.
+    mounted.store(false, Ordering::SeqCst);
+    let report = harness
+        .report_where(|r| r["recording"]["mounted"] == false)
+        .await;
+    assert_eq!(
+        report["streams"]["camera"]["recording"]["state"],
+        "recording"
+    );
+    harness
+        .desired
+        .send(json!({"streams": {"camera": {"state": "stopped"}}}))
+        .expect("module running");
+    harness
+        .report_where(|r| r["streams"]["camera"]["recording"]["state"] == "unavailable")
+        .await;
+    while harness.started.try_recv().is_ok() {}
+    harness
+        .desired
+        .send(json!({"streams": {"camera": {"state": "live"}}}))
+        .expect("module running");
+    assert!(
+        !harness
+            .next_start()
+            .await
+            .spec
+            .args
+            .join(" ")
+            .contains("tee")
+    );
+
+    // It comes back: the encoder restarts to record (fake encoders also restart when they
+    // stall, without recording until the next check).
+    mounted.store(true, Ordering::SeqCst);
+    while !harness
+        .next_start()
+        .await
+        .spec
+        .args
+        .join(" ")
+        .contains("-f tee")
+    {}
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recording_directory_that_cannot_be_made_leaves_the_stream_running() {
+    let config = CONFIG.replace(
+        "streamid = \"publish/live/backpack\"",
+        "streamid = \"publish/live/backpack\"\nrecord = true",
+    ) + "\n[recording]\ndir = \"/proc/helios-no-such-dir\"\n";
+    let mut harness = harness_disk(
+        &config,
+        None,
+        false,
+        Arc::new(|| Ok(Vec::new())),
+        Arc::new(|_| Ok(Vec::new())),
+        fake_disk(Arc::new(AtomicBool::new(true))),
+    );
+    harness.plug(true);
+    let args = harness.next_start().await.spec.args.join(" ");
+    assert!(!args.contains("tee"), "{args}");
+    let report = harness
+        .report_where(|r| r["streams"]["camera"]["recording"]["state"] == "error")
+        .await;
+    assert!(
+        report["streams"]["camera"]["recording"]["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("can't create /proc/helios-no-such-dir/camera"))
     );
     harness.stop().await;
 }

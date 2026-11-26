@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::ffmpeg::{self, CameraNodes, Progress, ProgressParser, Target};
+use super::ffmpeg::{self, CameraNodes, Progress, ProgressParser, Record, Target};
 use super::settings::{Profile, StreamSettings, parse_size};
 
 /// What encodes a stream (a profile's `encoder`).
@@ -178,7 +178,10 @@ pub(crate) fn plan(
     if let Some(passphrase) = &target.output.passphrase {
         args.extend(["-p".to_owned(), passphrase.clone()]);
     }
-    let mut files = vec![(pipeline_file.clone(), pipeline(profile, input))];
+    let mut files = vec![(
+        pipeline_file.clone(),
+        pipeline(profile, input, target.record),
+    )];
     let range_file = range_file(
         settings,
         backend,
@@ -267,8 +270,15 @@ pub(crate) fn encoders_dir(runtime_dir: &Path) -> PathBuf {
 
 /// The GStreamer pipeline: video and audio into MPEG-TS, to `appsink name=appsink` (which the
 /// encoder sends over SRT). The video encoder is `venc_bps` (Rockchip, bits per second) or
-/// `venc_kbps` (`x264enc`), whose bitrate the encoder sets and adapts.
-pub(crate) fn pipeline(profile: &Profile, input: Input<'_>) -> String {
+/// `venc_kbps` (`x264enc`), whose bitrate the encoder sets and adapts. A recording run tees the
+/// encoded video and audio, before the stream's muxer, into `splitmuxsink` (MPEG-TS segments
+/// split at keyframes) behind leaky queues, so a slow disk drops recorded data, never streamed.
+pub(crate) fn pipeline(profile: &Profile, input: Input<'_>, record: Option<Record<'_>>) -> String {
+    // Where encoded video and audio go: the stream's muxer, and the recording's tee if any.
+    let sink = |tee: &str| match record {
+        Some(_) => format!("tee name={tee} ! queue ! mux."),
+        None => "queue ! mux.".to_owned(),
+    };
     let hardware = profile.video.ends_with("_rkmpp");
     let scale = parse_size(&profile.scale);
     let fps = match input {
@@ -345,7 +355,8 @@ pub(crate) fn pipeline(profile: &Profile, input: Input<'_>) -> String {
         };
         lines.push(format!(
             "queue ! {element} name=venc_bps zero-copy-pkt=0 qp-max=51 gop={gop}{size} ! \
-             {parser} config-interval=-1 ! queue ! mux."
+             {parser} config-interval=-1 ! {}",
+            sink("vrec")
         ));
     } else {
         if let Some((width, height)) = scale {
@@ -355,12 +366,17 @@ pub(crate) fn pipeline(profile: &Profile, input: Input<'_>) -> String {
         }
         lines.push(format!(
             "queue ! x264enc name=venc_kbps speed-preset=veryfast tune=zerolatency \
-             key-int-max={gop} ! h264parse config-interval=-1 ! queue ! mux."
+             key-int-max={gop} ! h264parse config-interval=-1 ! {}",
+            sink("vrec")
         ));
     }
 
     // Audio.
-    let aac = "audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux.";
+    let aac = format!(
+        "audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! {}",
+        sink("arec")
+    );
+    let before = lines.len();
     if profile.audio != "none" {
         lines.push(String::new());
         match input {
@@ -373,12 +389,31 @@ pub(crate) fn pipeline(profile: &Profile, input: Input<'_>) -> String {
                 }
             }
             Input::Rtmp(_) if profile.audio == "copy" => {
-                lines.push("demux.audio ! queue ! aacparse ! queue ! mux.".to_owned());
+                lines.push(format!("demux.audio ! queue ! aacparse ! {}", sink("arec")));
             }
             Input::Rtmp(_) => lines.push(format!(
                 "demux.audio ! queue ! aacparse ! avdec_aac ! {aac}"
             )),
         }
+    }
+
+    let audio = lines[before..]
+        .iter()
+        .any(|line| line.contains("name=arec"));
+
+    if let Some(record) = record {
+        let leaky = "queue leaky=downstream max-size-buffers=0 max-size-bytes=0 \
+                     max-size-time=5000000000";
+        lines.push(String::new());
+        lines.push(format!("vrec. ! {leaky} ! rec.video"));
+        if audio {
+            lines.push(format!("arec. ! {leaky} ! rec.audio_0"));
+        }
+        lines.push(format!(
+            "splitmuxsink name=rec muxer=mpegtsmux max-size-time={} location={}",
+            u64::from(record.segment_s) * 1_000_000_000,
+            record.pattern.display()
+        ));
     }
 
     lines.push(String::new());
@@ -498,6 +533,7 @@ streamid = "publish/live/pattern"
             output,
             streamid: "publish/live/s",
             sender_port: port,
+            record: None,
         }
     }
 
@@ -669,7 +705,7 @@ streamid = "publish/live/pattern"
             video: "/dev/video2".into(),
             audio: Some("hw:1,0".into()),
         };
-        let pipeline = pipeline(profile, Input::Camera(&nodes));
+        let pipeline = pipeline(profile, Input::Camera(&nodes), None);
         assert!(pipeline.starts_with("v4l2src device=/dev/video2 ! image/jpeg,width=1920,height=1080,framerate=25/1 ! queue ! jpegdec !"), "{pipeline}");
         assert!(
             pipeline.contains("videoscale ! video/x-raw,width=640,height=360 !"),
@@ -685,7 +721,7 @@ streamid = "publish/live/pattern"
         let mut with_audio = profile.clone();
         with_audio.audio = "aac".into();
         with_audio.input.format = "yuyv422".into();
-        let pipeline = super::pipeline(&with_audio, Input::Camera(&nodes));
+        let pipeline = super::pipeline(&with_audio, Input::Camera(&nodes), None);
         assert!(
             pipeline.contains("video/x-raw,format=YUY2,width=1920"),
             "{pipeline}"
@@ -694,6 +730,71 @@ streamid = "publish/live/pattern"
             pipeline.contains("alsasrc device=hw:1,0 ! audioconvert ! audioresample ! voaacenc"),
             "{pipeline}"
         );
+    }
+
+    #[test]
+    fn tees_a_recording_into_splitmuxsink() {
+        let settings = settings(GST);
+        let profile = &settings.profiles["soft"];
+        let nodes = CameraNodes {
+            video: "/dev/video2".into(),
+            audio: Some("hw:1,0".into()),
+        };
+        let pattern = Path::new("/rec/cam/20261126T101500Z-%05d.ts");
+        let record = Some(Record {
+            pattern,
+            segment_s: 600,
+        });
+        // No audio: video only into the recording.
+        let pipeline = pipeline(profile, Input::Camera(&nodes), record);
+        assert!(
+            pipeline.contains("h264parse config-interval=-1 ! tee name=vrec ! queue ! mux."),
+            "{pipeline}"
+        );
+        let leaky = "queue leaky=downstream max-size-buffers=0 max-size-bytes=0 \
+                     max-size-time=5000000000";
+        assert!(
+            pipeline.contains(&format!("vrec. ! {leaky} ! rec.video\n")),
+            "{pipeline}"
+        );
+        assert!(!pipeline.contains("arec"), "{pipeline}");
+        assert!(
+            pipeline.contains(
+                "splitmuxsink name=rec muxer=mpegtsmux max-size-time=600000000000 \
+                 location=/rec/cam/20261126T101500Z-%05d.ts\n\nmpegtsmux name=mux"
+            ),
+            "{pipeline}"
+        );
+        // With AAC from the camera's microphone, and RTMP's audio copied.
+        let mut with_audio = profile.clone();
+        with_audio.audio = "aac".into();
+        let pipeline = super::pipeline(&with_audio, Input::Camera(&nodes), record);
+        assert!(
+            pipeline.contains("aacparse ! tee name=arec ! queue ! mux."),
+            "{pipeline}"
+        );
+        assert!(
+            pipeline.contains(&format!("arec. ! {leaky} ! rec.audio_0\n")),
+            "{pipeline}"
+        );
+        with_audio.audio = "copy".into();
+        let pipeline = super::pipeline(&with_audio, Input::Rtmp("rtmp://x/live/ingest"), record);
+        assert!(
+            pipeline.contains("demux.audio ! queue ! aacparse ! tee name=arec ! queue ! mux."),
+            "{pipeline}"
+        );
+        // And a plan passes it through.
+        let mut target = target(&settings.outputs["open"], Some(6000));
+        target.record = record;
+        let plan = plan(
+            &settings,
+            "cam",
+            profile,
+            target,
+            Input::Camera(&nodes),
+            Range::new(profile, 3000, None),
+        );
+        assert!(plan.files[0].1.contains("splitmuxsink"));
     }
 
     #[test]
