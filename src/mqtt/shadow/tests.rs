@@ -425,8 +425,12 @@ async fn passes_desired_state_to_the_module() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(first, json!({"x": 1}));
-    assert_eq!(second, json!({"x": 2}));
+    assert_eq!(
+        first,
+        json!({"x": 1, "$full": true}),
+        "a get is the whole desired state"
+    );
+    assert_eq!(second, json!({"x": 2}), "a delta isn't marked");
 }
 
 #[tokio::test]
@@ -448,7 +452,10 @@ async fn reads_the_shadow_again_for_a_desired_request_made_while_connected() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(state, json!({"idle": {"template": "status"}}));
+    assert_eq!(
+        state,
+        json!({"idle": {"template": "status"}, "$full": true})
+    );
 }
 
 #[tokio::test]

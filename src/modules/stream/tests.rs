@@ -2570,6 +2570,124 @@ async fn the_desired_state_sets_a_streams_profile_source_and_destination() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_delta_changing_part_of_a_source_applies_the_whole_source() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
+    let first = harness.next_start().await;
+    // The full read: the source is a 640x360 test pattern.
+    harness
+        .desired
+        .send(json!({"streams": {"pattern": {
+            "state": "live", "source": {"type": "test", "size": "640x360", "fps": 25},
+        }}, "$full": true}))
+        .expect("module running");
+    let second = harness.next_start().await;
+    assert!(first.stopped.load(Ordering::SeqCst));
+    assert!(
+        second
+            .spec
+            .args
+            .join(" ")
+            .contains("testsrc2=size=640x360:rate=25")
+    );
+
+    // AWS IoT's delta holds only what changed: no `type`.
+    harness.desire(json!({"source": {"size": "960x540", "fps": 30}}));
+    let third = harness.next_start().await;
+    assert!(second.stopped.load(Ordering::SeqCst));
+    let args = third.spec.args.join(" ");
+    assert!(args.contains("testsrc2=size=960x540:rate=30"), "{args}");
+    let reported = harness
+        .report_where(|r| r["streams"]["pattern"]["overrides"]["source"]["size"] == "960x540")
+        .await;
+    let status = &reported["streams"]["pattern"];
+    assert_eq!(
+        status["overrides"]["source"],
+        json!({"type": "test", "size": "960x540", "fps": 30})
+    );
+    assert!(
+        !settings_of(&status["rejected"]).contains(&"source"),
+        "the partial source isn't refused: {}",
+        status["rejected"]
+    );
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_read_replaces_desired_state_seen_before() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
+    let _first = harness.next_start().await;
+    harness
+        .desired
+        .send(json!({"streams": {"pattern": {
+            "state": "live", "source": {"type": "camera", "video": "usb:1-1.3", "audio": "usb:1-1.3"},
+        }}, "$full": true}))
+        .expect("module running");
+    // While Helios was offline the cloud switched the source to the test pattern (clearing the
+    // camera's keys); after reconnecting, the full read has only the new source.
+    harness
+        .desired
+        .send(json!({"streams": {"pattern": {
+            "state": "live", "source": {"type": "test", "size": "640x360", "fps": 25},
+        }}, "$full": true}))
+        .expect("module running");
+    let started = harness.next_start().await;
+    assert!(
+        started
+            .spec
+            .args
+            .join(" ")
+            .contains("testsrc2=size=640x360:rate=25"),
+        "the camera's video and audio didn't survive into the test source"
+    );
+    let status = harness.status_of("pattern").await;
+    assert!(
+        !settings_of(&status["rejected"]).contains(&"source"),
+        "{}",
+        status["rejected"]
+    );
+    harness.stop().await;
+}
+
+#[test]
+fn merges_desired_deltas_like_the_shadow_service() {
+    let mut seen = Value::Null;
+    super::merge_desired(
+        &mut seen,
+        &json!({"streams": {"a": {"source": {"type": "camera", "video": "v", "audio": "a"}, "state": "live"}}, "$full": true}),
+    );
+    super::merge_desired(
+        &mut seen,
+        &json!({"streams": {"a": {"source": {"type": "test", "video": null, "audio": null, "size": "640x360"}}}}),
+    );
+    assert_eq!(
+        seen,
+        json!({"streams": {"a": {"source": {"type": "test", "size": "640x360"}, "state": "live"}}})
+    );
+    super::merge_desired(
+        &mut seen,
+        &json!({"streams": {"a": {"state": null}, "b": {"profile": {"x": null, "y": 1}}}}),
+    );
+    assert_eq!(
+        seen,
+        json!({"streams": {"a": {"source": {"type": "test", "size": "640x360"}}, "b": {"profile": {"y": 1}}}})
+    );
+    super::merge_desired(&mut seen, &json!({"streams": {"b": {"profile": "plain"}}}));
+    assert_eq!(seen["streams"]["b"]["profile"], "plain");
+    assert_eq!(
+        super::whole(
+            &json!({"source": {"size": "1x1"}, "profile": null, "gone": 1}),
+            &seen["streams"]["a"]
+        ),
+        json!({"source": {"type": "test", "size": "640x360"}, "profile": null, "gone": null})
+    );
+    assert_eq!(super::whole(&Value::Null, &seen), Value::Null);
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_srtla_destination_runs_its_own_sender() {
     let runtime = tempfile::tempdir().expect("runtime directory");
     let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
