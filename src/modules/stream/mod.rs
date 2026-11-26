@@ -437,6 +437,9 @@ struct Streams<'a> {
     formats_rx: mpsc::UnboundedReceiver<(String, std::io::Result<Vec<v4l2::Format>>)>,
     /// Whether the last report left the formats out (logged once, when that starts).
     formats_left_out: bool,
+    /// Streams desired state named that the config doesn't have, each logged once (Helios
+    /// removes them from the shadow).
+    unknown_desired: BTreeSet<String>,
 }
 
 impl<'a> Streams<'a> {
@@ -502,6 +505,7 @@ impl<'a> Streams<'a> {
             formats_tx,
             formats_rx,
             formats_left_out: false,
+            unknown_desired: BTreeSet::new(),
         }
     }
 
@@ -1373,7 +1377,9 @@ impl<'a> Streams<'a> {
         };
         for (id, desired) in streams {
             let Some(index) = self.entries.iter().position(|entry| entry.id == *id) else {
-                tracing::warn!(stream = %id, "desired state for an unknown stream");
+                if !desired.is_null() && self.unknown_desired.insert(id.clone()) {
+                    tracing::warn!(stream = %id, "desired state for a stream helios.toml doesn't have");
+                }
                 continue;
             };
             self.desired_settings(index, desired, ctx);
