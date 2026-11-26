@@ -926,11 +926,18 @@ impl<'a> Streams<'a> {
                 "waiting for output {output}: {}",
                 self.senders.state(output, now).as_str()
             );
+            let problem = self.senders.problem(output, now);
             let entry = &mut self.entries[index];
             if entry.state != State::Reconnecting {
                 entry.set_state(State::Starting);
             }
-            entry.last_error.get_or_insert(waiting);
+            match problem {
+                // A stuck sender says why, replacing the plain "waiting" note.
+                Some(problem) => entry.last_error = Some(format!("{waiting} ({problem})")),
+                None => {
+                    entry.last_error.get_or_insert(waiting);
+                }
+            }
             return;
         }
         self.start_job(index, ctx);

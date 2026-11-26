@@ -1695,6 +1695,61 @@ async fn a_sender_that_exits_is_restarted() {
     harness.stop().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_sender_no_link_registers_with_says_why() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = SRTLA.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness_with(
+        &config,
+        None,
+        false,
+        Arc::new(|| Ok(vec![address("wlan0", [10, 0, 2, 2])])),
+    );
+    let sender = harness.next_start().await;
+    assert!(
+        sender
+            .spec
+            .env
+            .contains(&("RUST_LOG".to_owned(), "warn".to_owned())),
+        "srtla_send's warnings are what explain a stuck link"
+    );
+    // What srtla_send printed when the receiver resolved to IPv6 (2026-11-25), colours and all.
+    sender.send(JobEvent::Stderr(
+        "\u{1b}[2m2026-11-25T23:40:23.925784Z\u{1b}[0m \u{1b}[33m WARN\u{1b}[0m Failed to send REG1 to \
+         uplink #0: Os { code: 97 }"
+            .into(),
+    ));
+    sender.send(JobEvent::Stdout("still trying".into()));
+    tokio::time::advance(Duration::from_secs(16)).await;
+    let reported = harness
+        .report_where(|r| r["outputs"]["bond"]["last_error"].is_string())
+        .await;
+    let error = reported["outputs"]["bond"]["last_error"]
+        .as_str()
+        .expect("error");
+    assert!(
+        error.starts_with("no link has registered in 1")
+            && error.ends_with("Failed to send REG1 to uplink #0: Os { code: 97 }"),
+        "the last warning, without colour codes: {error}"
+    );
+    assert!(!error.contains('\u{1b}'), "{error}");
+    assert_eq!(reported["outputs"]["bond"]["state"], "starting");
+    let stream = harness
+        .report_where(|r| {
+            r["streams"]["pattern"]["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("no link has registered"))
+        })
+        .await;
+    assert!(
+        stream["streams"]["pattern"]["last_error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("waiting for output bond: starting (no link")),
+        "{stream}"
+    );
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn no_uplink_addresses_leave_the_output_waiting() {
     let runtime = tempfile::tempdir().expect("runtime directory");
