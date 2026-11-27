@@ -3,10 +3,11 @@
 //! Streams read USB cameras (from the usb module, LLD 5), RTMP publishers (`rtmp-ingest`, LLD 4
 //! section 4: nginx under systemd, with its publish hook and statistics page in [`rtmp`]) or a
 //! test pattern, and go to `direct` SRT outputs or `srtla` ones through `srtla_send` (section 5).
-//! Each configured stream is `live` (run whenever its input is there) or `stopped`, from config,
-//! the `stream` shadow's desired state, or `stream.start` / `stream.stop`. The desired state can
-//! also change a stream's source, profile, destination and ceiling percentage (HLD section
-//! 7.3.7), checked as `helios.toml` is; what it refuses is reported in the stream's `rejected`. The module starts
+//! Each configured stream is `live` (run whenever its input is there) or `stopped`, from config
+//! or `stream.start` / `stream.stop`; `stream.update` changes its source, profile, destination,
+//! bitrate, ceiling percentage and recording, checked as `helios.toml` is. Writes are commands
+//! only: the `stream` shadow is reported-only (the page "Helios - State Management: Tenets and
+//! Practices"). The daemon saves the overrides and gives them back at startup. The module starts
 //! ffmpeg when a live stream's input is there, reads its `-progress` output, restarts it with
 //! backoff when it exits or stalls, and stops it when the input goes or the stream is stopped.
 //!
@@ -46,7 +47,6 @@ use tokio::time::Instant;
 use crate::backoff::Backoff;
 use crate::modules::usb::{UsbHandle, UsbSnapshot};
 use crate::mqtt::envelope::timestamp;
-use crate::mqtt::shadow::FULL_DESIRED;
 use crate::router::{Outcome, codes};
 
 use super::{Module, ModuleContext, ModuleError, ModuleFuture};
@@ -87,7 +87,7 @@ const ENCODER_REPORT: Duration = Duration::from_secs(60);
 /// yet (nginx asks before it lists the publisher).
 const PUBLISH_GRACE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
 
-/// What a command or the desired state does to a stream's bitrate.
+/// What a command does to a stream's bitrate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BitrateChange {
     Keep,
@@ -168,6 +168,8 @@ pub struct StreamModule {
     /// The net module's view of the uplinks (kinds, metrics, public addresses), from Helios over
     /// the control socket, for standby (LLD 3, section 3.5.1). Empty until Helios sends it.
     uplinks: tokio::sync::watch::Receiver<standby::View>,
+    /// The overrides the daemon saved (`{"streams": {"<id>": ...}}`), applied at startup.
+    saved: Option<Value>,
 }
 
 /// Where uplink addresses come from: rtnetlink, or a fake in tests.
@@ -200,7 +202,15 @@ impl StreamModule {
             formats: Arc::new(v4l2::formats),
             disk: Arc::new(recording::check),
             uplinks: tokio::sync::watch::channel(standby::View::new()).1,
+            saved: None,
         }
+    }
+
+    /// Starts with the overrides the daemon saved.
+    #[must_use]
+    pub(crate) fn with_saved(mut self, saved: Option<Value>) -> Self {
+        self.saved = saved;
+        self
     }
 
     /// Follows the uplink view the daemon receives from Helios.
@@ -228,6 +238,7 @@ impl StreamModule {
             formats: Arc::new(|_| Ok(Vec::new())),
             disk: Arc::new(|_| recording::Disk::default()),
             uplinks: tokio::sync::watch::channel(standby::View::new()).1,
+            saved: None,
         }
     }
 
@@ -285,38 +296,27 @@ impl Running {
     }
 }
 
-/// A desired value the stream refused, for the shadow's `rejected`.
-#[derive(Debug, Clone)]
-struct Rejected {
-    /// What was asked, so the same value sent again keeps its first time.
-    value: Value,
-    reason: String,
-    at: SystemTime,
-}
-
 /// One stream's state.
 struct Entry {
     id: String,
     /// The stream as `helios.toml` defines it.
     configured: Stream,
-    /// The stream as it runs: `configured` with the desired state's source, profile and
+    /// The stream as it runs: `configured` with `stream.update`'s source, profile and
     /// destination (`output` is then `stream:<id>`, and `streamid` the destination's).
     config: Stream,
-    /// A destination set through the shadow, and the output it makes.
+    /// A destination set by `stream.update`, and the output it makes.
     destination: Option<(Destination, Output)>,
-    /// A `source_ceiling_percent` set through the shadow.
+    /// A `source_ceiling_percent` set by `stream.update`.
     ceiling_override: Option<u32>,
-    /// `record` set through the shadow.
+    /// `record` set by `stream.update`.
     record_override: Option<bool>,
     /// Why the last run that should have recorded couldn't.
     record_error: Option<String>,
-    /// Desired values refused, by setting: `source`, `profile`, `destination`,
-    /// `source_ceiling_percent`, `record`, `bitrate` or `state`.
-    rejected: BTreeMap<&'static str, Rejected>,
+    /// Whether the stream should be live (`stream.start`, `stream.stop`; reported `desired`).
     desired_live: bool,
     /// The bitrate in use: the override if there is one, else the profile's.
     bitrate_kbps: u32,
-    /// A bitrate set by `stream.start` or the desired state, which outlasts restarts; `None`
+    /// A bitrate set by `stream.start` or `stream.update`, which outlasts restarts; `None`
     /// follows the profile, so a changed `bitrate_kbps` in the config applies.
     bitrate_override: Option<u32>,
     /// An adaptive RTMP stream's ceiling from its camera's bitrate, once known.
@@ -345,7 +345,7 @@ struct Entry {
 }
 
 impl Entry {
-    /// Whether the stream should record: the desired state's `record`, else `helios.toml`'s.
+    /// Whether the stream should record: `stream.update`'s `record`, else `helios.toml`'s.
     fn record(&self) -> bool {
         self.record_override.unwrap_or(self.configured.record)
     }
@@ -404,7 +404,7 @@ impl Entry {
         }
     }
 
-    /// Its profile, with the ceiling percentage set through the shadow.
+    /// Its profile, with the ceiling percentage set by `stream.update`.
     fn profile(&self, settings: &StreamSettings) -> Option<Profile> {
         let mut profile = settings.profiles.get(&self.config.profile)?.clone();
         if let Some(percent) = self.ceiling_override {
@@ -431,13 +431,6 @@ impl Entry {
         if let (Some(source), Value::Object(camera)) = (source.as_object_mut(), &self.camera) {
             source.extend(camera.clone());
         }
-        let rejected: Vec<Value> = self
-            .rejected
-            .iter()
-            .map(|(setting, rejected)| {
-                json!({"setting": setting, "reason": rejected.reason, "at": timestamp(rejected.at)})
-            })
-            .collect();
         // Every key, null when not overridden: the shadow only removes a key set to null.
         let overrides = json!({
             "source": (self.config.source != self.configured.source)
@@ -463,7 +456,6 @@ impl Entry {
             "destination": self.destination_url(settings),
             "source_ceiling_percent": self.profile(settings).map(|p| p.source_ceiling_percent),
             "last_error": self.last_error.as_ref().or(self.unusable.as_ref()),
-            "rejected": rejected,
             "overrides": overrides,
         });
         if with_log {
@@ -488,7 +480,7 @@ struct Streams<'a> {
     addresses: Vec<Address>,
     addresses_at: Option<Instant>,
     ingest: Ingest,
-    /// ffmpeg's encoders, once listed: a profile set through the shadow must find its own.
+    /// ffmpeg's encoders, once listed: a profile set by `stream.update` must find its own.
     encoders: Option<BTreeSet<String>>,
     /// The usb module's latest snapshot, for `inputs`.
     devices: Arc<UsbSnapshot>,
@@ -499,13 +491,6 @@ struct Streams<'a> {
     formats_rx: mpsc::UnboundedReceiver<(String, std::io::Result<Vec<v4l2::Format>>)>,
     /// Whether the last report left the formats out (logged once, when that starts).
     formats_left_out: bool,
-    /// Streams desired state named that the config doesn't have, each logged once (Helios
-    /// removes them from the shadow).
-    unknown_desired: BTreeSet<String>,
-    /// The whole desired state seen so far: the first full read, with each delta merged in. A
-    /// delta holds only what changed, down to nested keys (a source's `size` without its
-    /// `type`), so settings are applied from this.
-    desired_seen: Value,
     /// The recordings' filesystem as last checked, when, and whether a check is running.
     disk: recording::Disk,
     disk_at: Option<Instant>,
@@ -528,7 +513,6 @@ impl<'a> Streams<'a> {
                 ceiling_override: None,
                 record_override: None,
                 record_error: None,
-                rejected: BTreeMap::new(),
                 desired_live: config.desired == "live",
                 bitrate_kbps: module
                     .settings
@@ -580,8 +564,6 @@ impl<'a> Streams<'a> {
             formats_tx,
             formats_rx,
             formats_left_out: false,
-            unknown_desired: BTreeSet::new(),
-            desired_seen: Value::Null,
             disk: recording::Disk::default(),
             disk_at: None,
             disk_checking: false,
@@ -915,7 +897,6 @@ impl<'a> Streams<'a> {
         let mut stats = tokio::time::interval(settings.stats_interval());
         stats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut commands_open = true;
-        let mut desired_open = true;
         let (ingest_tx, mut ingest_rx) = mpsc::unbounded_channel();
         let ingest_cancel = ctx.cancel.child_token();
         let ingest_task = settings.rtmp_ingest.enabled.then(|| {
@@ -934,10 +915,10 @@ impl<'a> Streams<'a> {
             .await
             .unwrap_or_default();
         self.disk_at = Some(Instant::now());
-        // Desired state queued before the start (the daemon's saved state) applies before the
-        // first pass, so a stream saved as stopped doesn't start for a moment.
-        while let Ok(state) = ctx.desired.try_recv() {
-            self.desired(&state, &ctx);
+        // The saved overrides apply before the first pass, so a stream saved as stopped doesn't
+        // start for a moment.
+        if let Some(saved) = &module.saved {
+            self.resume(saved, &ctx);
         }
         loop {
             let devices = snapshot.borrow_and_update().clone();
@@ -960,10 +941,6 @@ impl<'a> Streams<'a> {
                         pending.respond(outcome);
                     }
                     None => commands_open = false,
-                },
-                desired = ctx.desired.recv(), if desired_open => match desired {
-                    Some(state) => self.desired(&state, &ctx),
-                    None => desired_open = false,
                 },
                 changed = snapshot.changed() => {
                     if changed.is_err() {
@@ -991,7 +968,7 @@ impl<'a> Streams<'a> {
         Ok(())
     }
 
-    /// Brings one stream in line with its desired state, its camera and its job.
+    /// Brings one stream in line with whether it should be live, its camera and its job.
     fn reconcile(
         &mut self,
         index: usize,
@@ -1415,65 +1392,18 @@ impl<'a> Streams<'a> {
                 format!("unknown stream command {name}"),
             );
         }
-        let Some(id) = id else {
-            return Outcome::error(codes::INVALID_MESSAGE, "stream_id is required");
+        let id = match update::StreamArgs::parse(name, args) {
+            Ok(args) => args.stream_id,
+            Err(why) => return Outcome::error(codes::INVALID_MESSAGE, why),
         };
         let Some(index) = self.entries.iter().position(|entry| entry.id == id) else {
             return Outcome::error(codes::INVALID_MESSAGE, format!("no stream {id:?}"));
         };
-        let Ok(bitrate) = self.bitrate_change(index, args.get("bitrate_kbps")) else {
-            return Outcome::error(
-                codes::INVALID_MESSAGE,
-                "bitrate_kbps is outside the profile's limits",
-            );
-        };
-        if name == "start" {
-            self.set_live(index, true, bitrate);
-        } else {
-            self.set_live(index, false, BitrateChange::Keep);
-        }
+        self.set_live(index, name == "start", BitrateChange::Keep);
         Outcome::Ok(json!({"status": self.entries[index].status(&self.module.settings, false)}))
     }
 
-    fn bitrate_allowed(&self, index: usize, bitrate: u32) -> bool {
-        self.module
-            .settings
-            .profiles
-            .get(&self.entries[index].config.profile)
-            .is_some_and(|profile| {
-                profile.video != "copy"
-                    && (profile.min_bitrate_kbps..=profile.max_bitrate_kbps).contains(&bitrate)
-            })
-    }
-
-    /// What a `bitrate_kbps` value asks for: absent, no change; `null` or the profile's own
-    /// bitrate, back to the profile; another value within the profile's limits, an override.
-    fn bitrate_change(&self, index: usize, value: Option<&Value>) -> Result<BitrateChange, ()> {
-        let profile = self
-            .module
-            .settings
-            .profiles
-            .get(&self.entries[index].config.profile);
-        match value {
-            None => Ok(BitrateChange::Keep),
-            Some(Value::Null) => Ok(BitrateChange::Profile),
-            Some(value) => {
-                let bitrate = value
-                    .as_u64()
-                    .and_then(|v| u32::try_from(v).ok())
-                    .ok_or(())?;
-                if profile.is_some_and(|profile| profile.bitrate_kbps == bitrate) {
-                    Ok(BitrateChange::Profile)
-                } else if self.bitrate_allowed(index, bitrate) {
-                    Ok(BitrateChange::Override(bitrate))
-                } else {
-                    Err(())
-                }
-            }
-        }
-    }
-
-    /// The desired state from a command or the shadow. Starting a failed stream gives it a new
+    /// Live or stopped, from a command or the saved overrides. Starting a failed stream gives it a new
     /// chance; a new bitrate restarts a running job.
     fn set_live(&mut self, index: usize, live: bool, bitrate: BitrateChange) {
         let entry = &mut self.entries[index];
@@ -1543,180 +1473,6 @@ impl<'a> Streams<'a> {
         }
     }
 
-    /// The `stream` shadow's desired state (HLD section 7.3.7): `{"streams": {"<id>": {...}}}`
-    /// with `state`, `bitrate_kbps` (an override, `null` for the profile's), and `source`,
-    /// `profile`, `destination` and `source_ceiling_percent` (`null` for `helios.toml`'s). Each
-    /// member present is applied in that order (settings first, so a bitrate is checked against
-    /// the new profile) or refused, and a refusal is reported in the stream's `rejected` until a
-    /// value for that setting is accepted.
-    fn desired(&mut self, state: &Value, ctx: &ModuleContext) {
-        // A full read (from the shadow's `get`, or the daemon's saved state) replaces what was
-        // seen; a delta merges into it.
-        if state.get(FULL_DESIRED) == Some(&Value::Bool(true)) {
-            self.desired_seen = Value::Null;
-        }
-        let Some(streams) = state.get("streams").and_then(Value::as_object) else {
-            return;
-        };
-        merge_desired(&mut self.desired_seen, state);
-        for (id, changed) in streams {
-            // What the delta names, with each value whole from everything seen so far.
-            let desired = &whole(changed, &self.desired_seen["streams"][id]);
-            let Some(index) = self.entries.iter().position(|entry| entry.id == *id) else {
-                if !desired.is_null() && self.unknown_desired.insert(id.clone()) {
-                    tracing::warn!(stream = %id, "desired state for a stream helios.toml doesn't have");
-                }
-                continue;
-            };
-            self.desired_settings(index, desired, ctx);
-            let value = desired.get("bitrate_kbps");
-            let bitrate = match self.bitrate_change(index, value) {
-                Ok(change) => {
-                    if value.is_some() {
-                        self.accept(index, "bitrate");
-                    }
-                    change
-                }
-                Err(()) => {
-                    let value = value.cloned().unwrap_or_default();
-                    let reason = "bitrate_kbps is outside the profile's limits".to_owned();
-                    self.reject(index, "bitrate", &value, reason);
-                    BitrateChange::Keep
-                }
-            };
-            match desired.get("state") {
-                Some(value) if value == "live" || value == "stopped" => {
-                    self.accept(index, "state");
-                    self.set_live(index, value == "live", bitrate);
-                }
-                Some(value) => {
-                    let reason = "state must be live or stopped".to_owned();
-                    self.reject(index, "state", value, reason);
-                }
-                None if bitrate != BitrateChange::Keep => {
-                    let live = self.entries[index].desired_live;
-                    self.set_live(index, live, bitrate);
-                }
-                None => {}
-            }
-        }
-    }
-
-    /// The desired `profile`, `source`, `destination` and `source_ceiling_percent`. A changed
-    /// source, profile or destination stops the job; the next pass starts it again with them.
-    fn desired_settings(&mut self, index: usize, desired: &Value, ctx: &ModuleContext) {
-        let mut reconfigured = false;
-        if let Some(value) = desired.get("profile") {
-            let entry = &self.entries[index];
-            let wanted = match value {
-                Value::Null => Ok(entry.configured.profile.clone()),
-                Value::String(name) => Ok(name.clone()),
-                _ => Err("profile must be a profile name".to_owned()),
-            };
-            let checked = wanted.and_then(|name| {
-                let mut candidate = entry.config.clone();
-                candidate.profile = name;
-                self.check(index, &candidate).map(|()| candidate)
-            });
-            match checked {
-                Ok(candidate) => {
-                    self.accept(index, "profile");
-                    if candidate.profile != self.entries[index].config.profile {
-                        self.entries[index].config.profile = candidate.profile;
-                        reconfigured = true;
-                    }
-                }
-                Err(reason) => self.reject(index, "profile", value, reason),
-            }
-        }
-        if let Some(value) = desired.get("source") {
-            let entry = &self.entries[index];
-            let wanted = match value {
-                Value::Null => Ok(entry.configured.source.clone()),
-                value => serde_json::from_value::<Source>(value.clone())
-                    .map_err(|error| format!("source: {error}")),
-            };
-            let checked = wanted.and_then(|source| {
-                let mut candidate = entry.config.clone();
-                candidate.source = source;
-                self.check(index, &candidate).map(|()| candidate)
-            });
-            match checked {
-                Ok(candidate) => {
-                    self.accept(index, "source");
-                    if candidate.source != self.entries[index].config.source {
-                        self.entries[index].config.source = candidate.source;
-                        reconfigured = true;
-                    }
-                }
-                Err(reason) => self.reject(index, "source", value, reason),
-            }
-        }
-        if let Some(value) = desired.get("destination") {
-            match self.destination_for(index, value) {
-                Ok(destination) => {
-                    self.accept(index, "destination");
-                    let url = |d: &Option<(Destination, Output)>| d.as_ref().map(|(d, _)| d.url());
-                    if url(&destination) != url(&self.entries[index].destination) {
-                        self.set_destination(index, destination);
-                        reconfigured = true;
-                    }
-                }
-                Err(reason) => self.reject(index, "destination", value, reason),
-            }
-        }
-        if let Some(value) = desired.get("source_ceiling_percent") {
-            let wanted = match value {
-                Value::Null => Ok(None),
-                value => value
-                    .as_u64()
-                    .and_then(|percent| u32::try_from(percent).ok())
-                    .filter(|percent| *percent <= 400)
-                    .map(Some)
-                    .ok_or_else(|| "source_ceiling_percent must be 0 to 400".to_owned()),
-            };
-            match wanted {
-                Ok(percent) => {
-                    self.accept(index, "source_ceiling_percent");
-                    if percent != self.entries[index].ceiling_override {
-                        self.set_ceiling(index, percent);
-                    }
-                }
-                Err(reason) => self.reject(index, "source_ceiling_percent", value, reason),
-            }
-        }
-        if let Some(value) = desired.get("record") {
-            match value {
-                Value::Null | Value::Bool(_) => {
-                    self.accept(index, "record");
-                    let entry = &mut self.entries[index];
-                    let before = entry.record();
-                    entry.record_override = value.as_bool();
-                    if entry.record() != before {
-                        tracing::info!(stream = %entry.id, record = entry.record(),
-                            "recording switched by the desired state");
-                        entry.record_error = None;
-                        // The encoder starts again with or without its recording branch.
-                        if entry.job.is_some() {
-                            self.stop_job(index);
-                        }
-                    }
-                }
-                value => {
-                    let reason = "record must be true or false".to_owned();
-                    self.reject(index, "record", value, reason);
-                }
-            }
-        }
-        if reconfigured {
-            tracing::info!(
-                stream = %self.entries[index].id, profile = %self.entries[index].config.profile,
-                output = %self.entries[index].config.output, "new settings from the desired state"
-            );
-            self.reconfigure(index, ctx);
-        }
-    }
-
     /// After a change of source, profile or destination: the job stops (the next pass starts it
     /// with the new settings) and what came from the old ones is forgotten.
     fn reconfigure(&mut self, index: usize, ctx: &ModuleContext) {
@@ -1778,20 +1534,14 @@ impl<'a> Streams<'a> {
         Ok(())
     }
 
-    /// The destination a desired `destination` asks for: `None` for the configured one (`null`,
-    /// or a URL equal to it).
+    /// The destination `url` asks for: `None` for the configured one (a URL equal to it).
     fn destination_for(
         &self,
         index: usize,
-        value: &Value,
+        url: &str,
     ) -> Result<Option<(Destination, Output)>, String> {
         let settings = &self.module.settings;
         let entry = &self.entries[index];
-        let url = match value {
-            Value::Null => return Ok(None),
-            Value::String(url) => url,
-            _ => return Err("destination must be an srt:// or srtla:// URL".into()),
-        };
         let destination = Destination::parse(url)?;
         let Some(base) = settings.outputs.get(&entry.configured.output) else {
             return Err(format!("no output {:?}", entry.configured.output));
@@ -1849,31 +1599,6 @@ impl<'a> Streams<'a> {
         if entry.source_ceiling.is_none() && entry.job.is_some() && !self.reload_bitrate(index) {
             self.stop_job(index);
         }
-    }
-
-    /// Records a refused desired value; the same value again keeps its first time.
-    fn reject(&mut self, index: usize, setting: &'static str, value: &Value, reason: String) {
-        let entry = &mut self.entries[index];
-        if entry
-            .rejected
-            .get(setting)
-            .is_some_and(|rejected| rejected.value == *value)
-        {
-            return;
-        }
-        tracing::warn!(stream = %entry.id, setting, %reason, "desired setting refused");
-        entry.rejected.insert(
-            setting,
-            Rejected {
-                value: value.clone(),
-                reason,
-                at: SystemTime::now(),
-            },
-        );
-    }
-
-    fn accept(&mut self, index: usize, setting: &str) {
-        self.entries[index].rejected.remove(setting);
     }
 
     fn stats(&self, ctx: &ModuleContext) {
@@ -2125,53 +1850,6 @@ fn resolve(source: &Source, devices: &UsbSnapshot) -> (Option<CameraNodes>, Valu
         audio,
     };
     (Some(nodes), report)
-}
-
-/// Merges a desired-state delta into `seen`, as the shadow service does: objects merge key by
-/// key, a `null` removes the key, anything else replaces it.
-pub(crate) fn merge_desired(seen: &mut Value, delta: &Value) {
-    match (seen, delta) {
-        (Value::Object(seen), Value::Object(delta)) => {
-            for (key, value) in delta {
-                if key == FULL_DESIRED {
-                    continue;
-                }
-                if value.is_null() {
-                    seen.remove(key);
-                } else if let Some(existing) = seen.get_mut(key) {
-                    merge_desired(existing, value);
-                } else {
-                    let mut fresh = Value::Null;
-                    merge_desired(&mut fresh, value);
-                    seen.insert(key.clone(), fresh);
-                }
-            }
-        }
-        (seen, delta) => {
-            // An object replaces a non-object; its own nulls are dropped as it goes in.
-            if let Value::Object(_) = delta {
-                *seen = Value::Object(serde_json::Map::new());
-                merge_desired(seen, delta);
-            } else {
-                *seen = delta.clone();
-            }
-        }
-    }
-}
-
-/// `changed` (a stream's entry in a delta) with each key's value taken whole from `seen` (the
-/// merged desired state for that stream), so `{"source": {"size": …}}` becomes the whole source.
-/// A key `seen` no longer has (set to `null`) stays `null`.
-pub(crate) fn whole(changed: &Value, seen: &Value) -> Value {
-    let Value::Object(changed) = changed else {
-        return changed.clone();
-    };
-    Value::Object(
-        changed
-            .keys()
-            .map(|key| (key.clone(), seen.get(key).cloned().unwrap_or(Value::Null)))
-            .collect(),
-    )
 }
 
 #[cfg(test)]

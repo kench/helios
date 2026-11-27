@@ -3,10 +3,12 @@
 //!
 //! The engine is the stream module unchanged, given detached MQTT and shadow handles: its events
 //! and shadow reports come back here and go to the connected client (Helios) over the control
-//! socket, or wait in a buffer while none is connected. Commands and desired state come the
-//! other way. The daemon runs its own usb monitor for cameras, which reports nowhere.
+//! socket, or wait in a buffer while none is connected. Commands come the other way. The daemon
+//! saves the streams' overrides (what commands set: live or stopped, a bitrate, settings) in
+//! `<state_dir>/overrides.json` and gives them back to the engine at startup. The daemon runs its
+//! own usb monitor for cameras, which reports nowhere.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -77,24 +79,20 @@ impl Daemon {
 
         // The engine, with its outputs coming back here.
         let engine_cancel = cancel.child_token();
-        let (ctx, mut requests, mut reports, commands, desired) =
+        let (ctx, mut requests, mut reports, commands) =
             detached_context(&self.sysfs, engine_cancel.clone());
-        let state_file = self.settings.state_dir.join("desired.json");
-        if let Some(mut saved) = load_desired(&state_file) {
-            tracing::info!("resuming the saved desired state");
-            // The whole desired state, as a shadow `get` gives it.
-            if let Value::Object(object) = &mut saved {
-                object.insert(crate::mqtt::shadow::FULL_DESIRED.into(), Value::Bool(true));
-            }
-            let _ = desired.send(saved);
+        let state_file = self.settings.state_dir.join(OVERRIDES);
+        let old_file = self.settings.state_dir.join(OLD_OVERRIDES);
+        let saved = load_overrides(&state_file, &old_file);
+        if saved.is_some() {
+            tracing::info!("resuming the saved overrides");
         }
         let pending_restart = self.settings.runtime_dir.join("restart-pending");
         // The uplink view Helios sends (`uplinks`), for standby (LLD 3, section 3.5.1).
         let (uplinks, uplinks_view) = tokio::sync::watch::channel(super::standby::View::new());
-        // The streams helios.toml defines: desired state for any other is answered as unknown, so
-        // Helios can remove it from the shadow.
-        let configured: BTreeSet<String> = self.settings.streams.keys().cloned().collect();
-        let engine = (self.engine)(self.settings, usb).with_uplinks(uplinks_view);
+        let engine = (self.engine)(self.settings, usb)
+            .with_uplinks(uplinks_view)
+            .with_saved(saved);
         let engine_task = tokio::spawn(async move { engine.run(ctx).await });
 
         let (incoming_tx, mut incoming) = mpsc::unbounded_channel::<Incoming>();
@@ -103,7 +101,7 @@ impl Daemon {
         let mut buffered: VecDeque<Value> = VecDeque::new();
         let mut dropped = 0u64;
         let mut shadow = Map::new();
-        let mut saved_desired = Value::Null;
+        let mut saved = Value::Null;
         let mut restart_check = tokio::time::interval(RESTART_CHECK);
         loop {
             tokio::select! {
@@ -158,12 +156,6 @@ impl Daemon {
                                     None
                                 }
                             }
-                            "desired" => {
-                                let state = params.get("state").cloned().unwrap_or(Value::Null);
-                                let unknown = unknown_streams(&state, &configured);
-                                let _ = desired.send(state);
-                                Some(control::response(&id, Outcome::Ok(json!({"unknown_streams": unknown}))))
-                            }
                             "uplinks" => {
                                 uplinks.send_replace(super::standby::parse(&params));
                                 Some(control::response(&id, Outcome::Ok(json!({}))))
@@ -201,12 +193,14 @@ impl Daemon {
                         continue;
                     }
                     shadow = reported;
-                    let desired_now = desired_state(&shadow);
-                    if desired_now != saved_desired {
-                        if let Err(error) = save_desired(&state_file, &desired_now) {
-                            tracing::warn!(%error, file = %state_file.display(), "can't save the desired state");
+                    let now = overrides(&shadow);
+                    if now != saved {
+                        match save_overrides(&state_file, &now) {
+                            // The file before 0.17.0 goes once its state is in the new one.
+                            Ok(()) => { let _ = std::fs::remove_file(&old_file); }
+                            Err(error) => tracing::warn!(%error, file = %state_file.display(), "can't save the overrides"),
                         }
-                        saved_desired = desired_now;
+                        saved = now;
                     }
                     if let Some(c) = &client {
                         let _ = c.lines.send(control::notification("shadow", json!({"reported": shadow})));
@@ -234,7 +228,6 @@ type Detached = (
     mpsc::UnboundedReceiver<MqttRequest>,
     crate::mqtt::shadow::DetachedReports,
     mpsc::Sender<PendingCommand>,
-    mpsc::UnboundedSender<Value>,
 );
 
 /// A module context whose outputs come back to the daemon.
@@ -242,16 +235,15 @@ fn detached_context(sysfs: &Path, cancel: CancellationToken) -> Detached {
     let (mqtt, requests, _status) = MqttHandle::detached();
     let (shadows, reports, _desired) = ShadowHandle::detached();
     let (commands_tx, commands) = mpsc::channel(crate::router::MODULE_QUEUE);
-    let (desired_tx, desired) = mpsc::unbounded_channel();
     let ctx = ModuleContext {
         commands,
-        desired,
+        desired: mpsc::unbounded_channel().1,
         shadows,
         mqtt,
         sysfs: sysfs.to_owned(),
         cancel,
     };
-    (ctx, requests, reports, commands_tx, desired_tx)
+    (ctx, requests, reports, commands_tx)
 }
 
 /// Creates the control socket: owner and group may connect (the unit's group is `helios`).
@@ -338,29 +330,28 @@ fn peer_allowed(stream: &UnixStream, allowed: &[u32]) -> Result<(), String> {
     }
 }
 
-/// The desired state in a `stream` shadow report: each stream's `desired`, bitrate override
-/// (`null`: the profile's, so a config change to the profile applies after a restart) and the
-/// source, profile, destination and ceiling percentage set through the shadow (only those set:
-/// the others follow `helios.toml`).
-pub(crate) fn desired_state(shadow: &Map<String, Value>) -> Value {
+/// The overrides store, in `state_dir`.
+const OVERRIDES: &str = "overrides.json";
+/// Its name before 0.17.0, read once if the new one isn't there yet.
+const OLD_OVERRIDES: &str = "desired.json";
+
+/// The overrides in a `stream` shadow report (operator intent, never effective values): each
+/// stream's `desired` (live or stopped), `bitrate_override_kbps` (`null`: the profile's, so a
+/// config change to the profile applies after a restart) and `overrides` (`null` members follow
+/// `helios.toml`).
+pub(crate) fn overrides(shadow: &Map<String, Value>) -> Value {
     let streams: Map<String, Value> = shadow
         .get("streams")
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
         .map(|(id, status)| {
-            let mut desired =
-                json!({"state": status["desired"], "bitrate_kbps": status["bitrate_override_kbps"]});
-            for (key, value) in status
-                .get("overrides")
-                .and_then(Value::as_object)
-                .into_iter()
-                .flatten()
-                .filter(|(_, value)| !value.is_null())
-            {
-                desired[key] = value.clone();
-            }
-            (id.clone(), desired)
+            let saved = json!({
+                "desired": status["desired"],
+                "bitrate_override_kbps": status["bitrate_override_kbps"],
+                "overrides": status["overrides"],
+            });
+            (id.clone(), saved)
         })
         .collect();
     if streams.is_empty() {
@@ -382,35 +373,51 @@ pub(crate) fn busy(shadow: &Map<String, Value>) -> bool {
         })
 }
 
-/// The streams in a desired state (`{"streams": {"<id>": …}}`) that `configured` doesn't have.
-pub(crate) fn unknown_streams(state: &Value, configured: &BTreeSet<String>) -> Vec<String> {
-    state
+/// The saved overrides: `file`, else `old_file` (0.16.0's desired state, converted).
+pub(crate) fn load_overrides(file: &Path, old_file: &Path) -> Option<Value> {
+    if let Some(saved) = read_json(file) {
+        return Some(saved);
+    }
+    let old = read_json(old_file)?;
+    let streams: Map<String, Value> = old
         .get("streams")
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
-        .filter(|(id, value)| !value.is_null() && !configured.contains(id.as_str()))
-        .map(|(id, _)| id.clone())
-        .collect()
+        .map(|(id, desired)| {
+            let mut settings = desired.as_object().cloned().unwrap_or_default();
+            let state = settings.remove("state").unwrap_or(Value::Null);
+            let bitrate = settings.remove("bitrate_kbps").unwrap_or(Value::Null);
+            let saved = json!({
+                "desired": state,
+                "bitrate_override_kbps": bitrate,
+                "overrides": settings,
+            });
+            (id.clone(), saved)
+        })
+        .collect();
+    Some(json!({ "streams": streams }))
 }
 
-fn load_desired(file: &Path) -> Option<Value> {
+fn read_json(file: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(file).ok()?;
     serde_json::from_str(&text)
-        .map_err(|error| tracing::warn!(%error, file = %file.display(), "ignoring the saved desired state"))
+        .map_err(
+            |error| tracing::warn!(%error, file = %file.display(), "ignoring the saved overrides"),
+        )
         .ok()
 }
 
-/// Writes the desired state through a temporary file and a rename.
-fn save_desired(file: &Path, desired: &Value) -> std::io::Result<()> {
-    if desired.is_null() {
+/// Writes the overrides through a temporary file and a rename.
+fn save_overrides(file: &Path, overrides: &Value) -> std::io::Result<()> {
+    if overrides.is_null() {
         return Ok(());
     }
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let temporary = file.with_extension("json.new");
-    std::fs::write(&temporary, format!("{desired:#}\n"))?;
+    std::fs::write(&temporary, format!("{overrides:#}\n"))?;
     std::fs::rename(&temporary, file)
 }
 

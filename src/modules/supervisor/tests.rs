@@ -25,11 +25,16 @@ enum Run {
 struct Scripted {
     runs: Mutex<VecDeque<Run>>,
     started: mpsc::UnboundedSender<Instant>,
+    reads_desired: bool,
 }
 
 impl Module for Scripted {
     fn name(&self) -> &'static str {
         "test"
+    }
+
+    fn reads_desired(&self) -> bool {
+        self.reads_desired
     }
 
     fn run(&self, ctx: ModuleContext) -> ModuleFuture<'_> {
@@ -80,6 +85,11 @@ fn fast() -> Timing {
 }
 
 fn setup(runs: Vec<Run>, timing: Timing) -> Setup {
+    setup_reading(runs, timing, true)
+}
+
+/// `setup`, with a module that reads its desired state or not.
+fn setup_reading(runs: Vec<Run>, timing: Timing, reads_desired: bool) -> Setup {
     let (router, registrations) = RouterHandle::for_test();
     let (shadows, _reports, desired) = ShadowHandle::for_test();
     let (mqtt, _requests, _status) = MqttHandle::for_test();
@@ -87,6 +97,7 @@ fn setup(runs: Vec<Run>, timing: Timing) -> Setup {
     let module = Scripted {
         runs: Mutex::new(runs.into()),
         started: started_tx,
+        reads_desired,
     };
     let cancel = CancellationToken::new();
     let (states, tasks) = start(
@@ -219,6 +230,15 @@ async fn every_run_registers_its_commands_and_desired_state_again() {
             .unwrap();
         assert_eq!(shadow, "test");
     }
+}
+
+#[tokio::test]
+async fn a_module_that_reads_no_desired_state_gets_none() {
+    let mut setup = setup_reading(vec![Run::Fail("once"), Run::Wait], fast(), false);
+    next_start(&mut setup).await;
+    next_start(&mut setup).await;
+    // Its shadow is reported-only: the shadow manager is never asked for desired state.
+    assert!(setup.desired.try_recv().is_err());
 }
 
 #[tokio::test]

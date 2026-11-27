@@ -64,11 +64,15 @@ uplinks by `srtla_send`.
 - Streams run in `helios stream-daemon` (`helios-stream.service`, user `helios-stream`), so they
   keep going while Helios restarts or upgrades.
 - Helios's `stream` module is a client over `/run/helios-stream/control.sock` (JSON-RPC lines).
-- The daemon saves the desired state in `/var/lib/helios-stream`. After an upgrade, it restarts
-  itself only once no stream is live.
+- The daemon saves each stream's overrides (live or stopped, a bitrate, and what
+  `stream.update` set) in `/var/lib/helios-stream/overrides.json`, and applies them at startup
+  with `stream.update`'s checks; overrides `helios.toml` no longer allows are dropped and logged.
+  It saves only what commands set, never effective values. After an upgrade, it restarts itself
+  only once no stream is live.
 
 **Commands and events**
-- Commands: `stream.start`, `stream.stop`, `stream.update` and `stream.status`. From the cloud
+- Commands: `stream.start`, `stream.stop` (each takes only `stream_id`), `stream.update` and
+  `stream.status`. From the cloud
   they are AWS IoT commands (`helios-stream-start-v1`, `-stop-v1`, `-update-v1`; helios-contract
   `model/device.smithy`). `start`, `stop` and `update` answer `{"status": ...}` with the stream as
   it is after the command.
@@ -79,9 +83,12 @@ uplinks by `srtla_send`.
   new source, profile or destination restarts a running stream once.
 - A destination from the cloud is sealed to the device's key (AAD `stream.destination
   <stream_id>`). Helios's `stream` module opens it and passes the URL to the daemon; it refuses
-  a plain URL from the cloud. Writes to a device move to commands, and its shadows become
-  reported-only (Notion: *Helios - State Management: Tenets and Practices*); the desired state
-  below still works until the cloud has switched.
+  a plain URL from the cloud. A destination keeps the output's latency and the stream's
+  `streamid` unless the URL gives them. It runs as output `stream:<id>`, and an `srtla://`
+  destination gets its own sender over the output's uplinks (or `srtla_uplinks`).
+- Writes are commands only, and the `stream` shadow is reported-only (Notion: *Helios - State
+  Management: Tenets and Practices*). Since 0.17.0 the device reads no desired state for streams,
+  and removes any left in the shadow, so AWS IoT stops sending it in a delta after every report.
 - Events: `stream.connected`, `stream.live`, `stream.disconnected` and `stream.stats`.
 - ffmpeg's arguments come only from the local profiles.
 
@@ -94,19 +101,11 @@ also lists what the Control API can offer:
 Keys that disappear are set to `null`. If a report would come near AWS IoT's 8 KB limit, the
 cameras' formats are left out.
 
-**Desired state** (written by the Control API) can:
-- start and stop streams, and override the bitrate;
-- change a stream's `source`, `profile`, `destination` (`srt://` or `srtla://`),
-  `source_ceiling_percent` and `record`. Setting `null` goes back to `helios.toml`'s value.
+Each stream's `overrides` shows what `stream.update` set (`null`: `helios.toml`'s), and
+`bitrate_override_kbps` its bitrate override.
 
-Each value is checked the same way `helios.toml` is. A refused value shows in the stream's
-`rejected`, with the reason. Desired state for a stream `helios.toml` doesn't have (one removed from
-the config) is removed from the shadow by the device, so it doesn't come back in every delta. A destination keeps the output's latency and the stream's
-`streamid` unless the URL gives them. It runs as output `stream:<id>`, and an `srtla://`
-destination gets its own sender over the output's uplinks (or `srtla_uplinks`).
-
-**Recordings** (LLD 4, section 16). A stream with `record = true` (or the desired state's
-`record`) is recorded as sent, with no second encode: ffmpeg's `tee` muxer, or a `tee` into
+**Recordings** (LLD 4, section 16). A stream with `record = true` (or `record` set by
+`stream.update`) is recorded as sent, with no second encode: ffmpeg's `tee` muxer, or a `tee` into
 `splitmuxsink` behind a leaky queue for belacoder and ceracoder. Segments are MPEG-TS,
 `segment_s` long (10 minutes by default), at `<dir>/<stream>/<UTC start>-<n>.ts`, each starting
 on a keyframe. A recording that fails never stops the stream. Switching `record` restarts the

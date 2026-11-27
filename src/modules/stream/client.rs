@@ -1,13 +1,15 @@
 //! Helios's `stream` module (LLD 4, section 15): a client of the stream daemon
-//! (`helios-stream.service`). It forwards commands and the shadow's desired state to the daemon
-//! over its control socket, and the daemon's events and shadow to MQTT. Streams themselves run
-//! in the daemon, so they keep going while Helios restarts.
+//! (`helios-stream.service`). It forwards commands to the daemon over its control socket, and the
+//! daemon's events and shadow to MQTT. Streams themselves run in the daemon, so they keep going
+//! while Helios restarts. The `stream` shadow is reported-only: changes are commands, and desired
+//! state left from before 0.17.0 is removed, so AWS IoT stops sending it in a delta after every
+//! report.
 //!
 //! A `stream.update` with a sealed destination is opened here, where the device's secrets key
 //! is (the daemon has no access to it), and passed on as `{"url": ...}`, or as
 //! `{"unreadable": reason}` so the daemon refuses it with the rest of the command.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -100,30 +102,23 @@ async fn run(
     identity: Option<tokio::sync::watch::Receiver<IdentityState>>,
 ) -> Result<(), ModuleError> {
     let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
-    // The latest desired state, sent again after each reconnect.
-    let mut desired: Option<Value> = None;
+    ctx.shadows.clear_desired(MODULE, &["streams"]);
     loop {
         let failure = match UnixStream::connect(&socket).await {
-            Ok(stream) => match session(
-                stream,
-                &mut ctx,
-                &mut desired,
-                uplinks.as_mut(),
-                identity.as_ref(),
-            )
-            .await
-            {
-                Ended::Cancelled => return Ok(()),
-                Ended::Lost(why) => {
-                    backoff.reset();
-                    why
+            Ok(stream) => {
+                match session(stream, &mut ctx, uplinks.as_mut(), identity.as_ref()).await {
+                    Ended::Cancelled => return Ok(()),
+                    Ended::Lost(why) => {
+                        backoff.reset();
+                        why
+                    }
                 }
-            },
+            }
             Err(error) => format!("can't connect to {}: {error}", socket.display()),
         };
         tracing::warn!(error = %failure, "stream daemon unreachable");
         ctx.shadows.report(MODULE, unreachable(&failure));
-        // Until the daemon is back: refuse commands, remember desired state.
+        // Until the daemon is back: refuse commands.
         let retry = tokio::time::sleep(backoff.next_delay());
         tokio::pin!(retry);
         loop {
@@ -134,7 +129,6 @@ async fn run(
                     codes::MODULE_UNAVAILABLE,
                     format!("the stream daemon is unreachable: {failure}"),
                 )),
-                Some(state) = ctx.desired.recv() => desired = Some(state),
             }
         }
     }
@@ -160,7 +154,6 @@ fn with_daemon(mut reported: Map<String, Value>, version: &Value) -> Map<String,
 async fn session(
     stream: UnixStream,
     ctx: &mut ModuleContext,
-    desired: &mut Option<Value>,
     mut uplinks: Option<&mut tokio::sync::watch::Receiver<Value>>,
     identity: Option<&tokio::sync::watch::Receiver<IdentityState>>,
 ) -> Ended {
@@ -201,17 +194,6 @@ async fn session(
         publish(ctx, event);
     }
     let mut waiting: BTreeMap<u64, PendingCommand> = BTreeMap::new();
-    // `desired` requests not answered yet: the answer names streams helios.toml doesn't have.
-    let mut desired_requests: BTreeSet<u64> = BTreeSet::new();
-    let mut cleared: BTreeSet<String> = BTreeSet::new();
-    if let Some(state) = desired.take() {
-        next_id += 1;
-        let line = control::request(next_id, "desired", json!({"state": state}));
-        if writer.write_all(line.as_bytes()).await.is_err() {
-            return Ended::Lost("the daemon closed the connection".into());
-        }
-        desired_requests.insert(next_id);
-    }
     // The uplink view: the current one now, then each change.
     if let Some(view) = uplinks.as_deref_mut() {
         let current = view.borrow_and_update().clone();
@@ -246,22 +228,11 @@ async fn session(
                 }
                 waiting.insert(next_id, pending);
             }
-            Some(state) = ctx.desired.recv() => {
-                next_id += 1;
-                let line = control::request(next_id, "desired", json!({"state": state.clone()}));
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    *desired = Some(state);
-                    break Ended::Lost("the daemon closed the connection".into());
-                }
-                desired_requests.insert(next_id);
-            }
             line = lines.next_line() => match line {
                 Ok(Some(line)) => match control::parse(&line) {
                     Some(Message::Response { id, outcome }) => {
                         if let Some(pending) = waiting.remove(&id) {
                             pending.respond(outcome);
-                        } else if desired_requests.remove(&id) {
-                            clear_unknown(ctx, &outcome, &mut cleared);
                         }
                     }
                     Some(Message::Notification { method, params }) => match method.as_str() {
@@ -285,25 +256,6 @@ async fn session(
         ));
     }
     ended
-}
-
-/// Removes from the shadow the desired state of streams the daemon answered as unknown (not in
-/// helios.toml): the service would otherwise send it in every delta. Each is logged once.
-fn clear_unknown(ctx: &ModuleContext, outcome: &Outcome, cleared: &mut BTreeSet<String>) {
-    let Outcome::Ok(result) = outcome else {
-        return;
-    };
-    for id in result["unknown_streams"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        if cleared.insert(id.to_owned()) {
-            tracing::info!(stream = %id, "removing desired state for a stream helios.toml doesn't have");
-        }
-        ctx.shadows.clear_desired(MODULE, &["streams", id]);
-    }
 }
 
 /// `stream.update`'s sealed destination, opened for the daemon: `{"set": {"url": ...}}`, or

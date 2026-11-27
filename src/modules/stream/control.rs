@@ -1,7 +1,7 @@
 //! The stream daemon's control protocol (LLD 4, section 15): newline-delimited JSON-RPC 2.0 over
 //! a Unix socket, between Helios (the client) and `helios stream-daemon`.
 //!
-//! Helios → daemon requests: `hello`, `command` (`{name, args}`), `desired` (`{state}`),
+//! Helios → daemon requests: `hello`, `command` (`{name, args}`),
 //! `uplinks` (`{interfaces: {name: {kind, metric, public_ipv4}}}`, the net module's view for
 //! standby, LLD 3 section 3.5.1).
 //! Daemon → Helios notifications: `event` (`{kind, payload, at}`) and `shadow` (`{reported}`).

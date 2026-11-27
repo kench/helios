@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::control::{self, Message};
 use super::super::tests::{FakeSpawner, Started, address, settings};
 use super::super::{StreamClient, StreamModule};
-use super::{Daemon, busy, desired_state, uid_of};
+use super::{Daemon, busy, load_overrides, overrides, uid_of};
 use crate::modules::usb::UsbSettings;
 use crate::modules::{Module, ModuleContext};
 use crate::mqtt::manager::{MqttHandle, Request as MqttRequest};
@@ -81,7 +81,7 @@ fn frames_requests_responses_and_notifications() {
 }
 
 #[test]
-fn reads_users_desired_state_and_activity() {
+fn reads_users_overrides_and_activity() {
     let passwd =
         "root:x:0:0:root:/root:/bin/sh\nhelios:x:998:998::/nonexistent:/usr/sbin/nologin\nbad\n";
     assert_eq!(uid_of("helios", passwd), Some(998));
@@ -95,11 +95,14 @@ fn reads_users_desired_state_and_activity() {
     .cloned()
     .expect("object");
     assert_eq!(
-        desired_state(&shadow),
+        overrides(&shadow),
         // Only an override is saved: b follows its profile, even if the profile changes.
-        json!({"streams": {"a": {"state": "live", "bitrate_kbps": 3000}, "b": {"state": "stopped", "bitrate_kbps": null}}})
+        json!({"streams": {
+            "a": {"desired": "live", "bitrate_override_kbps": 3000, "overrides": null},
+            "b": {"desired": "stopped", "bitrate_override_kbps": null, "overrides": null},
+        }})
     );
-    // Settings from the shadow are saved too, but only those set: the others follow helios.toml.
+    // Settings set by stream.update are saved too: null ones follow helios.toml.
     let overridden: Map<String, Value> = json!({"streams": {"a": {
         "desired": "live", "bitrate_override_kbps": null,
         "overrides": {
@@ -111,15 +114,17 @@ fn reads_users_desired_state_and_activity() {
     .cloned()
     .expect("object");
     assert_eq!(
-        desired_state(&overridden),
+        overrides(&overridden),
         json!({"streams": {"a": {
-            "state": "live", "bitrate_kbps": null, "source": {"type": "rtmp", "camera": 2},
-            "destination": "srt://h.example:1", "source_ceiling_percent": 80,
+            "desired": "live", "bitrate_override_kbps": null, "overrides": {
+                "source": {"type": "rtmp", "camera": 2}, "profile": null,
+                "destination": "srt://h.example:1", "source_ceiling_percent": 80,
+            },
         }}})
     );
     assert!(busy(&shadow));
     assert!(!busy(&Map::new()));
-    assert_eq!(desired_state(&Map::new()), Value::Null);
+    assert_eq!(overrides(&Map::new()), Value::Null);
 }
 
 const CONFIG: &str = r#"
@@ -148,8 +153,6 @@ streamid = "publish/live/pattern"
 struct Agent {
     published: mpsc::UnboundedReceiver<MqttRequest>,
     reports: TestReports,
-    /// The shadow's desired state, as the shadow manager would hand it to the module.
-    desired: mpsc::UnboundedSender<Value>,
     commands: mpsc::Sender<PendingCommand>,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<Result<(), crate::modules::ModuleError>>,
@@ -168,11 +171,10 @@ fn agent_with(
     let (mqtt, published, _status) = MqttHandle::for_test();
     let (shadows, reports, _desired) = ShadowHandle::for_test();
     let (commands, commands_rx) = mpsc::channel(4);
-    let (desired, desired_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     let ctx = ModuleContext {
         commands: commands_rx,
-        desired: desired_rx,
+        desired: mpsc::unbounded_channel().1,
         shadows,
         mqtt,
         sysfs: "/sys".into(),
@@ -186,7 +188,6 @@ fn agent_with(
     Agent {
         published,
         reports,
-        desired,
         commands,
         cancel,
         task,
@@ -365,12 +366,12 @@ async fn streams_keep_running_while_helios_is_away() {
         .expect("ok");
     assert!(job.stopped.load(Ordering::SeqCst));
     let saved: Value = serde_json::from_str(
-        &std::fs::read_to_string(dir.path().join("state/desired.json")).expect("saved"),
+        &std::fs::read_to_string(dir.path().join("state/overrides.json")).expect("saved"),
     )
     .expect("json");
-    assert_eq!(saved["streams"]["pattern"]["state"], "stopped");
+    assert_eq!(saved["streams"]["pattern"]["desired"], "stopped");
 
-    // The next daemon resumes the saved desired state: stopped, so nothing starts.
+    // The next daemon resumes the saved overrides: stopped, so nothing starts.
     second
         .shadow_where("daemon unreachable", |r| {
             r["daemon"]["state"] == "unreachable"
@@ -526,43 +527,77 @@ async fn helios_uplink_view_puts_a_shared_uplink_in_standby() {
 }
 
 #[tokio::test]
-async fn desired_state_for_a_stream_helios_toml_lacks_is_removed_from_the_shadow() {
+async fn the_client_removes_desired_state_from_the_stream_shadow() {
+    let dir = tempfile::tempdir().expect("directory");
+    let socket = dir.path().join("control.sock");
+    // Reported-only: whatever desired state is left (from before 0.17.0) goes, daemon or not.
+    let mut helios = agent(socket);
+    assert_eq!(helios.cleared().await, json!(["streams"]));
+    helios.stop().await;
+}
+
+#[tokio::test]
+async fn a_new_daemon_resumes_the_overrides_saved_before_0_17() {
     let dir = tempfile::tempdir().expect("directory");
     let config = CONFIG.replace("DIR", &dir.path().display().to_string());
-    let socket = dir.path().join("control.sock");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state directory");
+    // 0.16.0's desired.json: the pattern stopped.
+    std::fs::write(
+        state.join("desired.json"),
+        r#"{"streams": {"pattern": {"state": "stopped", "bitrate_kbps": null}}}"#,
+    )
+    .expect("old file");
     let mut running = daemon(&config);
-    let _job = next_start(&mut running.started).await;
-    let mut helios = agent(socket);
+    let mut helios = agent(dir.path().join("control.sock"));
     helios
-        .shadow_where("daemon connected", |r| r["daemon"]["state"] == "connected")
+        .shadow_where("connected, the stream stopped", |r| {
+            r["daemon"]["state"] == "connected" && r["streams"]["pattern"]["desired"] == "stopped"
+        })
         .await;
-
-    // A stream removed from helios.toml, one already cleared (null), and one that exists.
-    helios
-        .desired
-        .send(json!({"streams": {
-            "gone": {"state": "live", "profile": "test"},
-            "cleared": null,
-            "pattern": {"state": "live"},
-        }}))
-        .expect("client running");
-    assert_eq!(helios.cleared().await, json!(["streams", "gone"]));
-    // Only that one: the known stream and the null are left alone.
-    let more = tokio::time::timeout(Duration::from_millis(500), helios.cleared()).await;
     assert!(
-        more.is_err(),
-        "cleared more than the unknown stream: {more:?}"
+        running.started.try_recv().is_err(),
+        "a stopped stream started"
     );
+    // Saved under the new name, and the old file is gone.
+    let saved = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(state.join("overrides.json")) {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("saved");
+    let saved: Value = serde_json::from_str(&saved).expect("json");
+    assert_eq!(saved["streams"]["pattern"]["desired"], "stopped");
+    assert!(!state.join("desired.json").exists(), "the old file stayed");
     helios.stop().await;
     running.cancel.cancel();
     let _ = running.task.await;
 }
 
 #[test]
-fn names_desired_streams_the_config_lacks() {
-    let configured: std::collections::BTreeSet<String> = ["pattern".to_owned()].into();
-    let state = json!({"streams": {"pattern": {"state": "live"}, "gone": {}, "nulled": null}});
-    assert_eq!(super::unknown_streams(&state, &configured), ["gone"]);
-    assert!(super::unknown_streams(&json!({}), &configured).is_empty());
-    assert!(super::unknown_streams(&Value::Null, &configured).is_empty());
+fn reads_overrides_from_the_old_desired_state() {
+    let dir = tempfile::tempdir().expect("directory");
+    let (file, old) = (
+        dir.path().join("overrides.json"),
+        dir.path().join("desired.json"),
+    );
+    assert_eq!(load_overrides(&file, &old), None);
+    std::fs::write(
+        &old,
+        r#"{"streams": {"a": {"state": "live", "bitrate_kbps": 3000, "profile": "hd"}}}"#,
+    )
+    .expect("old file");
+    assert_eq!(
+        load_overrides(&file, &old),
+        Some(json!({"streams": {"a": {
+            "desired": "live", "bitrate_override_kbps": 3000, "overrides": {"profile": "hd"},
+        }}}))
+    );
+    // The new file wins once it's there.
+    std::fs::write(&file, r#"{"streams": {}}"#).expect("new file");
+    assert_eq!(load_overrides(&file, &old), Some(json!({"streams": {}})));
 }

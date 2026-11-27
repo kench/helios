@@ -430,7 +430,6 @@ struct Harness {
     published: mpsc::UnboundedReceiver<MqttRequest>,
     reports: TestReports,
     commands: mpsc::Sender<PendingCommand>,
-    desired: mpsc::UnboundedSender<Value>,
     cancel: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<Result<(), crate::modules::ModuleError>>,
     /// The uplink view, as the daemon would get it from Helios (`uplinks`).
@@ -470,6 +469,20 @@ fn harness_full(
         addresses,
         formats,
         Arc::new(|_| super::recording::Disk::default()),
+        None,
+    )
+}
+
+/// The module, started with the overrides the daemon saved.
+fn harness_saved(config: &str, encoders: Option<&[&str]>, saved: Value) -> Harness {
+    harness_disk(
+        config,
+        encoders,
+        false,
+        Arc::new(|| Ok(Vec::new())),
+        Arc::new(|_| Ok(Vec::new())),
+        Arc::new(|_| super::recording::Disk::default()),
+        Some(saved),
     )
 }
 
@@ -480,6 +493,7 @@ fn harness_disk(
     addresses: Arc<super::Addresses>,
     formats: Arc<super::FormatReader>,
     disk: Arc<super::DiskCheck>,
+    saved: Option<Value>,
 ) -> Harness {
     let usb = UsbHandle::default();
     let (started_tx, started) = mpsc::unbounded_channel();
@@ -493,15 +507,15 @@ fn harness_disk(
         StreamModule::with_fakes(settings(config), usb.clone(), Arc::new(spawner), addresses)
             .with_formats(formats)
             .with_disk(disk)
-            .with_uplinks(uplinks_view);
+            .with_uplinks(uplinks_view)
+            .with_saved(saved);
     let (mqtt, published, _status) = MqttHandle::for_test();
     let (shadows, reports, _desired) = ShadowHandle::for_test();
     let (commands, commands_rx) = mpsc::channel(4);
-    let (desired, desired_rx) = mpsc::unbounded_channel();
     let cancel = tokio_util::sync::CancellationToken::new();
     let ctx = ModuleContext {
         commands: commands_rx,
-        desired: desired_rx,
+        desired: mpsc::unbounded_channel().1,
         shadows,
         mqtt,
         sysfs: "/sys".into(),
@@ -514,7 +528,6 @@ fn harness_disk(
         published,
         reports,
         commands,
-        desired,
         cancel,
         task,
         uplinks,
@@ -708,11 +721,14 @@ async fn commands_stop_start_and_change_the_bitrate() {
     let disconnected = harness.event("stream.disconnected").await;
     assert!(disconnected.contains("\"stopped\""), "{disconnected}");
 
+    // A bitrate set while stopped applies when it starts.
+    update(
+        &harness,
+        json!({"stream_id": "camera", "bitrate": {"set": 2500}}),
+    )
+    .await;
     let Outcome::Ok(_) = harness
-        .command(
-            "start",
-            json!({"stream_id": "camera", "bitrate_kbps": 2500}),
-        )
+        .command("start", json!({"stream_id": "camera"}))
         .await
     else {
         panic!("start refused");
@@ -721,15 +737,11 @@ async fn commands_stop_start_and_change_the_bitrate() {
     assert!(job.spec.args.join(" ").contains("-b:v 2500k"));
 
     // A new bitrate restarts the running job.
-    let Outcome::Ok(_) = harness
-        .command(
-            "start",
-            json!({"stream_id": "camera", "bitrate_kbps": 3000}),
-        )
-        .await
-    else {
-        panic!("start refused");
-    };
+    update(
+        &harness,
+        json!({"stream_id": "camera", "bitrate": {"set": 3000}}),
+    )
+    .await;
     assert!(
         harness
             .next_start()
@@ -742,9 +754,10 @@ async fn commands_stop_start_and_change_the_bitrate() {
     assert!(job.stopped.load(Ordering::SeqCst));
 
     for (name, args, code) in [
+        // A bitrate is stream.update's.
         (
             "start",
-            json!({"stream_id": "camera", "bitrate_kbps": 99_999}),
+            json!({"stream_id": "camera", "bitrate_kbps": 3000}),
             "INVALID_MESSAGE",
         ),
         ("start", json!({"stream_id": "nope"}), "INVALID_MESSAGE"),
@@ -788,16 +801,21 @@ async fn a_bitrate_override_is_kept_apart_from_the_profiles() {
     assert_eq!(live["bitrate_kbps"], 4000);
     assert_eq!(live["bitrate_override_kbps"], Value::Null);
 
-    // The profile's own bitrate (as an old saved state held it) is no override: nothing restarts.
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"state": "live", "bitrate_kbps": 4000}}}))
-        .expect("module running");
+    // The profile's own bitrate is no override: nothing restarts.
+    let result = update(
+        &harness,
+        json!({"stream_id": "camera", "bitrate": {"set": 4000}}),
+    )
+    .await;
+    assert_eq!(result["status"]["bitrate_override_kbps"], Value::Null);
     // An override restarts the job with it, and is reported as one.
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"state": "live", "bitrate_kbps": 2500}}}))
-        .expect("module running");
+    let result = update(
+        &harness,
+        json!({"stream_id": "camera", "bitrate": {"set": 2500}}),
+    )
+    .await;
+    assert_eq!(result["status"]["bitrate_kbps"], 2500);
+    assert_eq!(result["status"]["bitrate_override_kbps"], 2500);
     assert!(
         harness
             .next_start()
@@ -807,24 +825,13 @@ async fn a_bitrate_override_is_kept_apart_from_the_profiles() {
             .join(" ")
             .contains("-b:v 2500k")
     );
-    let overridden = loop {
-        let status = harness.state("starting").await;
-        if status["bitrate_override_kbps"] == 2500 {
-            break status;
-        }
-    };
-    assert_eq!(overridden["bitrate_kbps"], 2500);
 
-    // null goes back to the profile's.
-    let outcome = harness
-        .command(
-            "start",
-            json!({"stream_id": "camera", "bitrate_kbps": null}),
-        )
-        .await;
-    let Outcome::Ok(result) = outcome else {
-        panic!("{outcome:?}");
-    };
+    // Configured goes back to the profile's.
+    let result = update(
+        &harness,
+        json!({"stream_id": "camera", "bitrate": {"configured": {}}}),
+    )
+    .await;
     assert_eq!(result["status"]["bitrate_kbps"], 4000);
     assert_eq!(result["status"]["bitrate_override_kbps"], Value::Null);
     assert!(
@@ -836,58 +843,6 @@ async fn a_bitrate_override_is_kept_apart_from_the_profiles() {
             .join(" ")
             .contains("-b:v 4000k")
     );
-    // A value outside the profile's limits is ignored, not applied.
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"bitrate_kbps": 99_999}}}))
-        .expect("module running");
-    let Outcome::Ok(status) = harness
-        .command("status", json!({"stream_id": "camera"}))
-        .await
-    else {
-        panic!("status");
-    };
-    assert_eq!(status["bitrate_kbps"], 4000);
-    assert_eq!(status["bitrate_override_kbps"], Value::Null);
-    harness.stop().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn follows_the_shadows_desired_state() {
-    let mut harness = harness(CONFIG, None, false);
-    harness.plug(true);
-    harness.next_start().await;
-
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"state": "stopped"}, "unknown": {"state": "live"}}}))
-        .expect("module running");
-    harness.state("stopped").await;
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"bitrate_kbps": 2000}}}))
-        .expect("module running");
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"state": "live", "bitrate_kbps": 2000}}}))
-        .expect("module running");
-    assert!(
-        harness
-            .next_start()
-            .await
-            .spec
-            .args
-            .join(" ")
-            .contains("-b:v 2000k")
-    );
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {}}}))
-        .expect("module running");
-    harness
-        .desired
-        .send(json!({"other": 1}))
-        .expect("module running");
     harness.stop().await;
 }
 
@@ -1309,7 +1264,11 @@ async fn a_receiver_without_an_ipv4_address_fails_the_sender_instead_of_starting
         Arc::new(|| Ok(vec![address("wlan0", [10, 0, 2, 2])])),
     );
     let _first = harness.next_start().await;
-    harness.desire(json!({"destination": "srtla://gone.invalid:5000"}));
+    update(
+        &harness,
+        json!({"stream_id": "pattern", "destination": {"set": {"url": "srtla://gone.invalid:5000"}}}),
+    )
+    .await;
     let reported = harness
         .report_where(|r| {
             r["outputs"]["stream:pattern"]["last_error"]
@@ -2174,13 +2133,12 @@ async fn a_gstreamer_encoder_goes_live_on_connect_and_reloads_new_bitrates() {
     assert!(!job.stopped.load(Ordering::SeqCst));
 
     // A new ceiling is a rewritten range and a SIGHUP, not a restart.
-    let outcome = harness
-        .command(
-            "start",
-            json!({"stream_id": "pattern", "bitrate_kbps": 6000}),
-        )
-        .await;
-    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "bitrate": {"set": 6000}}),
+    )
+    .await;
+    assert_eq!(result.get("refused"), None, "{result}");
     assert_eq!(
         std::fs::read_to_string(&bitrate_file).expect("range"),
         "1000000\n6000000\n"
@@ -2329,7 +2287,7 @@ async fn an_adaptive_rtmp_streams_ceiling_follows_the_camera() {
     harness.stop().await;
 }
 
-// --- Settings from the desired state (HLD section 7.3.7) ---------------------------------------
+// --- Settings from stream.update and the saved overrides -----------------------------------------
 
 const REMOTE: &str = r#"
 ffmpeg = "/opt/ffmpeg"
@@ -2393,21 +2351,6 @@ impl Harness {
             other => panic!("{other:?}"),
         }
     }
-
-    fn desire(&self, desired: Value) {
-        self.desired
-            .send(json!({"streams": {"pattern": desired}}))
-            .expect("module running");
-    }
-}
-
-fn settings_of(rejected: &Value) -> Vec<&str> {
-    rejected
-        .as_array()
-        .expect("rejected")
-        .iter()
-        .map(|r| r["setting"].as_str().expect("setting"))
-        .collect()
 }
 
 #[test]
@@ -2441,31 +2384,35 @@ fn checks_srtla_uplinks_and_leaves_a_sender_port_per_stream() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_desired_state_sets_a_streams_profile_source_and_destination() {
+async fn stream_update_points_a_stream_at_another_destination() {
     let runtime = tempfile::tempdir().expect("runtime directory");
     let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
     let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
     let first = harness.next_start().await;
     let args = first.spec.args.join(" ");
-    assert!(args.contains("-b:v 4000k"), "{args}");
     assert!(args.contains("srt://ingest.example.com:4001?"), "{args}");
     let status = harness.state_of("pattern", "starting").await;
     assert_eq!(status["destination"], CONFIGURED);
     assert_eq!(status["source_ceiling_percent"], 100);
-    assert_eq!(status["rejected"], json!([]));
+    assert_eq!(
+        status.get("rejected"),
+        None,
+        "commands answer refusals instead"
+    );
     assert_eq!(
         status["overrides"],
         json!({"source": null, "profile": null, "destination": null, "source_ceiling_percent": null, "record": null})
     );
 
-    // A new profile and destination together: one restart with both.
-    harness.desire(json!({
-        "profile": "small", "destination": "srt://other.example.com:4000?streamid=x/y",
-    }));
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "destination": {"set": {"url": "srt://other.example.com:4000?streamid=x/y"}}}),
+    )
+    .await;
+    assert_eq!(result.get("refused"), None, "{result}");
     let second = harness.next_start().await;
     assert!(first.stopped.load(Ordering::SeqCst));
     let args = second.spec.args.join(" ");
-    assert!(args.contains("-b:v 2000k"), "{args}");
     assert!(
         args.contains("srt://other.example.com:4000?mode=caller&latency=1500000&streamid=x/y"),
         "the configured latency, the URL's stream ID: {args}"
@@ -2475,16 +2422,13 @@ async fn the_desired_state_sets_a_streams_profile_source_and_destination() {
         "the passphrase is the server's: {args}"
     );
     let reported = harness
-        .report_where(|r| r["streams"]["pattern"]["profile"] == "small")
+        .report_where(|r| r["streams"]["pattern"]["output"] == "stream:pattern")
         .await;
     let status = &reported["streams"]["pattern"];
     assert_eq!(
         status["destination"],
         "srt://other.example.com:4000?streamid=x/y"
     );
-    assert_eq!(status["output"], "stream:pattern");
-    assert_eq!(status["bitrate_kbps"], 2000);
-    assert_eq!(status["overrides"]["profile"], "small");
     assert_eq!(status["overrides"]["destination"], status["destination"]);
     assert_eq!(
         reported["outputs"]["stream:pattern"],
@@ -2492,220 +2436,57 @@ async fn the_desired_state_sets_a_streams_profile_source_and_destination() {
         "direct: no sender"
     );
 
-    // Refusals change nothing, and each says why.
-    let refused = json!({
-        "profile": "hevc", "destination": "srt://h:1?mode=listener",
-        "source": {"type": "test", "size": "big"}, "source_ceiling_percent": 500,
-        "bitrate_kbps": 99_999, "state": "paused",
-    });
-    // (Commands go before desired state, so the report shows when it's applied.)
-    harness.desire(refused.clone());
-    let reported = harness
-        .report_where(|r| {
-            r["streams"]["pattern"]["rejected"]
-                .as_array()
-                .is_some_and(|rejected| rejected.len() == 6)
-        })
-        .await;
-    let status = reported["streams"]["pattern"].clone();
-    assert_eq!(status["profile"], "small");
-    assert_eq!(
-        status["destination"],
-        "srt://other.example.com:4000?streamid=x/y"
-    );
-    assert_eq!(
-        settings_of(&status["rejected"]),
-        [
-            "bitrate",
-            "destination",
+    // What the device can't do is refused, with why.
+    for (args, setting, expected) in [
+        (
+            json!({"profile": {"set": "hevc"}}),
             "profile",
-            "source",
-            "source_ceiling_percent",
-            "state"
-        ]
-    );
-    let reasons: Vec<&str> = status["rejected"]
-        .as_array()
-        .expect("rejected")
-        .iter()
-        .map(|r| r["reason"].as_str().expect("reason"))
-        .collect();
-    for (reason, expected) in reasons.iter().zip([
-        "outside the profile's limits",
-        "mode: only streamid, latency and passphrase",
-        "has no libx265 encoder",
-        "a test pattern needs size WIDTHxHEIGHT",
-        "0 to 400",
-        "live or stopped",
-    ]) {
+            "has no libx265 encoder",
+        ),
+        (
+            json!({"profile": {"set": "passthrough"}}),
+            "profile",
+            "pattern: a test pattern is generated",
+        ),
+        (
+            json!({"destination": {"set": {"url": "srt://h:1?mode=listener"}}}),
+            "destination",
+            "mode: only streamid, latency and passphrase",
+        ),
+    ] {
+        let mut args = args;
+        args["stream_id"] = json!("pattern");
+        let result = update(&harness, args).await;
+        assert_eq!(refused_settings(&result), [setting], "{result}");
+        let reason = result["refused"][0]["reason"].as_str().expect("reason");
         assert!(
             reason.contains(expected),
             "{reason:?} should say {expected:?}"
         );
-    }
-    // The same values again keep their first time; a new value gets its own.
-    harness.desire(refused);
-    harness.desire(json!({"profile": "passthrough"}));
-    let reported = harness
-        .report_where(|r| {
-            r["streams"]["pattern"]["rejected"][2]["reason"]
-                .as_str()
-                .is_some_and(|r| r.contains("pattern: a test pattern is generated"))
-        })
-        .await;
-    let rejected = &reported["streams"]["pattern"]["rejected"];
-    for index in [0, 1, 3, 4, 5] {
-        assert_eq!(rejected[index], status["rejected"][index]);
     }
     assert!(
         harness.started.try_recv().is_err(),
         "nothing restarted for refused values"
     );
 
-    // null goes back to helios.toml's; a new source restarts too.
-    harness.desire(json!({
-        "profile": null, "destination": null, "source": {"type": "test", "size": "640x360", "fps": 25},
-    }));
+    // The configured URL itself is no override; configured goes back too.
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "destination": {"set": {"url": CONFIGURED}}}),
+    )
+    .await;
+    assert_eq!(result["status"]["output"], "main");
+    assert_eq!(result["status"]["overrides"]["destination"], Value::Null);
     let third = harness.next_start().await;
     assert!(second.stopped.load(Ordering::SeqCst));
-    let args = third.spec.args.join(" ");
-    assert!(args.contains("-b:v 4000k"), "{args}");
-    assert!(args.contains("testsrc2=size=640x360:rate=25"), "{args}");
-    assert!(args.contains("srt://ingest.example.com:4001?"), "{args}");
-    let status = harness.status_of("pattern").await;
-    assert_eq!(status["destination"], CONFIGURED);
-    assert_eq!(status["output"], "main");
-    assert_eq!(
-        status["overrides"],
-        json!({
-            "source": {"type": "test", "size": "640x360", "fps": 25}, "profile": null,
-            "destination": null, "source_ceiling_percent": null, "record": null,
-        })
-    );
-    assert_eq!(
-        settings_of(&status["rejected"]),
-        ["bitrate", "source_ceiling_percent", "state"],
-        "accepted settings clear their refusals"
-    );
-    harness.stop().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_delta_changing_part_of_a_source_applies_the_whole_source() {
-    let runtime = tempfile::tempdir().expect("runtime directory");
-    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
-    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
-    let first = harness.next_start().await;
-    // The full read: the source is a 640x360 test pattern.
-    harness
-        .desired
-        .send(json!({"streams": {"pattern": {
-            "state": "live", "source": {"type": "test", "size": "640x360", "fps": 25},
-        }}, "$full": true}))
-        .expect("module running");
-    let second = harness.next_start().await;
-    assert!(first.stopped.load(Ordering::SeqCst));
     assert!(
-        second
+        third
             .spec
             .args
             .join(" ")
-            .contains("testsrc2=size=640x360:rate=25")
-    );
-
-    // AWS IoT's delta holds only what changed: no `type`.
-    harness.desire(json!({"source": {"size": "960x540", "fps": 30}}));
-    let third = harness.next_start().await;
-    assert!(second.stopped.load(Ordering::SeqCst));
-    let args = third.spec.args.join(" ");
-    assert!(args.contains("testsrc2=size=960x540:rate=30"), "{args}");
-    let reported = harness
-        .report_where(|r| r["streams"]["pattern"]["overrides"]["source"]["size"] == "960x540")
-        .await;
-    let status = &reported["streams"]["pattern"];
-    assert_eq!(
-        status["overrides"]["source"],
-        json!({"type": "test", "size": "960x540", "fps": 30})
-    );
-    assert!(
-        !settings_of(&status["rejected"]).contains(&"source"),
-        "the partial source isn't refused: {}",
-        status["rejected"]
+            .contains("srt://ingest.example.com:4001?")
     );
     harness.stop().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_full_read_replaces_desired_state_seen_before() {
-    let runtime = tempfile::tempdir().expect("runtime directory");
-    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
-    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
-    let _first = harness.next_start().await;
-    harness
-        .desired
-        .send(json!({"streams": {"pattern": {
-            "state": "live", "source": {"type": "camera", "video": "usb:1-1.3", "audio": "usb:1-1.3"},
-        }}, "$full": true}))
-        .expect("module running");
-    // While Helios was offline the cloud switched the source to the test pattern (clearing the
-    // camera's keys); after reconnecting, the full read has only the new source.
-    harness
-        .desired
-        .send(json!({"streams": {"pattern": {
-            "state": "live", "source": {"type": "test", "size": "640x360", "fps": 25},
-        }}, "$full": true}))
-        .expect("module running");
-    let started = harness.next_start().await;
-    assert!(
-        started
-            .spec
-            .args
-            .join(" ")
-            .contains("testsrc2=size=640x360:rate=25"),
-        "the camera's video and audio didn't survive into the test source"
-    );
-    let status = harness.status_of("pattern").await;
-    assert!(
-        !settings_of(&status["rejected"]).contains(&"source"),
-        "{}",
-        status["rejected"]
-    );
-    harness.stop().await;
-}
-
-#[test]
-fn merges_desired_deltas_like_the_shadow_service() {
-    let mut seen = Value::Null;
-    super::merge_desired(
-        &mut seen,
-        &json!({"streams": {"a": {"source": {"type": "camera", "video": "v", "audio": "a"}, "state": "live"}}, "$full": true}),
-    );
-    super::merge_desired(
-        &mut seen,
-        &json!({"streams": {"a": {"source": {"type": "test", "video": null, "audio": null, "size": "640x360"}}}}),
-    );
-    assert_eq!(
-        seen,
-        json!({"streams": {"a": {"source": {"type": "test", "size": "640x360"}, "state": "live"}}})
-    );
-    super::merge_desired(
-        &mut seen,
-        &json!({"streams": {"a": {"state": null}, "b": {"profile": {"x": null, "y": 1}}}}),
-    );
-    assert_eq!(
-        seen,
-        json!({"streams": {"a": {"source": {"type": "test", "size": "640x360"}}, "b": {"profile": {"y": 1}}}})
-    );
-    super::merge_desired(&mut seen, &json!({"streams": {"b": {"profile": "plain"}}}));
-    assert_eq!(seen["streams"]["b"]["profile"], "plain");
-    assert_eq!(
-        super::whole(
-            &json!({"source": {"size": "1x1"}, "profile": null, "gone": 1}),
-            &seen["streams"]["a"]
-        ),
-        json!({"source": {"type": "test", "size": "640x360"}, "profile": null, "gone": null})
-    );
-    assert_eq!(super::whole(&Value::Null, &seen), Value::Null);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2725,7 +2506,11 @@ async fn an_srtla_destination_runs_its_own_sender() {
     );
     let first = harness.next_start().await;
 
-    harness.desire(json!({"destination": "srtla://rec.example.com:5000?latency=800"}));
+    update(
+        &harness,
+        json!({"stream_id": "pattern", "destination": {"set": {"url": "srtla://rec.example.com:5000?latency=800"}}}),
+    )
+    .await;
     let sender = harness.next_start().await;
     assert!(first.stopped.load(Ordering::SeqCst));
     let dir = runtime.path().join("srtla");
@@ -2767,7 +2552,11 @@ async fn an_srtla_destination_runs_its_own_sender() {
     );
 
     // The configured destination, written out in full, is no override: the sender goes.
-    harness.desire(json!({"destination": CONFIGURED}));
+    update(
+        &harness,
+        json!({"stream_id": "pattern", "destination": {"set": {"url": CONFIGURED}}}),
+    )
+    .await;
     let job = harness.next_start().await;
     assert_eq!(job.spec.name, "pattern");
     assert!(
@@ -2788,23 +2577,67 @@ async fn an_srtla_destination_runs_its_own_sender() {
     harness.stop().await;
 }
 
+/// Saved overrides for the pattern stream, as the daemon writes them.
+fn saved_pattern(desired: &str, bitrate: Value, overrides: Value) -> Value {
+    json!({"streams": {"pattern": {
+        "desired": desired, "bitrate_override_kbps": bitrate, "overrides": overrides,
+    }}})
+}
+
 #[tokio::test(start_paused = true)]
-async fn a_saved_profile_applies_before_the_first_start() {
+async fn saved_overrides_apply_before_the_first_start() {
     let runtime = tempfile::tempdir().expect("runtime directory");
     let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
-    let mut harness = harness(&config, None, false);
-    // Queued before the module's first pass, as the daemon's saved state is.
-    harness.desire(json!({"state": "live", "profile": "small", "source_ceiling_percent": 80}));
+    let saved = saved_pattern(
+        "live",
+        json!(2500),
+        json!({
+            "source": {"type": "test", "size": "640x360", "fps": 25}, "profile": "small",
+            "destination": "srt://other.example.com:4000?streamid=x/y",
+            "source_ceiling_percent": 80, "record": null,
+        }),
+    );
+    let mut harness = harness_saved(&config, None, saved);
     let job = harness.next_start().await;
-    assert!(job.spec.args.join(" ").contains("-b:v 2000k"));
+    let args = job.spec.args.join(" ");
+    assert!(args.contains("-b:v 2500k"), "{args}");
+    assert!(args.contains("testsrc2=size=640x360:rate=25"), "{args}");
+    assert!(args.contains("srt://other.example.com:4000?"), "{args}");
     let status = harness.status_of("pattern").await;
+    assert_eq!(status["profile"], "small");
+    assert_eq!(status["bitrate_override_kbps"], 2500);
     assert_eq!(status["source_ceiling_percent"], 80);
     assert_eq!(status["overrides"]["source_ceiling_percent"], 80);
+    assert!(
+        harness.started.try_recv().is_err(),
+        "one start, with all of it"
+    );
     harness.stop().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn refuses_a_taken_rtmp_key_an_unbondable_destination_and_wrong_types() {
+async fn saved_overrides_helios_toml_no_longer_allows_are_dropped() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    // A profile helios.toml no longer has, and a stream it no longer has: helios.toml's
+    // settings apply, but the saved stopped state still does.
+    let mut saved = saved_pattern("stopped", json!(2500), json!({"profile": "gone"}));
+    saved["streams"]["removed"] =
+        json!({"desired": "live", "bitrate_override_kbps": null, "overrides": {}});
+    let harness = harness_saved(&config, None, saved);
+    let status = harness.status_of("pattern").await;
+    assert_eq!(status["profile"], "big");
+    assert_eq!(status["bitrate_override_kbps"], Value::Null);
+    assert_eq!(status["desired"], "stopped");
+    let Outcome::Ok(all) = harness.command("status", json!({})).await else {
+        panic!("status refused");
+    };
+    assert_eq!(all.get("removed"), None);
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn refuses_a_taken_rtmp_key_and_an_unbondable_destination() {
     let runtime = tempfile::tempdir().expect("runtime directory");
     let config = REMOTE
         .replace("RUNTIME", &runtime.path().display().to_string())
@@ -2830,57 +2663,51 @@ desired = "stopped"
     harness.next_start().await;
 
     // An override the new profile can't take goes back to the profile's bitrate.
-    harness.desire(json!({"bitrate_kbps": 7000}));
+    update(
+        &harness,
+        json!({"stream_id": "pattern", "bitrate": {"set": 7000}}),
+    )
+    .await;
     let job = harness.next_start().await;
     assert!(job.spec.args.join(" ").contains("-b:v 7000k"));
-    harness.desire(json!({"profile": "small"}));
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "profile": {"set": "small"}}),
+    )
+    .await;
+    assert_eq!(result["status"]["bitrate_override_kbps"], Value::Null);
     let job = harness.next_start().await;
     assert!(job.spec.args.join(" ").contains("-b:v 2000k"));
 
-    harness.desire(json!({
-        "source": {"type": "rtmp"}, "destination": "srtla://rec.example.com:5000",
-        "profile": 7, "source_ceiling_percent": "high",
-    }));
-    let reported = harness
-        .report_where(|r| {
-            r["streams"]["pattern"]["rejected"]
-                .as_array()
-                .is_some_and(|rejected| rejected.len() == 4)
-        })
-        .await;
-    let status = &reported["streams"]["pattern"];
-    assert_eq!(status["bitrate_override_kbps"], Value::Null);
-    let rejected = &status["rejected"];
+    // Another stream's RTMP key, and an SRTLA destination without uplinks.
+    let result = update(
+        &harness,
+        json!({
+            "stream_id": "pattern",
+            "source": {"set": {"rtmp": {"key": "ingest"}}},
+            "destination": {"set": {"url": "srtla://rec.example.com:5000"}},
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused_settings(&result),
+        ["source", "destination"],
+        "{result}"
+    );
     for (index, expected) in [
-        "srtla_uplinks is empty",
-        "profile must be a profile name",
         "pattern: stream pocket already takes RTMP key \"ingest\"",
-        "0 to 400",
+        "srtla_uplinks is empty",
     ]
     .into_iter()
     .enumerate()
     {
         assert!(
-            rejected[index]["reason"]
+            result["refused"][index]["reason"]
                 .as_str()
                 .is_some_and(|r| r.contains(expected)),
-            "{rejected}"
+            "{result}"
         );
     }
-    harness.desire(json!({"source": {"type": "usb"}, "destination": 5}));
-    let reported = harness
-        .report_where(|r| {
-            r["streams"]["pattern"]["rejected"][0]["reason"]
-                .as_str()
-                .is_some_and(|r| r.contains("must be an srt:// or srtla:// URL"))
-        })
-        .await;
-    assert!(
-        reported["streams"]["pattern"]["rejected"][2]["reason"]
-            .as_str()
-            .is_some_and(|r| r.starts_with("source: ")),
-        "{reported}"
-    );
     harness.stop().await;
 }
 
@@ -3087,7 +2914,7 @@ fn fake_disk(mounted: Arc<AtomicBool>) -> Arc<super::DiskCheck> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn records_the_stream_as_sent_and_switches_through_the_desired_state() {
+async fn records_the_stream_as_sent_and_switches_with_stream_update() {
     let temp = tempfile::tempdir().expect("tempdir");
     let dir = temp.path().display().to_string();
     let config = CONFIG.replace(
@@ -3102,6 +2929,7 @@ async fn records_the_stream_as_sent_and_switches_through_the_desired_state() {
         Arc::new(|| Ok(Vec::new())),
         Arc::new(|_| Ok(Vec::new())),
         fake_disk(Arc::clone(&mounted)),
+        None,
     );
     harness.plug(true);
     let args = harness.next_start().await.spec.args.join(" ");
@@ -3125,11 +2953,12 @@ async fn records_the_stream_as_sent_and_switches_through_the_desired_state() {
     assert_eq!(report["recording"]["mounted"], true);
     assert_eq!(report["recording"]["total_bytes"], 128_000_000_000_u64);
 
-    // Off through the desired state: the encoder restarts without its recording branch.
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"record": false}}}))
-        .expect("module running");
+    // Off: the encoder restarts without its recording branch.
+    update(
+        &harness,
+        json!({"stream_id": "camera", "record": {"set": false}}),
+    )
+    .await;
     let args = harness.next_start().await.spec.args.join(" ");
     assert!(
         !args.contains("tee") && args.contains("-f mpegts"),
@@ -3140,18 +2969,12 @@ async fn records_the_stream_as_sent_and_switches_through_the_desired_state() {
         .await;
     assert_eq!(report["streams"]["camera"]["overrides"]["record"], false);
 
-    // A bad value is refused; null goes back to helios.toml's (on).
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"record": "yes"}}}))
-        .expect("module running");
-    harness
-        .report_where(|r| settings_of(&r["streams"]["camera"]["rejected"]) == ["record"])
-        .await;
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"record": null}}}))
-        .expect("module running");
+    // Configured goes back to helios.toml's (on).
+    update(
+        &harness,
+        json!({"stream_id": "camera", "record": {"configured": {}}}),
+    )
+    .await;
     assert!(
         harness
             .next_start()
@@ -3171,18 +2994,22 @@ async fn records_the_stream_as_sent_and_switches_through_the_desired_state() {
         report["streams"]["camera"]["recording"]["state"],
         "recording"
     );
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"state": "stopped"}}}))
-        .expect("module running");
+    let Outcome::Ok(_) = harness
+        .command("stop", json!({"stream_id": "camera"}))
+        .await
+    else {
+        panic!("stop refused");
+    };
     harness
         .report_where(|r| r["streams"]["camera"]["recording"]["state"] == "unavailable")
         .await;
     while harness.started.try_recv().is_ok() {}
-    harness
-        .desired
-        .send(json!({"streams": {"camera": {"state": "live"}}}))
-        .expect("module running");
+    let Outcome::Ok(_) = harness
+        .command("start", json!({"stream_id": "camera"}))
+        .await
+    else {
+        panic!("start refused");
+    };
     assert!(
         !harness
             .next_start()
@@ -3220,6 +3047,7 @@ async fn a_recording_directory_that_cannot_be_made_leaves_the_stream_running() {
         Arc::new(|| Ok(Vec::new())),
         Arc::new(|_| Ok(Vec::new())),
         fake_disk(Arc::new(AtomicBool::new(true))),
+        None,
     );
     harness.plug(true);
     let args = harness.next_start().await.spec.args.join(" ");
@@ -3442,11 +3270,9 @@ fn stream_command_vectors_from_the_contract() {
         let valid = case["valid"].as_bool().expect("valid");
         let parsed = match case["command"].as_str().expect("command") {
             "helios-stream-update-v1" => super::update::UpdateArgs::parse(args).map(|_| ()),
-            "helios-stream-start-v1" | "helios-stream-stop-v1" => args
-                .get("stream_id")
-                .and_then(Value::as_str)
-                .map(|_| ())
-                .ok_or_else(|| "stream_id is required".to_owned()),
+            "helios-stream-start-v1" | "helios-stream-stop-v1" => {
+                super::update::StreamArgs::parse("start", args).map(|_| ())
+            }
             other => panic!("unknown command {other}"),
         };
         assert_eq!(parsed.is_ok(), valid, "{}: {parsed:?}", case["name"]);

@@ -132,6 +132,11 @@ impl Module for DisplayModule {
         MODULE
     }
 
+    /// The idle screen, until it's a `helios-display-idle-v1` command.
+    fn reads_desired(&self) -> bool {
+        true
+    }
+
     fn run(&self, ctx: ModuleContext) -> ModuleFuture<'_> {
         Box::pin(async move {
             let inputs = Inputs {

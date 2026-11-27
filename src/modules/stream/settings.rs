@@ -31,7 +31,7 @@ pub struct StreamSettings {
     pub(crate) gst_plugin_path: PathBuf,
     /// The stream daemon's control socket (LLD 4, section 15), which Helios connects to.
     pub(crate) control_socket: PathBuf,
-    /// Where the daemon keeps the desired state across its restarts.
+    /// Where the daemon keeps the streams' overrides across its restarts (`overrides.json`).
     pub(crate) state_dir: PathBuf,
     /// The user whose processes may use the control socket (besides root and the daemon's
     /// own user): Helios's.
@@ -40,9 +40,9 @@ pub struct StreamSettings {
     /// `RuntimeDirectory`, and where the upgrade's `restart-pending` file appears.
     pub(crate) runtime_dir: PathBuf,
     /// The first local UDP port for senders: outputs get consecutive ports in name order, then
-    /// each stream one for an SRTLA destination set through the shadow, in name order.
+    /// each stream one for an SRTLA destination set by `stream.update`, in name order.
     pub(crate) srtla_port_base: u16,
-    /// The uplinks an `srtla://` destination set through the shadow bonds when the stream's
+    /// The uplinks an `srtla://` destination set by `stream.update` bonds when the stream's
     /// configured output is `direct` (an `srtla` output's own uplinks come first). By default
     /// the board's own Ethernet and Wi-Fi ports and any USB uplink.
     pub(crate) srtla_uplinks: Vec<String>,
@@ -277,8 +277,8 @@ pub struct Stream {
     /// `live` (run whenever the source is ready) or `stopped`.
     #[serde(default = "default_desired")]
     pub(crate) desired: String,
-    /// Whether the stream is recorded as sent, to `[modules.stream.recording] dir`. The desired
-    /// state's `record` overrides it.
+    /// Whether the stream is recorded as sent, to `[modules.stream.recording] dir`. `stream.update`'s
+    /// `record` overrides it.
     #[serde(default)]
     pub(crate) record: bool,
 }
@@ -508,7 +508,7 @@ impl StreamSettings {
     }
 
     /// Checks one stream's source, profile and stream ID: at start-up, and for a source or
-    /// profile set through the shadow (`at` begins the message).
+    /// profile set by `stream.update` (`at` begins the message).
     ///
     /// # Errors
     ///
@@ -581,7 +581,7 @@ impl StreamSettings {
         self.srtla_port_base.checked_add(u16::try_from(index).ok()?)
     }
 
-    /// The local port of stream `id`'s SRTLA destination set through the shadow: after the
+    /// The local port of stream `id`'s SRTLA destination set by `stream.update`: after the
     /// outputs', in stream name order.
     pub(crate) fn stream_sender_port(&self, id: &str) -> Option<u16> {
         let index = self.outputs.len() + self.streams.keys().position(|name| name == id)?;
