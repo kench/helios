@@ -93,7 +93,7 @@ uplinks by `srtla_send`.
 - Writes are commands only, and the `stream` shadow is reported-only (Notion: *Helios - State
   Management: Tenets and Practices*). Since 0.17.0 the device reads no desired state for streams,
   and removes any left in the shadow, so AWS IoT stops sending it in a delta after every report.
-  Since the release after 0.17.0, no module reads desired state, and Helios doesn't subscribe to
+  Since 0.18.0, no module reads desired state, and Helios doesn't subscribe to
   shadow deltas.
 - Events: `stream.connected`, `stream.live`, `stream.disconnected` and `stream.stats`.
 - ffmpeg's arguments come only from the local profiles.
