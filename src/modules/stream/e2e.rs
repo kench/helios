@@ -88,12 +88,11 @@ struct Helios {
 impl Helios {
     fn start(socket: &str) -> Self {
         let (mqtt, published, _status) = MqttHandle::for_test();
-        let (shadows, reports, _desired) = ShadowHandle::for_test();
+        let (shadows, reports) = ShadowHandle::for_test();
         let (commands, commands_rx) = mpsc::channel(4);
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ModuleContext {
             commands: commands_rx,
-            desired: mpsc::unbounded_channel().1,
             shadows,
             mqtt,
             sysfs: "/sys".into(),

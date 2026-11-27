@@ -325,7 +325,7 @@ async fn connects_as_the_thing_with_a_will_and_a_clean_session() {
 }
 
 #[tokio::test]
-async fn subscribes_in_batches_of_eight_and_goes_online_after_the_last() {
+async fn subscribes_at_most_eight_filters_at_once_and_goes_online_after_the_last() {
     let running = start_with(
         |options| options.commands = crate::mqtt::CommandTransports::default().transport(),
         |_| {},
@@ -342,12 +342,10 @@ async fn subscribes_in_batches_of_eight_and_goes_online_after_the_last() {
     filters.push(format!("{base}/request/json"));
     filters.push(format!("{base}/response/accepted/json"));
     filters.push(format!("{base}/response/rejected/json"));
-    // Five shadow filters, the custom topic and three for AWS IoT commands: nine, so two.
-    assert_eq!(filters.len(), 9);
-    assert_eq!(
-        state.subscribes,
-        vec![filters[..8].to_vec(), filters[8..].to_vec()]
-    );
+    // Four shadow filters (no deltas: reported-only), the custom topic and three for AWS IoT
+    // commands: eight, so one.
+    assert_eq!(filters.len(), 8);
+    assert_eq!(state.subscribes, vec![filters]);
     assert_eq!(state.publishes[0].1["type"], "lifecycle.online");
 }
 

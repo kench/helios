@@ -10,15 +10,14 @@ pub fn event(thing: &str, module: &str) -> String {
     format!("helios/{thing}/evt/{module}")
 }
 
-/// The shadow filters each session subscribes to: the named shadows' replies and deltas. The
-/// command transport adds its own (LLD 2, section 2).
+/// The shadow filters each session subscribes to: the named shadows' replies. No deltas: shadows
+/// are reported-only. The command transport adds its own (LLD 2, section 2).
 #[must_use]
 pub fn shadow_filters(thing: &str) -> Vec<String> {
     let shadows = format!("$aws/things/{thing}/shadow/name/+");
     vec![
         format!("{shadows}/update/accepted"),
         format!("{shadows}/update/rejected"),
-        format!("{shadows}/update/delta"),
         format!("{shadows}/get/accepted"),
         format!("{shadows}/get/rejected"),
     ]
@@ -32,8 +31,11 @@ mod tests {
     fn builds_the_topics() {
         assert_eq!(event("t-1", LIFECYCLE), "helios/t-1/evt/lifecycle");
         let filters = shadow_filters("t-1");
-        assert_eq!(filters.len(), 5);
-        assert_eq!(filters[2], "$aws/things/t-1/shadow/name/+/update/delta");
+        assert_eq!(filters.len(), 4);
+        assert!(
+            !filters.iter().any(|f| f.ends_with("/delta")),
+            "reported-only: no deltas"
+        );
     }
 
     #[test]

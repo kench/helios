@@ -819,10 +819,7 @@ fn display_module_refuses_bad_settings() {
 
     for (section, expected) in [
         ("time_zone = \"Nowhere/Else\"", "isn't a known time zone"),
-        (
-            "idle_template = \"message\"",
-            "only the shadow's desired state",
-        ),
+        ("idle_template = \"message\"", "only display.idle can set"),
         ("idle_template = \"fancy\"", "no template"),
         (
             "redraw_interval_s = 3601",

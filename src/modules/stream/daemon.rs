@@ -233,11 +233,10 @@ type Detached = (
 /// A module context whose outputs come back to the daemon.
 fn detached_context(sysfs: &Path, cancel: CancellationToken) -> Detached {
     let (mqtt, requests, _status) = MqttHandle::detached();
-    let (shadows, reports, _desired) = ShadowHandle::detached();
+    let (shadows, reports) = ShadowHandle::detached();
     let (commands_tx, commands) = mpsc::channel(crate::router::MODULE_QUEUE);
     let ctx = ModuleContext {
         commands,
-        desired: mpsc::unbounded_channel().1,
         shadows,
         mqtt,
         sysfs: sysfs.to_owned(),

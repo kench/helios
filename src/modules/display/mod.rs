@@ -1,13 +1,17 @@
 //! The `display` module (LLD 9): screens on the scanner's framebuffer.
 //!
 //! It shows one screen at a time: the most recent `display.show` until it expires or is cleared,
-//! otherwise the idle screen, which the `display` shadow's desired state can change. The idle
+//! otherwise the idle screen, which `display.idle` can change until Helios restarts. The idle
 //! `status` screen follows the MQTT connection and shows the clock in the configured time zone.
 //! Writes go only to the rows that changed. On shutdown it shows "Helios stopped", so the screen
 //! never shows stale information.
 //!
-//! Commands (`helios/<thing>/cmd/display`): `show` (`template`, `fields`, `duration_s`), `clear`
-//! and `status`.
+//! Commands (`helios/<thing>/cmd/display`): `show` (`template`, `fields`, `duration_s`), `clear`,
+//! `idle` and `status`. `idle` (AWS IoT command `helios-display-idle-v1`, helios-contract
+//! `model/device.smithy`) takes `{"idle": {"set": {"<template>": {fields}}}}` or
+//! `{"idle": {"configured": {}}}` and answers `{"status": ...}`; arguments outside the model are
+//! `INVALID_MESSAGE` and change nothing. The `display` shadow is reported-only (the page "Helios -
+//! State Management: Tenets and Practices"): desired state left from before 0.17.0 is removed.
 
 pub mod canvas;
 pub mod fb;
@@ -48,7 +52,7 @@ const MAX_DURATION_S: u64 = 86_400;
 pub struct DisplaySettings {
     /// The framebuffer device.
     pub framebuffer: PathBuf,
-    /// The idle screen until the shadow's desired state sets one.
+    /// The idle screen until `display.idle` sets one.
     pub idle: Screen,
     /// The clock's time zone, by name.
     pub time_zone_name: String,
@@ -66,8 +70,6 @@ pub struct DisplaySettings {
 pub struct Inputs {
     /// Commands from the router (`RouterHandle::register("display")`).
     pub commands: mpsc::Receiver<PendingCommand>,
-    /// The `display` shadow's desired state (`ShadowHandle::desired("display")`).
-    pub desired: mpsc::UnboundedReceiver<Value>,
     /// For the `display` shadow's reported state.
     pub shadows: ShadowHandle,
     /// The MQTT connection, for the idle screen.
@@ -132,16 +134,10 @@ impl Module for DisplayModule {
         MODULE
     }
 
-    /// The idle screen, until it's a `helios-display-idle-v1` command.
-    fn reads_desired(&self) -> bool {
-        true
-    }
-
     fn run(&self, ctx: ModuleContext) -> ModuleFuture<'_> {
         Box::pin(async move {
             let inputs = Inputs {
                 commands: ctx.commands,
-                desired: ctx.desired,
                 shadows: ctx.shadows,
                 mqtt: ctx.mqtt.status(),
                 sysfs: ctx.sysfs,
@@ -224,8 +220,9 @@ impl Display {
 
     async fn run(mut self, cancel: CancellationToken) {
         let mut commands_open = true;
-        let mut desired_open = true;
         let mut mqtt_open = true;
+        // Reported-only: the idle screen is a command now.
+        self.inputs.shadows.clear_desired(MODULE, &["idle"]);
         loop {
             self.expire(Instant::now());
             if self.framebuffer.is_none() && Instant::now() >= self.retry_at {
@@ -245,10 +242,6 @@ impl Display {
                         pending.respond(outcome);
                     }
                     None => commands_open = false,
-                },
-                desired = self.inputs.desired.recv(), if desired_open => match desired {
-                    Some(state) => self.desired(&state),
-                    None => desired_open = false,
                 },
                 changed = self.inputs.mqtt.changed(), if mqtt_open => {
                     if changed.is_err() {
@@ -439,44 +432,26 @@ impl Display {
                 }
                 Outcome::Ok(self.state())
             }
+            "idle" => match idle_request(args, &self.settings.idle) {
+                Ok(screen) => {
+                    tracing::info!(template = screen.template(), "idle screen set");
+                    if screen != self.idle {
+                        self.idle = screen;
+                        self.idle_since = SystemTime::now();
+                        if self.shown.is_none() {
+                            self.draw(false);
+                        }
+                    }
+                    self.report();
+                    Outcome::Ok(json!({"status": self.state()}))
+                }
+                Err(message) => Outcome::error(codes::INVALID_MESSAGE, message),
+            },
             "status" => Outcome::Ok(self.state()),
             other => Outcome::error(
                 codes::UNKNOWN_COMMAND,
                 format!("no command display.{other}"),
             ),
-        }
-    }
-
-    /// Applies the `display` shadow's desired state: `{"idle": {"template", "fields"}}`.
-    fn desired(&mut self, state: &Value) {
-        let Some(idle) = state.get("idle") else {
-            return;
-        };
-        let parsed = if idle.is_null() {
-            Ok(self.settings.idle.clone())
-        } else {
-            let template = idle
-                .get("template")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            Screen::parse(template, idle.get("fields").unwrap_or(&Value::Null))
-        };
-        match parsed {
-            Ok(screen) => {
-                tracing::info!(template = screen.template(), "idle screen set");
-                self.error = None;
-                if screen != self.idle {
-                    self.idle = screen;
-                    self.idle_since = SystemTime::now();
-                    if self.shown.is_none() {
-                        self.draw(false);
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "desired idle screen refused");
-                self.error = Some(format!("desired idle screen refused: {error}"));
-            }
         }
     }
 
@@ -522,6 +497,43 @@ impl Display {
             self.inputs.shadows.report(MODULE, state.clone());
             self.reported = Some(state);
         }
+    }
+}
+
+/// The idle screen a `display.idle` command's arguments ask for (helios-contract `DisplayIdle`):
+/// `{"idle": {"set": {"<template>": {fields}}}}`, or `{"idle": {"configured": {}}}` for
+/// `configured`, `helios.toml`'s.
+fn idle_request(args: &Value, configured: &Screen) -> Result<Screen, String> {
+    /// The one member of `value`, an object that must have exactly one.
+    fn only<'a>(value: &'a Value, what: &str) -> Result<(&'a str, &'a Value), String> {
+        match value.as_object() {
+            Some(object) if object.len() == 1 => object
+                .iter()
+                .next()
+                .map(|(key, value)| (key.as_str(), value))
+                .ok_or_else(|| format!("{what} needs exactly one member")),
+            _ => Err(format!("{what} needs exactly one member")),
+        }
+    }
+    let Value::Object(members) = args else {
+        return Err("display.idle needs an object with idle".to_owned());
+    };
+    if let Some(unknown) = members.keys().find(|key| key.as_str() != "idle") {
+        return Err(format!("display.idle has no argument {unknown:?}"));
+    }
+    let idle = members
+        .get("idle")
+        .ok_or("display.idle needs idle: {\"set\": screen} or {\"configured\": {}}")?;
+    match only(idle, "idle")? {
+        ("configured", Value::Object(empty)) if empty.is_empty() => Ok(configured.clone()),
+        ("set", screen) => {
+            let (template, fields) = only(screen, "a screen")?;
+            if !fields.is_object() {
+                return Err(format!("the {template} screen's fields must be an object"));
+            }
+            Screen::parse(template, fields)
+        }
+        _ => Err("idle is {\"set\": screen} or {\"configured\": {}}".to_owned()),
     }
 }
 
