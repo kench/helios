@@ -12,7 +12,8 @@
 //!
 //! Events on `helios/<thing>/evt/stream`: `stream.connected` (the source became ready),
 //! `stream.live`, `stream.disconnected` (with a reason) and, while live, `stream.stats`.
-//! Commands: `stream.start`, `stream.stop`, `stream.status`.
+//! Commands: `stream.start`, `stream.stop`, `stream.update` (any settings, whole or not at all;
+//! [`update`]) and `stream.status`. `start`, `stop` and `update` answer `{"status": ...}`.
 
 mod addrs;
 mod client;
@@ -30,6 +31,7 @@ mod rtmp;
 pub(crate) mod settings;
 mod srtla;
 mod standby;
+mod update;
 mod v4l2;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -954,7 +956,7 @@ impl<'a> Streams<'a> {
                 () = ctx.cancel.cancelled() => break,
                 command = ctx.commands.recv(), if commands_open => match command {
                     Some(pending) => {
-                        let outcome = self.command(&pending.command.name, &pending.command.args);
+                        let outcome = self.command(&pending.command.name, &pending.command.args, &ctx);
                         pending.respond(outcome);
                     }
                     None => commands_open = false,
@@ -1393,7 +1395,10 @@ impl<'a> Streams<'a> {
         }
     }
 
-    fn command(&mut self, name: &str, args: &Value) -> Outcome {
+    fn command(&mut self, name: &str, args: &Value, ctx: &ModuleContext) -> Outcome {
+        if name == "update" {
+            return self.update(args, ctx);
+        }
         let id = args.get("stream_id").and_then(Value::as_str);
         if name == "status" {
             return match id {
@@ -1427,7 +1432,7 @@ impl<'a> Streams<'a> {
         } else {
             self.set_live(index, false, BitrateChange::Keep);
         }
-        Outcome::Ok(self.entries[index].status(&self.module.settings, false))
+        Outcome::Ok(json!({"status": self.entries[index].status(&self.module.settings, false)}))
     }
 
     fn bitrate_allowed(&self, index: usize, bitrate: u32) -> bool {
@@ -1600,7 +1605,6 @@ impl<'a> Streams<'a> {
     /// The desired `profile`, `source`, `destination` and `source_ceiling_percent`. A changed
     /// source, profile or destination stops the job; the next pass starts it again with them.
     fn desired_settings(&mut self, index: usize, desired: &Value, ctx: &ModuleContext) {
-        let settings = &self.module.settings;
         let mut reconfigured = false;
         if let Some(value) = desired.get("profile") {
             let entry = &self.entries[index];
@@ -1709,35 +1713,42 @@ impl<'a> Streams<'a> {
                 stream = %self.entries[index].id, profile = %self.entries[index].config.profile,
                 output = %self.entries[index].config.output, "new settings from the desired state"
             );
-            self.stop_job(index);
-            self.disconnect(index, "reconfigured", ctx);
-            let encoders = self.encoders.as_ref();
-            let entry = &mut self.entries[index];
-            entry.nodes = None;
-            entry.camera = Value::Null;
-            entry.source_ceiling = None;
-            entry.source_kbps = None;
-            entry.progress = None;
-            entry.last_error = None;
-            entry.restart_at = None;
-            entry.failures.clear();
-            entry.backoff.reset();
-            entry.unusable =
-                encoders.and_then(|encoders| missing_encoders(settings, &entry.config, encoders));
-            if entry.state == State::Failed {
-                entry.set_state(State::Stopped);
+            self.reconfigure(index, ctx);
+        }
+    }
+
+    /// After a change of source, profile or destination: the job stops (the next pass starts it
+    /// with the new settings) and what came from the old ones is forgotten.
+    fn reconfigure(&mut self, index: usize, ctx: &ModuleContext) {
+        let settings = &self.module.settings;
+        self.stop_job(index);
+        self.disconnect(index, "reconfigured", ctx);
+        let encoders = self.encoders.as_ref();
+        let entry = &mut self.entries[index];
+        entry.nodes = None;
+        entry.camera = Value::Null;
+        entry.source_ceiling = None;
+        entry.source_kbps = None;
+        entry.progress = None;
+        entry.last_error = None;
+        entry.restart_at = None;
+        entry.failures.clear();
+        entry.backoff.reset();
+        entry.unusable =
+            encoders.and_then(|encoders| missing_encoders(settings, &entry.config, encoders));
+        if entry.state == State::Failed {
+            entry.set_state(State::Stopped);
+        }
+        // The bitrate follows the new profile; an override outside its limits goes.
+        if let Some(profile) = settings.profiles.get(&entry.config.profile) {
+            let limits = profile.min_bitrate_kbps..=profile.max_bitrate_kbps;
+            if entry
+                .bitrate_override
+                .is_some_and(|kbps| profile.video == "copy" || !limits.contains(&kbps))
+            {
+                entry.bitrate_override = None;
             }
-            // The bitrate follows the new profile; an override outside its limits goes.
-            if let Some(profile) = settings.profiles.get(&entry.config.profile) {
-                let limits = profile.min_bitrate_kbps..=profile.max_bitrate_kbps;
-                if entry
-                    .bitrate_override
-                    .is_some_and(|kbps| profile.video == "copy" || !limits.contains(&kbps))
-                {
-                    entry.bitrate_override = None;
-                }
-                entry.bitrate_kbps = entry.bitrate_override.unwrap_or(profile.bitrate_kbps);
-            }
+            entry.bitrate_kbps = entry.bitrate_override.unwrap_or(profile.bitrate_kbps);
         }
     }
 

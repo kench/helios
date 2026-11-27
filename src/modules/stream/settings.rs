@@ -258,10 +258,10 @@ impl Source {
     }
 }
 
-fn default_test_size() -> String {
+pub(crate) fn default_test_size() -> String {
     "1280x720".into()
 }
-fn default_test_fps() -> u32 {
+pub(crate) fn default_test_fps() -> u32 {
     30
 }
 

@@ -2,6 +2,10 @@
 //! (`helios-stream.service`). It forwards commands and the shadow's desired state to the daemon
 //! over its control socket, and the daemon's events and shadow to MQTT. Streams themselves run
 //! in the daemon, so they keep going while Helios restarts.
+//!
+//! A `stream.update` with a sealed destination is opened here, where the device's secrets key
+//! is (the daemon has no access to it), and passed on as `{"url": ...}`, or as
+//! `{"unreadable": reason}` so the daemon refuses it with the rest of the command.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -14,6 +18,8 @@ use tokio::net::UnixStream;
 use super::MODULE;
 use super::control::{self, Message};
 use crate::backoff::Backoff;
+use crate::identity::manager::IdentityState;
+use crate::identity::secrets::{Sealed, open_sealed};
 use crate::modules::{Module, ModuleContext, ModuleError, ModuleFuture};
 use crate::router::{Outcome, PendingCommand, codes};
 
@@ -25,6 +31,8 @@ pub struct StreamClient {
     socket: PathBuf,
     /// The net module's uplink view, passed on to the daemon (`uplinks`) for standby.
     uplinks: Option<tokio::sync::watch::Receiver<Value>>,
+    /// The identity, for opening sealed destinations.
+    identity: Option<tokio::sync::watch::Receiver<IdentityState>>,
 }
 
 impl StreamClient {
@@ -34,7 +42,15 @@ impl StreamClient {
         Self {
             socket,
             uplinks: None,
+            identity: None,
         }
+    }
+
+    /// Opens sealed destinations (`stream.update`) with this identity's secrets key.
+    #[must_use]
+    pub fn with_identity(mut self, identity: tokio::sync::watch::Receiver<IdentityState>) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Passes the net module's uplink view on to the daemon, after each connect and on change.
@@ -51,7 +67,12 @@ impl Module for StreamClient {
     }
 
     fn run(&self, ctx: ModuleContext) -> ModuleFuture<'_> {
-        Box::pin(run(self.socket.clone(), ctx, self.uplinks.clone()))
+        Box::pin(run(
+            self.socket.clone(),
+            ctx,
+            self.uplinks.clone(),
+            self.identity.clone(),
+        ))
     }
 }
 
@@ -76,13 +97,22 @@ async fn run(
     socket: PathBuf,
     mut ctx: ModuleContext,
     mut uplinks: Option<tokio::sync::watch::Receiver<Value>>,
+    identity: Option<tokio::sync::watch::Receiver<IdentityState>>,
 ) -> Result<(), ModuleError> {
     let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
     // The latest desired state, sent again after each reconnect.
     let mut desired: Option<Value> = None;
     loop {
         let failure = match UnixStream::connect(&socket).await {
-            Ok(stream) => match session(stream, &mut ctx, &mut desired, uplinks.as_mut()).await {
+            Ok(stream) => match session(
+                stream,
+                &mut ctx,
+                &mut desired,
+                uplinks.as_mut(),
+                identity.as_ref(),
+            )
+            .await
+            {
                 Ended::Cancelled => return Ok(()),
                 Ended::Lost(why) => {
                     backoff.reset();
@@ -132,6 +162,7 @@ async fn session(
     ctx: &mut ModuleContext,
     desired: &mut Option<Value>,
     mut uplinks: Option<&mut tokio::sync::watch::Receiver<Value>>,
+    identity: Option<&tokio::sync::watch::Receiver<IdentityState>>,
 ) -> Ended {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -204,7 +235,11 @@ async fn session(
             }
             Some(pending) = ctx.commands.recv() => {
                 next_id += 1;
-                let params = json!({"name": pending.command.name, "args": pending.command.args});
+                let mut args = pending.command.args.clone();
+                if pending.command.name == "update" {
+                    args = open_destination(identity, args).await;
+                }
+                let params = json!({"name": pending.command.name, "args": args});
                 if writer.write_all(control::request(next_id, "command", params).as_bytes()).await.is_err() {
                     pending.respond(Outcome::error(codes::MODULE_UNAVAILABLE, "the stream daemon went away"));
                     break Ended::Lost("the daemon closed the connection".into());
@@ -271,6 +306,49 @@ fn clear_unknown(ctx: &ModuleContext, outcome: &Outcome, cleared: &mut BTreeSet<
     }
 }
 
+/// `stream.update`'s sealed destination, opened for the daemon: `{"set": {"url": ...}}`, or
+/// `{"set": {"unreadable": reason}}` when it can't be (the daemon then refuses it). A plain
+/// `url` (only the local control socket may give one) is refused the same way. Arguments
+/// without a well-formed sealed destination go on as they are, for the daemon to check.
+async fn open_destination(
+    identity: Option<&tokio::sync::watch::Receiver<IdentityState>>,
+    mut args: Value,
+) -> Value {
+    // `url` and `unreadable` are this function's own: from the cloud, a destination is sealed.
+    let inner = args.pointer("/destination/set").and_then(Value::as_object);
+    if inner.is_some_and(|inner| inner.contains_key("url") || inner.contains_key("unreadable")) {
+        args["destination"] =
+            json!({"set": {"unreadable": "a destination from the cloud must be sealed"}});
+        return args;
+    }
+    let Some(sealed) = args
+        .pointer("/destination/set/sealed")
+        .and_then(|sealed| serde_json::from_value::<Sealed>(sealed.clone()).ok())
+    else {
+        return args;
+    };
+    let stream = args["stream_id"].as_str().unwrap_or_default().to_owned();
+    let aad = format!("stream.destination {stream}");
+    let opened = match identity {
+        None => Err("the device has no key for sealed secrets".to_owned()),
+        Some(identity) => open_sealed(identity, aad.as_bytes(), &sealed)
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|plain| {
+                String::from_utf8(plain.to_vec())
+                    .map_err(|_| "the sealed destination isn't text".to_owned())
+            }),
+    };
+    args["destination"] = match opened {
+        Ok(url) => json!({"set": {"url": url}}),
+        Err(reason) => {
+            tracing::warn!(%stream, %reason, "sealed destination not opened");
+            json!({"set": {"unreadable": reason}})
+        }
+    };
+    args
+}
+
 fn publish(ctx: &ModuleContext, event: &Value) {
     if let Some(kind) = event["kind"].as_str() {
         ctx.mqtt.publish_event(
@@ -280,3 +358,6 @@ fn publish(ctx: &ModuleContext, event: &Value) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

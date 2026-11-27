@@ -32,7 +32,7 @@ use tokio::time::Instant;
 
 use super::{Module, ModuleContext, ModuleError, ModuleFuture};
 use crate::identity::manager::IdentityState;
-use crate::identity::secrets::{Sealed, SecretError};
+use crate::identity::secrets::{Sealed, SecretError, open_sealed};
 use crate::mqtt::envelope::timestamp;
 use crate::router::{Outcome, PendingCommand, codes};
 use netlink::{Kernel, Rtnetlink, Watch};
@@ -423,20 +423,12 @@ impl NetModule {
         };
         let sealed: Sealed = serde_json::from_value(sealed)
             .map_err(|_| unreadable(&SecretError::Malformed("sealed is {enc, ct}")))?;
-        let ready = self
+        let identity = self
             .identity
             .as_ref()
-            .and_then(|identity| match &*identity.borrow() {
-                IdentityState::Ready(ready) => Some(Arc::clone(ready)),
-                _ => None,
-            });
-        let (thing, key) = ready
-            .as_ref()
-            .and_then(|ready| Some((ready.device.thing_name.clone(), ready.secrets.clone()?)))
             .ok_or_else(|| unreadable(&SecretError::NoKey))?;
         let aad = format!("wifi.passphrase {ssid}");
-        let opened = key
-            .open(&thing, aad.as_bytes(), &sealed)
+        let opened = open_sealed(identity, aad.as_bytes(), &sealed)
             .await
             .map_err(|error| unreadable(&error))?;
         let text =

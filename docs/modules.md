@@ -68,7 +68,20 @@ uplinks by `srtla_send`.
   itself only once no stream is live.
 
 **Commands and events**
-- Commands: `stream.start`, `stream.stop` and `stream.status`.
+- Commands: `stream.start`, `stream.stop`, `stream.update` and `stream.status`. From the cloud
+  they are AWS IoT commands (`helios-stream-start-v1`, `-stop-v1`, `-update-v1`; helios-contract
+  `model/device.smithy`). `start`, `stop` and `update` answer `{"status": ...}` with the stream as
+  it is after the command.
+- `stream.update` changes any of source, profile, destination, bitrate, source ceiling and
+  recording at once. Each is `{"set": value}` or `{"configured": {}}` (back to `helios.toml`'s);
+  a `null` is never a setting. Every setting is checked first (against the new profile, if one is
+  given); if any is refused, nothing changes and the answer lists every refusal in `refused`. A
+  new source, profile or destination restarts a running stream once.
+- A destination from the cloud is sealed to the device's key (AAD `stream.destination
+  <stream_id>`). Helios's `stream` module opens it and passes the URL to the daemon; it refuses
+  a plain URL from the cloud. Writes to a device move to commands, and its shadows become
+  reported-only (Notion: *Helios - State Management: Tenets and Practices*); the desired state
+  below still works until the cloud has switched.
 - Events: `stream.connected`, `stream.live`, `stream.disconnected` and `stream.stats`.
 - ffmpeg's arguments come only from the local profiles.
 
