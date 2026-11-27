@@ -22,7 +22,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::SystemTime;
 
-use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -51,13 +50,6 @@ pub trait Module: Send + Sync + 'static {
     /// The stable name: the command topic, the shadow's name and the config section.
     fn name(&self) -> &'static str;
 
-    /// Whether it reads its shadow's desired state (`ModuleContext::desired`). Shadows are
-    /// reported-only and writes are commands (the page "Helios - State Management: Tenets and
-    /// Practices"); only display still reads desired state, until its idle screen is a command.
-    fn reads_desired(&self) -> bool {
-        false
-    }
-
     /// Runs until `ctx.cancel` fires, then returns `Ok(())`. Returning an error, panicking or
     /// returning while not cancelled makes the supervisor restart the module with a new context.
     fn run(&self, ctx: ModuleContext) -> ModuleFuture<'_>;
@@ -68,15 +60,13 @@ pub trait Module: Send + Sync + 'static {
 #[error("{0}")]
 pub struct ModuleError(pub String);
 
-/// What one run of a module gets. Every run gets new command and desired-state channels, so a
-/// restarted module starts from a clean queue.
+/// What one run of a module gets. Every run gets a new command channel, so a restarted module
+/// starts from a clean queue. Writes to a module are commands; its shadow is reported-only (the
+/// page "Helios - State Management: Tenets and Practices").
 #[derive(Debug)]
 pub struct ModuleContext {
     /// Commands on `helios/<thing>/cmd/<name>` (`RouterHandle::register`).
     pub commands: mpsc::Receiver<PendingCommand>,
-    /// The `<name>` shadow's desired state (`ShadowHandle::desired`) if the module reads it
-    /// ([`Module::reads_desired`]); otherwise closed.
-    pub desired: mpsc::UnboundedReceiver<Value>,
     /// For the module's reported state.
     pub shadows: ShadowHandle,
     /// For events (`publish_event`) and the connection's status.

@@ -8,10 +8,11 @@
 //! no longer reports, and those are set to `null` in the next update, which removes them. That
 //! goes for nested keys too (`streams.<id>`), since the service merges an update into what it
 //! holds and keeps a nested key until it's set to `null`. The
-//! reply's `desired` state, and every later `update/delta`, go to the module if it asked for them
-//! with [`ShadowHandle::desired`] (only display does; every other shadow is reported-only). A
-//! module can also remove desired state it doesn't read with [`ShadowHandle::clear_desired`]: the
-//! next update sets that key to `null` in `desired`, until an update carrying it is accepted.
+//! Shadows are reported-only: writes to the device are commands (the page "Helios - State
+//! Management: Tenets and Practices"), so no desired state reaches a module and deltas aren't
+//! subscribed to. A module removes desired state left in its shadow (from before 0.17.0) with
+//! [`ShadowHandle::clear_desired`]: the next update sets that key to `null` in `desired`, until
+//! an update carrying it is accepted.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,7 +50,7 @@ impl Default for Timing {
     }
 }
 
-/// Reports shadow state and receives desired state. Cheap to clone.
+/// Reports shadow state. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct ShadowHandle {
     requests: mpsc::UnboundedSender<Request>,
@@ -60,10 +61,6 @@ enum Request {
     Report {
         shadow: String,
         reported: Map<String, Value>,
-    },
-    Desired {
-        shadow: String,
-        sender: mpsc::UnboundedSender<Value>,
     },
     ClearDesired {
         shadow: String,
@@ -81,21 +78,9 @@ impl ShadowHandle {
         });
     }
 
-    /// The desired state of `shadow`: its `desired` section after each connect (from `get`), then
-    /// each `update/delta`'s `state`.
-    #[must_use]
-    pub fn desired(&self, shadow: &str) -> mpsc::UnboundedReceiver<Value> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let _ = self.requests.send(Request::Desired {
-            shadow: shadow.to_owned(),
-            sender,
-        });
-        receiver
-    }
-
-    /// Removes `path` (`["streams"]`) from `shadow`'s desired state: desired state the module
-    /// doesn't read (its shadow is reported-only), which the service would otherwise send in a
-    /// delta after every report.
+    /// Removes `path` (`["streams"]`) from `shadow`'s desired state: desired state left from
+    /// before 0.17.0, which the service would otherwise keep sending in a delta after every
+    /// report.
     pub fn clear_desired(&self, shadow: &str, path: &[&str]) {
         let _ = self.requests.send(Request::ClearDesired {
             shadow: shadow.to_owned(),
@@ -191,7 +176,6 @@ struct Shadow {
     /// The update waiting for a reply.
     in_flight: Option<InFlight>,
     last_sent: Option<Instant>,
-    desired: Option<mpsc::UnboundedSender<Value>>,
 }
 
 struct Manager {
@@ -285,15 +269,6 @@ impl Manager {
                     entry.dirty = true;
                 }
             }
-            Request::Desired { shadow, sender } => {
-                self.shadows.entry(shadow.clone()).or_default().desired = Some(sender);
-                // Asked for while connected (a module restarted): read the shadow again, so the
-                // new receiver gets the full desired state, not just later deltas.
-                if let Some(thing) = self.thing() {
-                    self.mqtt
-                        .publish_now(format!("{}/get", base(&thing, &shadow)), b"{}".to_vec());
-                }
-            }
         }
     }
 
@@ -342,11 +317,6 @@ impl Manager {
                     "shadow update rejected"
                 );
             }
-            ("update", "delta") => {
-                if let Some(desired) = &shadow.desired {
-                    let _ = desired.send(document["state"].clone());
-                }
-            }
             ("get", "accepted") => {
                 if let Some(reported) = document["state"]["reported"].as_object() {
                     let mut gone = Vec::new();
@@ -357,11 +327,6 @@ impl Manager {
                             shadow.dirty = true;
                         }
                     }
-                }
-                if let (Some(desired), Some(state)) =
-                    (&shadow.desired, document["state"].get("desired"))
-                {
-                    let _ = desired.send(state.clone());
                 }
             }
             // 404 just means the shadow doesn't exist yet.
@@ -439,40 +404,28 @@ impl Manager {
 /// Reports as module tests see them: (shadow, reported).
 #[cfg(test)]
 pub(crate) type TestReports = mpsc::UnboundedReceiver<(String, Map<String, Value>)>;
-/// Desired-state subscriptions as module tests see them: (shadow, where deltas go).
-#[cfg(test)]
-pub(crate) type TestDesired = mpsc::UnboundedReceiver<(String, mpsc::UnboundedSender<Value>)>;
 
 #[cfg(any(test, feature = "module-stream"))]
 /// Reports from a detached handle: (shadow, reported).
 pub(crate) type DetachedReports = mpsc::UnboundedReceiver<(String, Map<String, Value>)>;
-#[cfg(any(test, feature = "module-stream"))]
-/// Desired-state subscriptions from a detached handle: (shadow, where deltas go).
-pub(crate) type DetachedDesired = mpsc::UnboundedReceiver<(String, mpsc::UnboundedSender<Value>)>;
 
 impl ShadowHandle {
     #[cfg(any(test, feature = "module-stream"))]
-    /// A handle that isn't connected to a shadow manager: reports arrive on the first channel
-    /// as (shadow, reported), and each `desired` call gets its sender from the second. A
-    /// `clear_desired(shadow, path)` arrives on the first as (`<shadow>#desired`, `{"clear":
-    /// path}`). For
+    /// A handle that isn't connected to a shadow manager: reports arrive as (shadow, reported),
+    /// and a `clear_desired(shadow, path)` as (`<shadow>#desired`, `{"clear": path}`). For
     /// components run outside the agent, such as the stream daemon's engine, and for tests.
     ///
     /// # Panics
     ///
     /// Panics if called outside a tokio runtime.
-    pub(crate) fn detached() -> (Self, DetachedReports, DetachedDesired) {
+    pub(crate) fn detached() -> (Self, DetachedReports) {
         let (requests, mut incoming) = mpsc::unbounded_channel();
         let (reports_tx, reports) = mpsc::unbounded_channel();
-        let (desired_tx, desired) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(request) = incoming.recv().await {
                 match request {
                     Request::Report { shadow, reported } => {
                         let _ = reports_tx.send((shadow, reported));
-                    }
-                    Request::Desired { shadow, sender } => {
-                        let _ = desired_tx.send((shadow, sender));
                     }
                     // Arrives with the reports, as `<shadow>#desired` with `{"clear": path}`.
                     Request::ClearDesired { shadow, path } => {
@@ -483,12 +436,12 @@ impl ShadowHandle {
                 }
             }
         });
-        (Self { requests }, reports, desired)
+        (Self { requests }, reports)
     }
 
     /// A handle for module tests: [`Self::detached`].
     #[cfg(test)]
-    pub(crate) fn for_test() -> (Self, TestReports, TestDesired) {
+    pub(crate) fn for_test() -> (Self, TestReports) {
         Self::detached()
     }
 }

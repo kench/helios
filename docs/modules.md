@@ -19,10 +19,14 @@ Screens on the scanner's framebuffer, drawn from templates compiled into Helios:
 `message`, `result`, `blank` and `test`.
 
 - **Idle screen:** `status` shows the clock (in `time_zone`), the thing name, the MQTT
-  connection and the device's address. The `display` shadow's desired state
-  `{"idle": {"template": …, "fields": …}}` sets a different one.
-- **Commands:** `display.show` (`template`, `fields`, `duration_s`), `display.clear` and
-  `display.status`.
+  connection and the device's address. `display.idle` sets a different one until Helios
+  restarts; then `idle_template` applies again.
+- **Commands:** `display.show` (`template`, `fields`, `duration_s`), `display.clear`,
+  `display.idle` and `display.status`. `display.idle` (AWS IoT command `helios-display-idle-v1`)
+  takes `{"idle": {"set": {"<template>": {fields}}}}` or `{"idle": {"configured": {}}}` and
+  answers `{"status": ...}`; anything outside the model (helios-contract `model/device.smithy`)
+  is `INVALID_MESSAGE` and changes nothing.
+- **Shadow:** reported-only. Desired state left in it from before 0.17.0 is removed.
 - **Fonts:** Noto Sans (`assets/fonts`, SIL Open Font License). `bold_font` can name a font file
   on the device for bold text, for licensed fonts that mustn't be compiled in.
 - **Behaviour:** it redraws only the rows that change, and shows "Helios stopped" on shutdown.
@@ -89,6 +93,8 @@ uplinks by `srtla_send`.
 - Writes are commands only, and the `stream` shadow is reported-only (Notion: *Helios - State
   Management: Tenets and Practices*). Since 0.17.0 the device reads no desired state for streams,
   and removes any left in the shadow, so AWS IoT stops sending it in a delta after every report.
+  Since the release after 0.17.0, no module reads desired state, and Helios doesn't subscribe to
+  shadow deltas.
 - Events: `stream.connected`, `stream.live`, `stream.disconnected` and `stream.stats`.
 - ffmpeg's arguments come only from the local profiles.
 

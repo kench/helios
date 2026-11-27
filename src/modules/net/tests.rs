@@ -570,10 +570,9 @@ fn context(
     mpsc::UnboundedReceiver<MqttRequest>,
 ) {
     let (mqtt, requests, _status) = MqttHandle::for_test();
-    let (shadows, reports, _desired) = ShadowHandle::for_test();
+    let (shadows, reports) = ShadowHandle::for_test();
     let ctx = ModuleContext {
         commands: mpsc::channel(1).1,
-        desired: mpsc::unbounded_channel().1,
         shadows,
         mqtt,
         sysfs: sysfs.to_owned(),

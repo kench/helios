@@ -239,10 +239,9 @@ fn classifies_network_serial_smartcard_and_storage_devices() {
 
 fn context() -> ModuleContext {
     let (mqtt, _, _) = MqttHandle::for_test();
-    let (shadows, _, _) = ShadowHandle::for_test();
+    let (shadows, _) = ShadowHandle::for_test();
     ModuleContext {
         commands: mpsc::channel(1).1,
-        desired: mpsc::unbounded_channel().1,
         shadows,
         mqtt,
         sysfs: "/sys".into(),
@@ -464,12 +463,11 @@ fn running(fixture: Fixture, opens: &[bool]) -> Running {
             .unwrap_or_else(|| Err(io::Error::from_raw_os_error(libc::EACCES)))
     };
     let (mqtt, published, _status) = MqttHandle::for_test();
-    let (shadows, reports, _desired) = ShadowHandle::for_test();
+    let (shadows, reports) = ShadowHandle::for_test();
     let (commands, commands_rx) = mpsc::channel(4);
     let cancel = tokio_util::sync::CancellationToken::new();
     let ctx = ModuleContext {
         commands: commands_rx,
-        desired: mpsc::unbounded_channel().1,
         shadows,
         mqtt,
         sysfs: fixture.root.path().to_owned(),

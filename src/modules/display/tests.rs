@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::canvas::Color;
 use super::templates::Screen;
 use super::*;
-use crate::router::Outcome;
+use crate::router::{Outcome, codes};
 
 const BACKGROUND: Color = Color::rgb(18, 22, 30);
 const BLUE: Color = Color::rgb(40, 120, 210);
@@ -23,7 +23,6 @@ const STOPPED_TEXT: Color = Color::rgb(150, 160, 175);
 struct Harness {
     dir: PathBuf,
     commands: mpsc::Sender<PendingCommand>,
-    desired: mpsc::UnboundedSender<Value>,
     mqtt: watch::Sender<MqttStatus>,
     reports: mpsc::UnboundedReceiver<(String, Map<String, Value>)>,
     cancel: CancellationToken,
@@ -68,13 +67,11 @@ impl Harness {
 
     fn start_in(dir: PathBuf, adjust: impl FnOnce(DisplaySettings) -> DisplaySettings) -> Self {
         let (commands, commands_rx) = mpsc::channel(16);
-        let (desired, desired_rx) = mpsc::unbounded_channel();
         let (mqtt, mqtt_rx) = watch::channel(MqttStatus::default());
-        let (shadows, reports, _desired_requests) = ShadowHandle::for_test();
+        let (shadows, reports) = ShadowHandle::for_test();
         let cancel = CancellationToken::new();
         let inputs = Inputs {
             commands: commands_rx,
-            desired: desired_rx,
             shadows,
             mqtt: mqtt_rx,
             sysfs: dir.join("sys"),
@@ -83,7 +80,6 @@ impl Harness {
         Self {
             dir,
             commands,
-            desired,
             mqtt,
             reports,
             cancel,
@@ -123,9 +119,26 @@ impl Harness {
                     .await
                     .expect("a report")
                     .expect("reports open");
-            assert_eq!(shadow, MODULE);
-            if check(&reported) {
+            if shadow == MODULE && check(&reported) {
                 return reported;
+            }
+            assert!(
+                shadow == MODULE || shadow == "display#desired",
+                "a report for {shadow}"
+            );
+        }
+    }
+
+    /// Waits for the module to remove desired state, and returns the path it removed.
+    async fn cleared(&mut self) -> Value {
+        loop {
+            let (shadow, cleared) =
+                tokio::time::timeout(Duration::from_secs(5), self.reports.recv())
+                    .await
+                    .expect("a report")
+                    .expect("reports open");
+            if shadow == "display#desired" {
+                return cleared["clear"].clone();
             }
         }
     }
@@ -288,46 +301,71 @@ async fn refuses_bad_commands() {
 }
 
 #[tokio::test]
-async fn follows_the_desired_idle_screen() {
-    let mut harness = Harness::start("desired", true);
+async fn display_idle_sets_the_idle_screen_until_configured() {
+    let mut harness = Harness::start("idle-command", true);
+    // Reported-only: desired state left from before 0.17.0 is removed.
+    assert_eq!(harness.cleared().await, json!(["idle"]));
     harness.report(|r| r["available"] == true).await;
 
-    harness
-        .desired
-        .send(json!({"idle": {"template": "blank"}}))
-        .unwrap();
-    harness.report(|r| r["idle"] == "blank").await;
+    let result = ok(harness
+        .command("idle", json!({"idle": {"set": {"blank": {}}}}))
+        .await);
+    assert_eq!(result["status"]["idle"], "blank");
     assert_eq!(harness.pixel(0, 0), Color::BLACK);
 
-    harness
-        .desired
-        .send(json!({"idle": {"template": "message"}}))
-        .unwrap();
-    let refused = harness.report(|r| !r["error"].is_null()).await;
-    assert!(
-        refused["error"]
-            .as_str()
-            .unwrap()
-            .contains("title is required")
-    );
-    assert_eq!(refused["idle"], "blank");
+    // Anything outside the model is INVALID_MESSAGE and changes nothing.
+    for args in [
+        json!({"idle": {"set": {"message": {}}}}),
+        json!({"idle": {"set": {"template": "status"}}}),
+        json!({"idle": null}),
+        json!({}),
+    ] {
+        match harness.command("idle", args.clone()).await {
+            Outcome::Err { code, .. } => assert_eq!(code, codes::INVALID_MESSAGE, "{args}"),
+            Outcome::Ok(value) => panic!("{args} accepted: {value}"),
+        }
+    }
+    let status = ok(harness.command("status", json!({})).await);
+    assert_eq!(status["idle"], "blank");
+    assert_eq!(status["error"], Value::Null);
 
-    // Other desired fields are ignored; null goes back to the configured idle screen.
-    harness.desired.send(json!({"something": 1})).unwrap();
-    harness.desired.send(json!({"idle": null})).unwrap();
-    let back = harness.report(|r| r["idle"] == "status").await;
-    assert_eq!(back["error"], Value::Null);
+    // Configured goes back to helios.toml's idle screen.
+    let result = ok(harness
+        .command("idle", json!({"idle": {"configured": {}}}))
+        .await);
+    assert_eq!(result["status"]["idle"], "status");
     assert_eq!(harness.pixel(0, 0), BACKGROUND);
 
     // While a screen is shown, a new idle screen waits for it to end.
     ok(harness.command("show", json!({"template": "test"})).await);
-    harness
-        .desired
-        .send(json!({"idle": {"template": "blank"}}))
-        .unwrap();
-    harness.report(|r| r["idle"] == "blank").await;
+    let result = ok(harness
+        .command(
+            "idle",
+            json!({"idle": {"set": {"message": {"title": "Out of service", "severity": "warning"}}}}),
+        )
+        .await);
+    assert_eq!(result["status"]["idle"], "message");
+    assert_eq!(result["status"]["template"], "test");
     assert_eq!(harness.pixel(50, 100), Color::WHITE);
     harness.stop().await;
+}
+
+#[test]
+fn display_command_vectors_from_the_contract() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("contract/test-vectors/display-commands-v1.json");
+    let vectors: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).expect("vectors (contract submodule at v0.10.0 or later)"),
+    )
+    .expect("JSON");
+    let cases = vectors["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 20);
+    for case in cases {
+        assert_eq!(case["command"], "helios-display-idle-v1");
+        let parsed = super::idle_request(&case["args"], &Screen::Status);
+        let valid = case["valid"].as_bool().expect("valid");
+        assert_eq!(parsed.is_ok(), valid, "{}: {parsed:?}", case["name"]);
+    }
 }
 
 #[tokio::test]
@@ -385,10 +423,8 @@ async fn keeps_running_when_its_inputs_close() {
     let mut harness = Harness::start("closed", true);
     harness.report(|r| r["available"] == true).await;
     let (closed_commands, _) = mpsc::channel(1);
-    let (closed_desired, _) = mpsc::unbounded_channel();
     let (closed_mqtt, _) = watch::channel(MqttStatus::default());
     drop(std::mem::replace(&mut harness.commands, closed_commands));
-    drop(std::mem::replace(&mut harness.desired, closed_desired));
     drop(std::mem::replace(&mut harness.mqtt, closed_mqtt));
     Harness::settle().await;
 

@@ -402,7 +402,7 @@ impl DisplaySection {
         let idle = Screen::parse(&idle_template, &serde_json::Value::Null).map_err(|error| {
             format!(
                 "modules.display.idle_template: {error} (status, blank or test; other templates \
-                 need fields, which only the shadow's desired state can set)"
+                 need fields, which only display.idle can set)"
             )
         })?;
         let time_zone_name = self.time_zone.unwrap_or_else(|| "UTC".to_owned());
