@@ -2,8 +2,8 @@
 //! when a run fails, panics or ends without being cancelled.
 //!
 //! Every run gets a new [`ModuleContext`]: the module registers with the router again (the
-//! router replaces the old queue) and asks for its shadow's desired state again (the shadow
-//! manager reads the shadow once more, so the run gets the full desired state). A run that
+//! router replaces the old queue) and, if it reads desired state (only display), asks for it
+//! again (the shadow manager reads the shadow once more, so the run gets all of it). A run that
 //! lasted [`STABLE_RUN`] resets the backoff, so a module that fails once a day restarts after a
 //! second, not after the maximum delay.
 
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -122,7 +122,11 @@ async fn supervise(
     loop {
         let ctx = ModuleContext {
             commands: deps.router.register(name),
-            desired: deps.shadows.desired(name),
+            desired: if module.reads_desired() {
+                deps.shadows.desired(name)
+            } else {
+                mpsc::unbounded_channel().1
+            },
             shadows: deps.shadows.clone(),
             mqtt: deps.mqtt.clone(),
             sysfs: deps.sysfs.clone(),

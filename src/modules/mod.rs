@@ -51,6 +51,13 @@ pub trait Module: Send + Sync + 'static {
     /// The stable name: the command topic, the shadow's name and the config section.
     fn name(&self) -> &'static str;
 
+    /// Whether it reads its shadow's desired state (`ModuleContext::desired`). Shadows are
+    /// reported-only and writes are commands (the page "Helios - State Management: Tenets and
+    /// Practices"); only display still reads desired state, until its idle screen is a command.
+    fn reads_desired(&self) -> bool {
+        false
+    }
+
     /// Runs until `ctx.cancel` fires, then returns `Ok(())`. Returning an error, panicking or
     /// returning while not cancelled makes the supervisor restart the module with a new context.
     fn run(&self, ctx: ModuleContext) -> ModuleFuture<'_>;
@@ -67,7 +74,8 @@ pub struct ModuleError(pub String);
 pub struct ModuleContext {
     /// Commands on `helios/<thing>/cmd/<name>` (`RouterHandle::register`).
     pub commands: mpsc::Receiver<PendingCommand>,
-    /// The `<name>` shadow's desired state (`ShadowHandle::desired`).
+    /// The `<name>` shadow's desired state (`ShadowHandle::desired`) if the module reads it
+    /// ([`Module::reads_desired`]); otherwise closed.
     pub desired: mpsc::UnboundedReceiver<Value>,
     /// For the module's reported state.
     pub shadows: ShadowHandle,

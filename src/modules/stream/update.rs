@@ -11,6 +11,9 @@
 //!
 //! The stream client in Helios opens a sealed destination before the command reaches the
 //! daemon, and passes it on as `{"url": ...}`, or `{"unreadable": reason}` when it can't.
+//!
+//! The daemon's saved overrides go through the same checks at startup ([`Streams::resume`]), so
+//! there is one way to change a stream's settings.
 
 use serde::Deserialize;
 use serde::de::Deserializer;
@@ -38,6 +41,20 @@ pub(crate) struct UpdateArgs {
     source_ceiling_percent: Option<Setting<u32>>,
     #[serde(default, deserialize_with = "present")]
     record: Option<Setting<bool>>,
+}
+
+/// `stream.start` and `stream.stop`'s arguments: the stream, and nothing else (a bitrate is
+/// `stream.update`'s).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StreamArgs {
+    pub(crate) stream_id: String,
+}
+
+impl StreamArgs {
+    pub(crate) fn parse(name: &str, args: &Value) -> Result<Self, String> {
+        serde_json::from_value(args.clone()).map_err(|error| format!("stream.{name}: {error}"))
+    }
 }
 
 /// A member that's there must be a value: `null` doesn't mean "left out".
@@ -245,6 +262,64 @@ impl SourceArg {
     }
 }
 
+/// A change to one stream's settings, from `stream.update` or the saved overrides; a setting
+/// left out (`None`) is unchanged.
+#[derive(Debug, Default)]
+pub(crate) struct Changes {
+    source: Option<Setting<Source>>,
+    profile: Option<Setting<String>>,
+    destination: Option<Setting<DestinationArg>>,
+    bitrate: Option<Setting<u32>>,
+    source_ceiling_percent: Option<Setting<u32>>,
+    record: Option<Setting<bool>>,
+}
+
+impl Changes {
+    /// The overrides the daemon saved for a stream (`{"bitrate_override_kbps", "overrides"}`, as
+    /// the stream's status reports them): each one set, as a `stream.update` would set it.
+    pub(crate) fn saved(stream: &Value) -> Self {
+        let overrides = &stream["overrides"];
+        let number = |value: Option<&Value>| {
+            value
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .map(Setting::Set)
+        };
+        Self {
+            source: overrides
+                .get("source")
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .map(Setting::Set),
+            profile: overrides["profile"]
+                .as_str()
+                .map(|profile| Setting::Set(profile.to_owned())),
+            destination: overrides["destination"]
+                .as_str()
+                .map(|url| Setting::Set(DestinationArg::Url(url.to_owned()))),
+            bitrate: number(stream.get("bitrate_override_kbps")),
+            source_ceiling_percent: number(overrides.get("source_ceiling_percent")),
+            record: overrides["record"].as_bool().map(Setting::Set),
+        }
+    }
+}
+
+impl UpdateArgs {
+    fn into_changes(self) -> Changes {
+        Changes {
+            source: self.source.map(|source| match source {
+                Setting::Set(source) => Setting::Set(source.into_source()),
+                Setting::Configured(empty) => Setting::Configured(empty),
+            }),
+            profile: self.profile,
+            destination: self.destination,
+            bitrate: self.bitrate,
+            source_ceiling_percent: self.source_ceiling_percent,
+            record: self.record,
+        }
+    }
+}
+
 impl Streams<'_> {
     /// `stream.update`.
     pub(crate) fn update(&mut self, args: &Value, ctx: &ModuleContext) -> Outcome {
@@ -262,29 +337,62 @@ impl Streams<'_> {
                 format!("no stream {:?}", args.stream_id),
             );
         };
-        let given = [
-            ("source", args.source.is_some()),
-            ("profile", args.profile.is_some()),
-            ("destination", args.destination.is_some()),
-            ("bitrate", args.bitrate.is_some()),
-            (
-                "source_ceiling_percent",
-                args.source_ceiling_percent.is_some(),
-            ),
-            ("record", args.record.is_some()),
-        ];
+        let id = args.stream_id.clone();
+        let status =
+            |streams: &Self| streams.entries[index].status(&streams.module.settings, false);
+        match self.change(index, args.into_changes(), ctx) {
+            Ok(()) => Outcome::Ok(json!({"status": status(self)})),
+            Err(refused) => {
+                let refused: Vec<Value> = refused
+                    .into_iter()
+                    .map(|(setting, reason)| json!({"setting": setting, "reason": reason}))
+                    .collect();
+                tracing::info!(stream = %id, ?refused, "stream.update refused");
+                Outcome::Ok(json!({"status": status(self), "refused": refused}))
+            }
+        }
+    }
+
+    /// Applies the overrides the daemon saved (`{"streams": {"<id>": ...}}`) before the first
+    /// pass, so each stream starts as it was left. They go through the same checks as
+    /// `stream.update`: a stream `helios.toml` no longer has is skipped, and a stream whose saved
+    /// settings it refuses now (`helios.toml` changed) starts with `helios.toml`'s, both logged.
+    pub(crate) fn resume(&mut self, saved: &Value, ctx: &ModuleContext) {
+        let streams = saved.get("streams").and_then(Value::as_object);
+        for (id, stream) in streams.into_iter().flatten() {
+            let Some(index) = self.entries.iter().position(|entry| entry.id == *id) else {
+                tracing::warn!(stream = %id, "saved overrides for a stream helios.toml doesn't have");
+                continue;
+            };
+            if let Err(refused) = self.change(index, Changes::saved(stream), ctx) {
+                tracing::warn!(stream = %id, ?refused, "saved overrides refused: helios.toml's settings apply");
+            }
+            if let Some(desired) = stream["desired"].as_str() {
+                self.set_live(index, desired == "live", BitrateChange::Keep);
+            }
+        }
+    }
+
+    /// Checks every setting in `changes` against the device and applies them all, or none: the
+    /// refusals, by setting.
+    fn change(
+        &mut self,
+        index: usize,
+        changes: Changes,
+        ctx: &ModuleContext,
+    ) -> Result<(), Vec<(&'static str, String)>> {
         let settings = &self.module.settings;
         let entry = &self.entries[index];
         let mut refused: Vec<(&'static str, String)> = Vec::new();
 
         // Source and profile together: the profile is checked against the new source.
         let mut candidate = entry.config.clone();
-        match args.source {
-            Some(Setting::Set(source)) => candidate.source = source.into_source(),
+        match changes.source {
+            Some(Setting::Set(source)) => candidate.source = source,
             Some(Setting::Configured(_)) => candidate.source = entry.configured.source.clone(),
             None => {}
         }
-        match args.profile {
+        match changes.profile {
             Some(Setting::Set(ref profile)) => candidate.profile = profile.clone(),
             Some(Setting::Configured(_)) => candidate.profile = entry.configured.profile.clone(),
             None => {}
@@ -293,7 +401,7 @@ impl Streams<'_> {
             candidate.source != entry.config.source || candidate.profile != entry.config.profile;
         if new_settings && let Err(reason) = self.check(index, &candidate) {
             let profile_changed = candidate.profile != entry.config.profile;
-            let setting = if args.profile.is_some() && profile_changed {
+            let setting = if changes.profile.is_some() && profile_changed {
                 "profile"
             } else {
                 "source"
@@ -301,18 +409,17 @@ impl Streams<'_> {
             refused.push((setting, reason));
         }
 
-        let destination = match args.destination {
+        let destination = match changes.destination {
             None => None,
             Some(Setting::Configured(_)) => Some(None),
-            Some(Setting::Set(DestinationArg::Url(url))) => {
-                match self.destination_for(index, &Value::String(url)) {
-                    Ok(destination) => Some(destination),
-                    Err(reason) => {
-                        refused.push(("destination", reason));
-                        None
-                    }
+            Some(Setting::Set(DestinationArg::Url(url))) => match self.destination_for(index, &url)
+            {
+                Ok(destination) => Some(destination),
+                Err(reason) => {
+                    refused.push(("destination", reason));
+                    None
                 }
-            }
+            },
             Some(Setting::Set(DestinationArg::Unreadable(reason))) => {
                 refused.push(("destination", reason));
                 None
@@ -327,7 +434,7 @@ impl Streams<'_> {
         };
 
         let profile = settings.profiles.get(&candidate.profile);
-        let bitrate = match args.bitrate {
+        let bitrate = match changes.bitrate {
             None => BitrateChange::Keep,
             Some(Setting::Configured(_)) => BitrateChange::Profile,
             Some(Setting::Set(kbps)) => match profile {
@@ -363,15 +470,7 @@ impl Streams<'_> {
         };
 
         if !refused.is_empty() {
-            let refused: Vec<Value> = refused
-                .into_iter()
-                .map(|(setting, reason)| json!({"setting": setting, "reason": reason}))
-                .collect();
-            tracing::info!(stream = %args.stream_id, ?refused, "stream.update refused");
-            return Outcome::Ok(json!({
-                "status": self.entries[index].status(settings, false),
-                "refused": refused,
-            }));
+            return Err(refused);
         }
 
         // Everything checks: apply it all.
@@ -393,7 +492,7 @@ impl Streams<'_> {
                 reconfigured = true;
             }
         }
-        if let Some(ceiling) = args.source_ceiling_percent {
+        if let Some(ceiling) = changes.source_ceiling_percent {
             let percent = match ceiling {
                 Setting::Set(percent) => Some(percent),
                 Setting::Configured(_) => None,
@@ -402,7 +501,7 @@ impl Streams<'_> {
                 self.set_ceiling(index, percent);
             }
         }
-        if let Some(record) = args.record {
+        if let Some(record) = changes.record {
             let entry = &mut self.entries[index];
             let before = entry.record();
             entry.record_override = match record {
@@ -410,7 +509,7 @@ impl Streams<'_> {
                 Setting::Configured(_) => None,
             };
             if entry.record() != before {
-                tracing::info!(stream = %entry.id, record = entry.record(), "recording switched by stream.update");
+                tracing::info!(stream = %entry.id, record = entry.record(), "recording switched");
                 entry.record_error = None;
                 // The encoder starts again with or without its recording branch.
                 if !reconfigured && entry.job.is_some() {
@@ -418,19 +517,14 @@ impl Streams<'_> {
                 }
             }
         }
-        for (setting, given) in given {
-            if given {
-                self.accept(index, setting);
-            }
-        }
         if reconfigured {
-            tracing::info!(stream = %args.stream_id, "new settings from stream.update");
+            tracing::info!(stream = %self.entries[index].id, "new stream settings");
             self.reconfigure(index, ctx);
         }
         if bitrate != BitrateChange::Keep {
             let live = self.entries[index].desired_live;
             self.set_live(index, live, bitrate);
         }
-        Outcome::Ok(json!({"status": self.entries[index].status(&self.module.settings, false)}))
+        Ok(())
     }
 }

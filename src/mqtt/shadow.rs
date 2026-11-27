@@ -8,10 +8,10 @@
 //! no longer reports, and those are set to `null` in the next update, which removes them. That
 //! goes for nested keys too (`streams.<id>`), since the service merges an update into what it
 //! holds and keeps a nested key until it's set to `null`. The
-//! reply's `desired` state (marked [`FULL_DESIRED`]), and every later `update/delta`, go to the
-//! module if it asked for them with [`ShadowHandle::desired`]. A module can also remove desired state it can't use (for
-//! a stream its config doesn't have) with [`ShadowHandle::clear_desired`]: the next update sets
-//! that key to `null` in `desired`, until an update carrying it is accepted.
+//! reply's `desired` state, and every later `update/delta`, go to the module if it asked for them
+//! with [`ShadowHandle::desired`] (only display does; every other shadow is reported-only). A
+//! module can also remove desired state it doesn't read with [`ShadowHandle::clear_desired`]: the
+//! next update sets that key to `null` in `desired`, until an update carrying it is accepted.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,11 +24,6 @@ use tokio_util::sync::CancellationToken;
 use crate::clock::ClockSamples;
 use crate::clock::offset::{Sample, Source};
 use crate::mqtt::manager::{Incoming, MqttHandle, MqttStatus};
-
-/// The key the shadow manager adds (`true`) to desired state from a `get`: the whole desired
-/// state, where a delta holds only what changed. A module that merges deltas replaces what it
-/// has seen on a full read, so keys removed while the device was offline go too.
-pub const FULL_DESIRED: &str = "$full";
 
 /// AWS IoT's limit on a shadow document.
 pub const MAX_DOCUMENT_BYTES: usize = 8 * 1024;
@@ -98,9 +93,9 @@ impl ShadowHandle {
         receiver
     }
 
-    /// Removes `path` (`["streams", "<id>"]`) from `shadow`'s desired state: desired state the
-    /// module can't apply, which the service would otherwise send in every delta. Only for keys
-    /// the module knows are wrong: the cloud owns the rest of the desired state.
+    /// Removes `path` (`["streams"]`) from `shadow`'s desired state: desired state the module
+    /// doesn't read (its shadow is reported-only), which the service would otherwise send in a
+    /// delta after every report.
     pub fn clear_desired(&self, shadow: &str, path: &[&str]) {
         let _ = self.requests.send(Request::ClearDesired {
             shadow: shadow.to_owned(),
@@ -366,11 +361,7 @@ impl Manager {
                 if let (Some(desired), Some(state)) =
                     (&shadow.desired, document["state"].get("desired"))
                 {
-                    let mut state = state.clone();
-                    if let Value::Object(object) = &mut state {
-                        object.insert(FULL_DESIRED.into(), Value::Bool(true));
-                    }
-                    let _ = desired.send(state);
+                    let _ = desired.send(state.clone());
                 }
             }
             // 404 just means the shadow doesn't exist yet.

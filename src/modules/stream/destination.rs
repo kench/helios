@@ -1,8 +1,8 @@
-//! SRT and SRTLA destination URLs, as operators set them through the `stream` shadow (HLD
-//! section 7.3.7): `srt://host:port` or `srtla://host:port`, with only `streamid`, `latency`
+//! SRT and SRTLA destination URLs, as operators set them with `stream.update` (HLD section
+//! 7.3.7): `srt://host:port` or `srtla://host:port`, with only `streamid`, `latency`
 //! (milliseconds) and `passphrase`, each at most once. The rules and the normal form are the
 //! Control API's (`Destinations.java` in helios-cloud), which checks them first; the device checks
-//! them again, since the desired state can come from anywhere that may write the shadow.
+//! them again, since the local control socket and the saved overrides give URLs too.
 
 use super::settings::Output;
 
