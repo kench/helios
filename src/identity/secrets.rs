@@ -139,6 +139,29 @@ impl SecretsKey {
     }
 }
 
+/// Opens `sealed` with the secrets key of the device `identity` is for, for the purpose `aad`
+/// (`wifi.passphrase <ssid>`, `stream.destination <stream_id>`; LLD 3, section 10.7).
+///
+/// # Errors
+///
+/// [`SecretError::NoKey`] until the identity is ready with a secrets key, else as
+/// [`SecretsKey::open`].
+pub async fn open_sealed(
+    identity: &tokio::sync::watch::Receiver<crate::identity::manager::IdentityState>,
+    aad: &[u8],
+    sealed: &Sealed,
+) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+    let ready = match &*identity.borrow() {
+        crate::identity::manager::IdentityState::Ready(ready) => Some(std::sync::Arc::clone(ready)),
+        _ => None,
+    };
+    let (thing, key) = ready
+        .as_ref()
+        .and_then(|ready| Some((ready.device.thing_name.clone(), ready.secrets.clone()?)))
+        .ok_or(SecretError::NoKey)?;
+    key.open(&thing, aad, sealed).await
+}
+
 /// `info` for a device: `helios secret v1 <thing>`.
 #[must_use]
 pub fn info(thing: &str) -> Vec<u8> {

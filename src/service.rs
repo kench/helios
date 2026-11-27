@@ -344,7 +344,8 @@ impl Service {
         // client, so streams outlive Helios's restarts (LLD 4, section 15).
         #[cfg(feature = "module-stream")]
         if let Some(settings) = config.stream {
-            let client = crate::modules::stream::StreamClient::new(settings.control_socket.clone());
+            let client = crate::modules::stream::StreamClient::new(settings.control_socket.clone())
+                .with_identity(identity.watch());
             #[cfg(feature = "module-net")]
             let client = client.with_uplink_view(uplink_view_rx);
             enabled.push(Arc::new(client));

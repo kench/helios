@@ -17,7 +17,7 @@ use crate::modules::Module;
 use crate::modules::usb::{UsbDevice, UsbHandle, UsbSnapshot};
 use crate::mqtt::manager::{MqttHandle, Request as MqttRequest};
 use crate::mqtt::shadow::{ShadowHandle, TestReports};
-use crate::router::{Outcome, PendingCommand};
+use crate::router::{Outcome, PendingCommand, codes};
 
 const WAIT: Duration = Duration::from_secs(600);
 
@@ -702,7 +702,7 @@ async fn commands_stop_start_and_change_the_bitrate() {
     else {
         panic!("stop refused");
     };
-    assert_eq!(stopped["desired"], "stopped");
+    assert_eq!(stopped["status"]["desired"], "stopped");
     harness.state("stopped").await;
     assert!(job.stopped.load(Ordering::SeqCst));
     let disconnected = harness.event("stream.disconnected").await;
@@ -822,11 +822,11 @@ async fn a_bitrate_override_is_kept_apart_from_the_profiles() {
             json!({"stream_id": "camera", "bitrate_kbps": null}),
         )
         .await;
-    let Outcome::Ok(status) = outcome else {
+    let Outcome::Ok(result) = outcome else {
         panic!("{outcome:?}");
     };
-    assert_eq!(status["bitrate_kbps"], 4000);
-    assert_eq!(status["bitrate_override_kbps"], Value::Null);
+    assert_eq!(result["status"]["bitrate_kbps"], 4000);
+    assert_eq!(result["status"]["bitrate_override_kbps"], Value::Null);
     assert!(
         harness
             .next_start()
@@ -3231,6 +3231,299 @@ async fn a_recording_directory_that_cannot_be_made_leaves_the_stream_running() {
         report["streams"]["camera"]["recording"]["last_error"]
             .as_str()
             .is_some_and(|e| e.contains("can't create /proc/helios-no-such-dir/camera"))
+    );
+    harness.stop().await;
+}
+
+// --- stream.update (helios-contract device.smithy) -----------------------------------------
+
+async fn update(harness: &Harness, args: Value) -> Value {
+    match harness.command("update", args).await {
+        Outcome::Ok(result) => result,
+        other => panic!("update failed: {other:?}"),
+    }
+}
+
+fn refused_settings(result: &Value) -> Vec<&str> {
+    result["refused"]
+        .as_array()
+        .map(|refused| {
+            refused
+                .iter()
+                .filter_map(|r| r["setting"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_update_changes_settings_together_with_one_restart() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
+    let first = harness.next_start().await;
+
+    let result = update(
+        &harness,
+        json!({
+            "stream_id": "pattern",
+            "profile": {"set": "small"},
+            "bitrate": {"set": 2500},
+            "destination": {"set": {"url": "srt://other.example.com:4000?streamid=x/y"}},
+            "source": {"set": {"test": {"size": "640x360"}}},
+        }),
+    )
+    .await;
+    assert_eq!(result.get("refused"), None, "{result}");
+    let status = &result["status"];
+    assert_eq!(status["profile"], "small");
+    assert_eq!(status["bitrate_override_kbps"], 2500);
+    assert_eq!(status["overrides"]["profile"], "small");
+    assert_eq!(status["overrides"]["source"]["size"], "640x360");
+
+    // One restart, with all of it.
+    let second = harness.next_start().await;
+    assert!(first.stopped.load(Ordering::SeqCst));
+    let args = second.spec.args.join(" ");
+    assert!(args.contains("-b:v 2500k"), "{args}");
+    assert!(args.contains("srt://other.example.com:4000?"), "{args}");
+    assert!(args.contains("640x360"), "{args}");
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_update_refuses_whole_and_changes_nothing() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
+    let first = harness.next_start().await;
+
+    // A good profile with a bitrate outside its limits: neither applies.
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "profile": {"set": "small"}, "bitrate": {"set": 5000}}),
+    )
+    .await;
+    assert_eq!(refused_settings(&result), ["bitrate"], "{result}");
+    assert!(
+        result["refused"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("500-3000"),
+        "{result}"
+    );
+    assert_eq!(result["status"]["profile"], "big");
+
+    // Every refusal is listed; the good ceiling doesn't apply either.
+    let result = update(
+        &harness,
+        json!({
+            "stream_id": "pattern",
+            "profile": {"set": "nope"},
+            "destination": {"set": {"unreadable": "the sealed value can't be opened with this device's key"}},
+            "source_ceiling_percent": {"set": 150},
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused_settings(&result),
+        ["profile", "destination"],
+        "{result}"
+    );
+    assert_eq!(
+        result["status"]["overrides"]["source_ceiling_percent"],
+        Value::Null
+    );
+
+    // A sealed destination the stream client didn't open, and one the device can't use.
+    for destination in [
+        json!({"sealed": {"enc": "AAAA", "ct": "AAAA"}}),
+        json!({"url": "srt://h:1?mode=listener"}),
+    ] {
+        let result = update(
+            &harness,
+            json!({"stream_id": "pattern", "destination": {"set": destination}}),
+        )
+        .await;
+        assert_eq!(refused_settings(&result), ["destination"], "{result}");
+    }
+    // A passthrough profile has no bitrate to set.
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "profile": {"set": "passthrough"}, "bitrate": {"set": 2000}}),
+    )
+    .await;
+    assert!(refused_settings(&result).contains(&"bitrate"), "{result}");
+
+    // Nothing restarted.
+    assert!(!first.stopped.load(Ordering::SeqCst));
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_update_configured_goes_back_to_helios_toml() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
+    harness.next_start().await;
+
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "profile": {"set": "small"}, "bitrate": {"set": 2500}, "source_ceiling_percent": {"set": 150}}),
+    )
+    .await;
+    assert_eq!(result["status"]["bitrate_override_kbps"], 2500);
+    harness.next_start().await;
+
+    let result = update(
+        &harness,
+        json!({
+            "stream_id": "pattern",
+            "profile": {"configured": {}},
+            "bitrate": {"configured": {}},
+            "source_ceiling_percent": {"configured": {}},
+        }),
+    )
+    .await;
+    assert_eq!(result.get("refused"), None, "{result}");
+    let status = &result["status"];
+    assert_eq!(status["profile"], "big");
+    assert_eq!(status["bitrate_kbps"], 4000);
+    assert_eq!(status["bitrate_override_kbps"], Value::Null);
+    assert_eq!(
+        status["overrides"],
+        json!({"source": null, "profile": null, "destination": null, "source_ceiling_percent": null, "record": null})
+    );
+
+    // The profile's own bitrate is no override (the rpi5test case, 2026-11-26).
+    harness.next_start().await;
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "bitrate": {"set": 4000}}),
+    )
+    .await;
+    assert_eq!(result.get("refused"), None, "{result}");
+    assert_eq!(result["status"]["bitrate_override_kbps"], Value::Null);
+    harness.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_update_rejects_arguments_outside_the_model() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
+    harness.next_start().await;
+    for args in [
+        json!({"stream_id": "nope"}),
+        json!({"stream_id": "pattern", "bitrate": null}),
+        json!({"stream_id": "pattern", "profile": {"set": "small", "configured": {}}}),
+    ] {
+        match harness.command("update", args.clone()).await {
+            Outcome::Err { code, .. } => assert_eq!(code, codes::INVALID_MESSAGE, "{args}"),
+            other => panic!("{args}: {other:?}"),
+        }
+    }
+    harness.stop().await;
+}
+
+/// The contract's shared vectors: every valid case parses, every invalid one doesn't.
+#[test]
+fn stream_command_vectors_from_the_contract() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("contract/test-vectors/stream-commands-v1.json");
+    let vectors: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).expect("vectors (contract submodule at v0.9.0 or later)"),
+    )
+    .expect("JSON");
+    let cases = vectors["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 17);
+    for case in cases {
+        let args = &case["args"];
+        let valid = case["valid"].as_bool().expect("valid");
+        let parsed = match case["command"].as_str().expect("command") {
+            "helios-stream-update-v1" => super::update::UpdateArgs::parse(args).map(|_| ()),
+            "helios-stream-start-v1" | "helios-stream-stop-v1" => args
+                .get("stream_id")
+                .and_then(Value::as_str)
+                .map(|_| ())
+                .ok_or_else(|| "stream_id is required".to_owned()),
+            other => panic!("unknown command {other}"),
+        };
+        assert_eq!(parsed.is_ok(), valid, "{}: {parsed:?}", case["name"]);
+    }
+}
+
+#[test]
+fn stream_update_arguments_follow_the_models_patterns() {
+    use super::update::UpdateArgs;
+    let parses = |extra: Value| {
+        let mut args = json!({"stream_id": "pattern"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        UpdateArgs::parse(&args)
+    };
+    for good in [
+        json!({"source": {"set": {"camera": {"video": "usb:1-1.3"}}}}),
+        json!({"source": {"set": {"camera": {"video": "0bda:8153:SERIAL-1", "audio": "usb:2-1"}}}}),
+        json!({"source": {"set": {"rtmp": {"key": "ingest-12"}}}}),
+        json!({"source": {"set": {"test": {"size": "1920x1080", "fps": 60}}}}),
+        json!({"record": {"set": false}}),
+        json!({"record": {"configured": {}}}),
+        json!({"source_ceiling_percent": {"set": 0}}),
+    ] {
+        assert!(parses(good.clone()).is_ok(), "{good}");
+    }
+    for bad in [
+        json!({"source": {"set": {"camera": {"video": "usb:1"}}}}),
+        json!({"source": {"set": {"camera": {"video": "/dev/video0"}}}}),
+        json!({"source": {"set": {"camera": {"video": "usb:1-1", "audio": null}}}}),
+        json!({"source": {"set": {"camera": {"video": "0bda:815:SERIAL"}}}}),
+        json!({"source": {"set": {"rtmp": {"key": "ingest-0"}}}}),
+        json!({"source": {"set": {"rtmp": {"key": "ingest-1000"}}}}),
+        json!({"source": {"set": {"rtmp": {"key": "camera"}}}}),
+        json!({"source": {"set": {"test": {"size": "big"}}}}),
+        json!({"source": {"set": {"test": {"fps": 0}}}}),
+        json!({"source": {"set": {"test": {"fps": 121}}}}),
+        json!({"profile": {"set": "has space"}}),
+        json!({"profile": {"set": ""}}),
+        json!({"destination": {"set": {"sealed": {"enc": "AAAA", "ct": "AAAA", "x": "y"}}}}),
+        json!({"destination": {"set": {"sealed": {"enc": "", "ct": "AAAA"}}}}),
+        json!({"destination": {"set": {"sealed": "AAAA"}}}),
+        json!({"record": {"set": "yes"}}),
+        json!({"profile": {"configured": {"x": 1}}}),
+    ] {
+        assert!(parses(bad.clone()).is_err(), "{bad}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_update_takes_an_rtmp_key_and_a_test_patterns_defaults() {
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let config = REMOTE.replace("RUNTIME", &runtime.path().display().to_string());
+    let mut harness = harness(&config, Some(&["libx264", "aac"]), false);
+    harness.next_start().await;
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "source": {"set": {"test": {}}}}),
+    )
+    .await;
+    assert_eq!(result.get("refused"), None, "{result}");
+    assert_eq!(result["status"]["source"]["size"], "1280x720");
+    assert_eq!(result["status"]["source"]["fps"], 30);
+    // An RTMP key is checked as helios.toml's would be: here RTMP ingest is off.
+    let result = update(
+        &harness,
+        json!({"stream_id": "pattern", "source": {"set": {"rtmp": {"key": "ingest-2"}}}}),
+    )
+    .await;
+    assert_eq!(refused_settings(&result), ["source"], "{result}");
+    assert!(
+        result["refused"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("rtmp_ingest"),
+        "{result}"
     );
     harness.stop().await;
 }
