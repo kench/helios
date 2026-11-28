@@ -234,7 +234,8 @@ pub struct Router;
 
 impl Router {
     /// Starts the router: commands arrive on `incoming` (non-shadow MQTT messages), are decoded
-    /// with `transport`, and responses go out through `mqtt`. Ends when `cancel` is cancelled.
+    /// by the first of `transports` that owns the topic, and each answer goes out through `mqtt`
+    /// on that same transport. Ends when `cancel` is cancelled.
     ///
     /// # Panics
     ///
@@ -242,7 +243,7 @@ impl Router {
     #[must_use]
     pub fn start(
         mqtt: MqttHandle,
-        transport: Arc<dyn CommandTransport>,
+        transports: Vec<Arc<dyn CommandTransport>>,
         incoming: mpsc::Receiver<Incoming>,
         timing: Timing,
         cancel: CancellationToken,
@@ -250,7 +251,7 @@ impl Router {
         let (registrations_tx, registrations) = mpsc::unbounded_channel();
         let router = Running {
             mqtt,
-            transport,
+            transports,
             incoming,
             registrations,
             timing,
@@ -269,7 +270,7 @@ impl Router {
 
 struct Running {
     mqtt: MqttHandle,
-    transport: Arc<dyn CommandTransport>,
+    transports: Vec<Arc<dyn CommandTransport>>,
     incoming: mpsc::Receiver<Incoming>,
     registrations: mpsc::UnboundedReceiver<(String, mpsc::Sender<PendingCommand>)>,
     timing: Timing,
@@ -297,10 +298,10 @@ impl Running {
         let Some(thing) = self.mqtt.status().borrow().thing.clone() else {
             return;
         };
-        let Some(decoded) = self
-            .transport
-            .decode(&thing, &message.topic, &message.payload)
-        else {
+        let Some((transport, decoded)) = self.transports.iter().find_map(|transport| {
+            let decoded = transport.decode(&thing, &message.topic, &message.payload)?;
+            Some((Arc::clone(transport), decoded))
+        }) else {
             tracing::debug!(topic = %message.topic, "MQTT message on no command topic");
             return;
         };
@@ -310,6 +311,7 @@ impl Running {
                 tracing::warn!(topic = %message.topic, reason = %invalid.reason, "invalid command");
                 if let Some(partial) = invalid.partial {
                     self.respond(
+                        &*transport,
                         &thing,
                         &partial,
                         &Outcome::error(codes::INVALID_MESSAGE, invalid.reason),
@@ -331,6 +333,7 @@ impl Running {
         {
             tracing::warn!(id = %command.id, module = %command.module, name = %command.name, "command arrived after its deadline");
             self.respond(
+                &*transport,
                 &thing,
                 &command,
                 &Outcome::error(codes::TIMEOUT, "the command arrived after its deadline"),
@@ -340,6 +343,7 @@ impl Running {
         let Some(module) = self.modules.get(&command.module) else {
             let message = format!("no module {:?}", command.module);
             self.respond(
+                &*transport,
                 &thing,
                 &command,
                 &Outcome::error(codes::UNKNOWN_COMMAND, message),
@@ -354,6 +358,7 @@ impl Running {
         if module.try_send(pending).is_err() {
             let message = format!("module {:?} is busy or stopped", command.module);
             self.respond(
+                &*transport,
                 &thing,
                 &command,
                 &Outcome::error(codes::MODULE_UNAVAILABLE, message),
@@ -370,7 +375,6 @@ impl Running {
                     .unwrap_or(Duration::ZERO)
             });
         let mqtt = self.mqtt.clone();
-        let transport = Arc::clone(&self.transport);
         tokio::spawn(async move {
             let outcome = match tokio::time::timeout(timeout, answer).await {
                 Ok(Ok(outcome)) => outcome,
@@ -390,8 +394,15 @@ impl Running {
         self.seen.insert(id.to_owned(), now).is_none()
     }
 
-    fn respond(&self, thing: &str, command: &Command, outcome: &Outcome) {
-        let publish = self.transport.encode(thing, command, outcome);
+    /// Answers `command` through `transport`, the one that decoded it.
+    fn respond(
+        &self,
+        transport: &dyn CommandTransport,
+        thing: &str,
+        command: &Command,
+        outcome: &Outcome,
+    ) {
+        let publish = transport.encode(thing, command, outcome);
         self.mqtt.publish_now(publish.topic, publish.payload);
     }
 }

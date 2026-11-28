@@ -37,7 +37,10 @@ fn setup(timing: Timing) -> Setup {
     let cancel = CancellationToken::new();
     let (router, _task) = Router::start(
         mqtt,
-        Arc::new(TopicsTransport),
+        vec![
+            Arc::new(TopicsTransport),
+            Arc::new(crate::router::aws_commands::AwsCommandsTransport),
+        ],
         incoming_rx,
         timing,
         cancel.clone(),
@@ -369,6 +372,92 @@ async fn the_helios_module_answers_ping() {
     assert!(ping.payload["uptime_s"].is_u64());
     assert_eq!(unknown.error.unwrap().code, codes::UNKNOWN_COMMAND);
     drop(status_tx);
+}
+
+/// The next publish's topic and JSON payload, whatever the transport.
+async fn publish(setup: &mut Setup) -> (String, Value) {
+    match tokio::time::timeout(WAIT, setup.published.recv())
+        .await
+        .expect("a publish")
+        .unwrap()
+    {
+        MqttRequest::Now { topic, payload } => (topic, serde_json::from_slice(&payload).unwrap()),
+        MqttRequest::Event(event) => panic!("unexpected event {event:?}"),
+    }
+}
+
+/// An AWS IoT command execution `execution` for `module`.
+fn aws_command(execution: &str, module: &str, name: &str) -> Incoming {
+    use base64::Engine;
+    Incoming {
+        topic: format!("$aws/commands/things/{THING}/executions/{execution}/request/json"),
+        payload: json!({
+            "module": module, "name": name, "timeout_s": 10,
+            "args": base64::engine::general_purpose::STANDARD.encode("{}"),
+        })
+        .to_string()
+        .into_bytes(),
+    }
+}
+
+#[tokio::test]
+async fn answers_each_command_through_the_transport_that_decoded_it() {
+    let mut setup = setup(Timing::default());
+    let mut net = setup.router.register("net");
+    registered(&mut setup).await;
+    let aws = |execution: &str| {
+        format!("$aws/commands/things/{THING}/executions/{execution}/response/json")
+    };
+
+    // An AWS IoT command, answered as its execution's response.
+    setup
+        .incoming
+        .send(aws_command("e1", "net", "wifi.list"))
+        .await
+        .unwrap();
+    let pending = tokio::time::timeout(WAIT, net.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    pending.respond(Outcome::Ok(json!({"networks": []})));
+    let (topic, body) = publish(&mut setup).await;
+    assert_eq!(topic, aws("e1"));
+    assert_eq!(body["status"], "SUCCEEDED");
+
+    // A custom-topics command, on its response topic.
+    setup
+        .incoming
+        .send(command("c1", "net", "net.wifi.list", json!({})))
+        .await
+        .unwrap();
+    let pending = tokio::time::timeout(WAIT, net.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    pending.respond(Outcome::Ok(json!({})));
+    let (topic, _) = response(&mut setup).await;
+    assert_eq!(topic, format!("helios/{THING}/rsp/net"));
+
+    // The router's own errors, and an invalid request, go back the same way.
+    setup
+        .incoming
+        .send(aws_command("e2", "nobody", "x"))
+        .await
+        .unwrap();
+    let (topic, body) = publish(&mut setup).await;
+    assert_eq!(topic, aws("e2"));
+    assert_eq!(body["statusReason"]["reasonCode"], codes::UNKNOWN_COMMAND);
+    setup
+        .incoming
+        .send(Incoming {
+            topic: format!("$aws/commands/things/{THING}/executions/e3/request/json"),
+            payload: b"nope".to_vec(),
+        })
+        .await
+        .unwrap();
+    let (topic, body) = publish(&mut setup).await;
+    assert_eq!(topic, aws("e3"));
+    assert_eq!(body["statusReason"]["reasonCode"], codes::INVALID_MESSAGE);
 }
 
 #[test]

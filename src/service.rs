@@ -45,7 +45,7 @@ use crate::mqtt::helios_shadow::{self, Sources};
 use crate::mqtt::manager::{Incoming, MqttHandle, MqttManager, Options as MqttOptions};
 use crate::mqtt::shadow::{ShadowHandle, ShadowManager};
 use crate::provision::DEFAULT_TOKEN_LABEL;
-use crate::router::{CommandTransport, Router, RouterHandle};
+use crate::router::{Router, RouterHandle};
 use crate::{hardening, logging};
 
 /// Where the service finds things on the device. Tests point these at fakes.
@@ -252,7 +252,7 @@ impl Service {
             cancel.clone(),
         );
         // Custom topics and AWS IoT commands, as mqtt.commands chooses (LLD 2, section 7.3).
-        let transport: Arc<dyn CommandTransport> = config.mqtt.commands.transport();
+        let transports = config.mqtt.commands.transports();
         let started = std::time::Instant::now();
         let mqtt_cancel = CancellationToken::new();
         let (incoming_tx, incoming) = mpsc::channel(INCOMING_CAPACITY);
@@ -263,7 +263,7 @@ impl Service {
                 local_endpoint,
                 boot_id: platform.boot_id.clone(),
                 timing: timing.mqtt,
-                commands: Arc::clone(&transport),
+                commands: transports.clone(),
             },
             incoming_tx,
             mqtt_cancel.clone(),
@@ -280,7 +280,7 @@ impl Service {
         let (commands_tx, commands_rx) = mpsc::channel(INCOMING_CAPACITY);
         let (router, router_task) = Router::start(
             mqtt.clone(),
-            transport,
+            transports,
             commands_rx,
             timing.router,
             cancel.clone(),
