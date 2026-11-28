@@ -1,0 +1,22 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  The Helios console on the local network (LLD 13, section 7), for DNS-SD browsers: the helios
+  package ships it in /usr/share/helios/avahi/ and board provisioning copies it to
+  /etc/avahi/services/ when it sets up [modules.web], so a board without the console doesn't
+  advertise one. The board's hostname is helios-<name> (set at provisioning), so Avahi also
+  answers helios-<name>.local on every address. The port must match [modules.web] listen.
+-->
+<service-group>
+  <name replace-wildcards="yes">Helios console on %h</name>
+  <service>
+    <type>_http._tcp</type>
+    <port>8080</port>
+    <txt-record>path=/</txt-record>
+  </service>
+  <service>
+    <type>_helios._tcp</type>
+    <port>8080</port>
+    <txt-record>console=/</txt-record>
+  </service>
+</service-group>

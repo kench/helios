@@ -47,7 +47,7 @@ Each module is a Cargo feature and is off by default.
 | Device | Build |
 | --- | --- |
 | Scanner (PROXmobil3, armv7) | `cargo zigbuild --release --target armv7-unknown-linux-gnueabihf.2.28 --features module-display,module-usb` |
-| Boards (Raspberry Pi 5, Orange Pi 5 Plus) | the release workflow's package: `module-usb,module-stream,module-net,module-gps` |
+| Boards (Raspberry Pi 5, Orange Pi 5 Plus) | the release workflow's package: `module-usb,module-stream,module-net,module-gps,module-web` |
 | Provisioning computer | `cargo build --release` |
 
 ## Running

@@ -131,7 +131,89 @@ fn decode(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_query;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{parse_query, run};
+    use crate::modules::web::auth::{self, Sessions, Throttle};
+    use crate::modules::web::control::Device;
+    use crate::modules::web::http::Web;
+    use crate::mqtt::manager::MqttHandle;
+    use crate::mqtt::shadow::ShadowHandle;
+    use crate::router::RouterHandle;
+
+    /// Sends `request` as raw HTTP/1.1 and returns the whole response.
+    async fn send(address: std::net::SocketAddr, request: &[u8]) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut response),
+        )
+        .await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn answers_over_http_and_refuses_large_bodies() {
+        let (mqtt, _published, _status) = MqttHandle::for_test();
+        let (shadows, _reports) = ShadowHandle::detached();
+        let (router, _registrations) = RouterHandle::for_test();
+        let web = Arc::new(Web {
+            device: Device {
+                shadows,
+                router,
+                mqtt,
+                identity: None,
+                thing_name: Some("t-1".into()),
+                role: "transcoder".into(),
+            },
+            name: "pocket".into(),
+            password_hash: auth::hash_password(b"a long console password").unwrap(),
+            console_dir: "/nonexistent".into(),
+            sessions: Mutex::new(Sessions::default()),
+            throttle: Mutex::new(Throttle::default()),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(run(listener, web, cancel.clone()));
+
+        let config = send(
+            address,
+            b"GET /config.json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(config.starts_with("HTTP/1.1 200"), "{config}");
+        assert!(config.contains(r#""kind":"device""#), "{config}");
+        assert!(
+            config
+                .to_ascii_lowercase()
+                .contains("content-security-policy:")
+        );
+
+        let big = format!(
+            "POST /v1/local/session HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            70_000,
+            "a".repeat(70_000)
+        );
+        let refused = send(address, big.as_bytes()).await;
+        assert!(refused.starts_with("HTTP/1.1 413"), "{refused}");
+
+        // The query string reaches the API (here: unsigned in, so 401 before it's used).
+        let api = send(
+            address,
+            b"GET /v1/control/devices/t-1/uplinks?includePublicAddresses=true HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(api.starts_with("HTTP/1.1 401"), "{api}");
+        cancel.cancel();
+        server.await.unwrap();
+    }
 
     #[test]
     fn decodes_query_strings() {

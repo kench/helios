@@ -24,7 +24,9 @@ token, reports its state, and runs its modules. The service is installed but not
 provision the device (config and token), then `systemctl enable --now helios`."""
 depends = "libc6 (>= 2.31), adduser, softhsm2"
 # gpsd: the gps module's source (LLD 10); Helios runs without it, and reports gpsd unavailable.
-recommends = "unattended-upgrades, gpsd"
+# avahi-daemon and libnss-mdns: the on-device console found as helios-<name>.local (LLD 13);
+# helios-console: the console's files the web module serves.
+recommends = "unattended-upgrades, gpsd, avahi-daemon, libnss-mdns, helios-console"
 # helios-rtmp.service (rtmp-ingest) runs nginx with the RTMP module, on the boards that ingest
 # RTMP; helios-firewall.service needs nft.
 suggests = "nginx, libnginx-mod-rtmp, nftables"
@@ -42,6 +44,7 @@ assets = [
     ["dist/systemd/gpsd.socket.d/helios.conf", "lib/systemd/system/gpsd.socket.d/", "644"],
     ["dist/nftables/helios.nft", "etc/helios/firewall.nft", "644"],
     ["dist/helios.toml", "usr/share/doc/helios/examples/", "644"],
+    ["dist/avahi/helios-console.service", "usr/share/helios/avahi/", "644"],
     ["dist/debian/52helios-unattended-upgrades", "etc/apt/apt.conf.d/", "644"],
     ["README.md", "usr/share/doc/helios/", "644"],
 ]

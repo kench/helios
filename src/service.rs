@@ -343,6 +343,17 @@ impl Service {
             let client = client.with_uplink_view(uplink_view_rx);
             enabled.push(Arc::new(client));
         }
+        // The console, served on the local network (LLD 13): its changes go through the router
+        // as commands, like the cloud's.
+        #[cfg(feature = "module-web")]
+        if let Some(settings) = config.web {
+            enabled.push(Arc::new(
+                crate::modules::web::WebModule::new(settings)
+                    .with_router(router.clone())
+                    .with_identity(identity.watch())
+                    .with_thing_name(config.thing_name.clone()),
+            ));
+        }
         let (module_states, modules) = supervisor::start(
             enabled,
             &supervisor::Deps {
