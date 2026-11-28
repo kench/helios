@@ -50,6 +50,9 @@ pub struct Command {
     pub args: Value,
     /// When the sender stops waiting, if it said.
     pub deadline: Option<SystemTime>,
+    /// Sent by Helios itself (`RouterHandle::dispatch`: the web module's local console, LLD 13),
+    /// not over MQTT. Only such a command may carry a destination in plain text.
+    pub local: bool,
 }
 
 impl fmt::Debug for Command {
@@ -173,6 +176,7 @@ impl PendingCommand {
             name: name.to_owned(),
             args,
             deadline: None,
+            local: false,
         };
         (Self { command, reply }, answer)
     }
@@ -198,6 +202,7 @@ impl PendingCommand {
             name: name.to_owned(),
             args,
             deadline: None,
+            local: false,
         };
         (Self { command, reply }, answer)
     }
@@ -241,7 +246,8 @@ impl RouterHandle {
     /// Runs `command` as if it had come over MQTT (the same deadline, module and timeout
     /// checks), and returns its outcome instead of publishing it. For the web module's local
     /// console (LLD 13), whose writes are the same commands the cloud sends.
-    pub async fn dispatch(&self, command: Command) -> Outcome {
+    pub async fn dispatch(&self, mut command: Command) -> Outcome {
+        command.local = true;
         let (reply, answer) = oneshot::channel();
         if self.local.send((command, reply)).is_err() {
             return Outcome::error(codes::INTERNAL, "the router has stopped");

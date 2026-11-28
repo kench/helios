@@ -216,7 +216,7 @@ async fn session(
                 next_id += 1;
                 let mut args = pending.command.args.clone();
                 if pending.command.name == "update" {
-                    args = open_destination(identity, args).await;
+                    args = open_destination(identity, args, pending.command.local).await;
                 }
                 let params = json!({"name": pending.command.name, "args": args});
                 if writer.write_all(control::request(next_id, "command", params).as_bytes()).await.is_err() {
@@ -257,14 +257,20 @@ async fn session(
 
 /// `stream.update`'s sealed destination, opened for the daemon: `{"set": {"url": ...}}`, or
 /// `{"set": {"unreadable": reason}}` when it can't be (the daemon then refuses it). A plain
-/// `url` (only the local control socket may give one) is refused the same way. Arguments
-/// without a well-formed sealed destination go on as they are, for the daemon to check.
+/// `url` is refused the same way, unless the command is `local` (Helios's own console, LLD 13:
+/// nothing between it and the device keeps the URL, and offline there may be no key to seal
+/// to). Arguments without a well-formed sealed destination go on as they are, for the daemon
+/// to check.
 async fn open_destination(
     identity: Option<&tokio::sync::watch::Receiver<IdentityState>>,
     mut args: Value,
+    local: bool,
 ) -> Value {
     // `url` and `unreadable` are this function's own: from the cloud, a destination is sealed.
     let inner = args.pointer("/destination/set").and_then(Value::as_object);
+    if local && inner.is_some_and(|inner| inner.len() == 1 && inner.contains_key("url")) {
+        return args;
+    }
     if inner.is_some_and(|inner| inner.contains_key("url") || inner.contains_key("unreadable")) {
         args["destination"] =
             json!({"set": {"unreadable": "a destination from the cloud must be sealed"}});

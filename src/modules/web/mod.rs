@@ -8,19 +8,21 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
+use serde_json::json;
+use tokio::sync::watch;
 
-#[allow(
-    dead_code,
-    reason = "the HTTP server that uses it comes in the next commit (LLD 13, PR 3)"
-)]
+use super::{Module, ModuleContext, ModuleError, ModuleFuture};
+use crate::identity::manager::IdentityState;
+use crate::router::RouterHandle;
+
 pub(crate) mod auth;
-#[allow(
-    dead_code,
-    reason = "the local Control API that uses it comes with the web module (LLD 13, PR 3)"
-)]
+pub(crate) mod control;
+pub(crate) mod http;
 pub(crate) mod reports;
+pub(crate) mod server;
 
 /// Where the console listens by default: every interface, port 8080 (Helios's firewall lets
 /// only private and link-local addresses reach it, LLD 13 section 5).
@@ -125,6 +127,95 @@ impl WebSettings {
         self.listen
             .parse()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)))
+    }
+}
+
+/// The module's name: its config section and its shadow.
+pub const MODULE: &str = "web";
+
+/// The web module: serves the console and the local Control API.
+#[derive(Debug)]
+pub struct WebModule {
+    settings: WebSettings,
+    router: Option<RouterHandle>,
+    identity: Option<watch::Receiver<IdentityState>>,
+    thing_name: Option<String>,
+}
+
+impl WebModule {
+    /// A module serving `settings`.
+    #[must_use]
+    pub fn new(settings: WebSettings) -> Self {
+        Self {
+            settings,
+            router: None,
+            identity: None,
+            thing_name: None,
+        }
+    }
+
+    /// The router the local console's changes go through, as commands.
+    #[must_use]
+    pub fn with_router(mut self, router: RouterHandle) -> Self {
+        self.router = Some(router);
+        self
+    }
+
+    /// The identity, for the device's ID once it has bootstrapped.
+    #[must_use]
+    pub fn with_identity(mut self, identity: watch::Receiver<IdentityState>) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// The thing name from `helios.toml`: the device's ID until it has bootstrapped.
+    #[must_use]
+    pub fn with_thing_name(mut self, thing_name: Option<String>) -> Self {
+        self.thing_name = thing_name;
+        self
+    }
+}
+
+impl Module for WebModule {
+    fn name(&self) -> &'static str {
+        MODULE
+    }
+
+    fn run(&self, ctx: ModuleContext) -> ModuleFuture<'_> {
+        Box::pin(async move {
+            let router = self
+                .router
+                .clone()
+                .ok_or_else(|| ModuleError("the web module has no router".into()))?;
+            let address = self.settings.listen();
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .map_err(|error| ModuleError(format!("can't listen on {address}: {error}")))?;
+            let installed = self.settings.console_dir.join("index.html").is_file();
+            tracing::info!(%address, name = %self.settings.name, installed, "web console listening");
+            let mut reported = serde_json::Map::new();
+            reported.insert("name".into(), json!(self.settings.name));
+            reported.insert("listen".into(), json!(address.to_string()));
+            reported.insert("console_installed".into(), json!(installed));
+            ctx.shadows.report(MODULE, reported);
+            let web = Arc::new(http::Web {
+                device: control::Device {
+                    shadows: ctx.shadows.clone(),
+                    router,
+                    mqtt: ctx.mqtt.clone(),
+                    identity: self.identity.clone(),
+                    thing_name: self.thing_name.clone(),
+                    role: self.settings.role.clone(),
+                },
+                name: self.settings.name.clone(),
+                password_hash: self.settings.password_hash.clone().unwrap_or_default(),
+                console_dir: self.settings.console_dir.clone(),
+                sessions: Mutex::new(auth::Sessions::default()),
+                throttle: Mutex::new(auth::Throttle::default()),
+            });
+            server::run(listener, web, ctx.cancel.clone()).await;
+            Ok(())
+        })
     }
 }
 

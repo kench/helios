@@ -145,6 +145,7 @@ fn command() -> Command {
         name: "wifi.set".into(),
         args: json!({}),
         deadline: None,
+        local: false,
     }
 }
 

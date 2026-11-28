@@ -140,7 +140,21 @@ fn get_stream(report: &Value, id: &str) -> Result<Value, Refusal> {
 /// A stream: `desired` is what the device reports wanting (nothing is kept beside it on the
 /// device), `reported` its state if it reports everything that needs.
 fn describe(report: &Value, id: &str) -> Value {
-    let stream = at(report, &["streams", id]);
+    describe_from(report, id, at(report, &["streams", id]))
+}
+
+/// Stream `id` as a change leaves it: from the command's answer (`status`, the stream's report
+/// as it is now), with the rest of the stream report (its outputs) from `report`.
+pub(crate) fn stream_after(report: Option<&Value>, id: &str, status: &Value) -> Value {
+    static EMPTY: Value = Value::Null;
+    describe_from(
+        report.unwrap_or(&EMPTY),
+        id,
+        Some(status).filter(|s| s.is_object()),
+    )
+}
+
+fn describe_from(report: &Value, id: &str, stream: Option<&Value>) -> Value {
     let state = stream
         .and_then(|s| string(s, &["desired"]))
         .filter(|s| *s == "live")
@@ -705,18 +719,20 @@ fn wifi(net: Option<&Value>) -> Result<Value, Refusal> {
     };
     let networks: Vec<Value> = list(wifi, &["networks"])
         .into_iter()
-        .filter_map(|network| {
-            let ssid = string(network, &["ssid"])?;
-            let security =
-                string(network, &["security"]).filter(|s| matches!(*s, "open" | "personal"))?;
-            Some(json!({
-                "ssid": ssid,
-                "security": security,
-                "hidden": boolean(network, &["hidden"]).unwrap_or(false),
-            }))
-        })
+        .filter_map(wifi_network)
         .collect();
     Ok(json!({ "networks": networks }))
+}
+
+/// One Wi-Fi network as the API shows it, if it's one the API knows (open or personal).
+pub(crate) fn wifi_network(network: &Value) -> Option<Value> {
+    let ssid = string(network, &["ssid"])?;
+    let security = string(network, &["security"]).filter(|s| matches!(*s, "open" | "personal"))?;
+    Some(json!({
+        "ssid": ssid,
+        "security": security,
+        "hidden": boolean(network, &["hidden"]).unwrap_or(false),
+    }))
 }
 
 // --- Reading reports, as helios-cloud's ShadowJson does --------------------------------------

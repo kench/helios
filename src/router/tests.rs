@@ -479,6 +479,7 @@ fn a_commands_debug_leaves_out_its_arguments() {
         name: "net.wifi.set".into(),
         args: serde_json::json!({"ssid": "Home", "passphrase": "correct horse battery"}),
         deadline: None,
+        local: false,
     };
     let shown = format!("{command:?}");
     assert!(shown.contains("net.wifi.set"), "{shown}");
@@ -493,6 +494,7 @@ fn local(id: &str, module: &str, name: &str, deadline: Option<SystemTime>) -> Co
         name: name.to_owned(),
         args: json!({"stream_id": "pocket"}),
         deadline,
+        local: false,
     }
 }
 
@@ -517,6 +519,7 @@ async fn dispatches_local_commands_and_answers_the_caller_not_mqtt() {
         .unwrap();
     assert_eq!(pending.command.name, "stream.start");
     assert_eq!(pending.command.args["stream_id"], "pocket");
+    assert!(pending.command.local, "dispatch marks its commands local");
     pending.respond(Outcome::Ok(json!({"status": {"state": "live"}})));
     assert_eq!(
         answer.await.unwrap(),
