@@ -122,24 +122,7 @@ impl Harness {
             if shadow == MODULE && check(&reported) {
                 return reported;
             }
-            assert!(
-                shadow == MODULE || shadow == "display#desired",
-                "a report for {shadow}"
-            );
-        }
-    }
-
-    /// Waits for the module to remove desired state, and returns the path it removed.
-    async fn cleared(&mut self) -> Value {
-        loop {
-            let (shadow, cleared) =
-                tokio::time::timeout(Duration::from_secs(5), self.reports.recv())
-                    .await
-                    .expect("a report")
-                    .expect("reports open");
-            if shadow == "display#desired" {
-                return cleared["clear"].clone();
-            }
+            assert_eq!(shadow, MODULE, "a report for {shadow}");
         }
     }
 
@@ -303,8 +286,6 @@ async fn refuses_bad_commands() {
 #[tokio::test]
 async fn display_idle_sets_the_idle_screen_until_configured() {
     let mut harness = Harness::start("idle-command", true);
-    // Reported-only: desired state left from before 0.17.0 is removed.
-    assert_eq!(harness.cleared().await, json!(["idle"]));
     harness.report(|r| r["available"] == true).await;
 
     let result = ok(harness

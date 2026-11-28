@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::control::{self, Message};
 use super::super::tests::{FakeSpawner, Started, address, settings};
 use super::super::{StreamClient, StreamModule};
-use super::{Daemon, busy, load_overrides, overrides, uid_of};
+use super::{Daemon, busy, overrides, uid_of};
 use crate::modules::usb::UsbSettings;
 use crate::modules::{Module, ModuleContext};
 use crate::mqtt::manager::{MqttHandle, Request as MqttRequest};
@@ -206,20 +206,6 @@ impl Agent {
         })
         .await
         .unwrap_or_else(|_| panic!("the shadow never showed {what}"))
-    }
-
-    /// The next `clear_desired` path for the stream shadow, skipping reports.
-    async fn cleared(&mut self) -> Value {
-        tokio::time::timeout(WAIT, async {
-            loop {
-                let (shadow, value) = self.reports.recv().await.expect("shadow");
-                if shadow == "stream#desired" {
-                    return value["clear"].clone();
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("nothing was cleared from the desired state"))
     }
 
     async fn event(&mut self, kind: &str) -> String {
@@ -526,77 +512,31 @@ async fn helios_uplink_view_puts_a_shared_uplink_in_standby() {
 }
 
 #[tokio::test]
-async fn the_client_removes_desired_state_from_the_stream_shadow() {
-    let dir = tempfile::tempdir().expect("directory");
-    let socket = dir.path().join("control.sock");
-    // Reported-only: whatever desired state is left (from before 0.17.0) goes, daemon or not.
-    let mut helios = agent(socket);
-    assert_eq!(helios.cleared().await, json!(["streams"]));
-    helios.stop().await;
-}
-
-#[tokio::test]
-async fn a_new_daemon_resumes_the_overrides_saved_before_0_17() {
+async fn a_new_daemon_resumes_the_saved_overrides() {
     let dir = tempfile::tempdir().expect("directory");
     let config = CONFIG.replace("DIR", &dir.path().display().to_string());
     let state = dir.path().join("state");
     std::fs::create_dir_all(&state).expect("state directory");
-    // 0.16.0's desired.json: the pattern stopped.
+    // Saved by an earlier daemon: the pattern stopped, at 1500 kbps.
     std::fs::write(
-        state.join("desired.json"),
-        r#"{"streams": {"pattern": {"state": "stopped", "bitrate_kbps": null}}}"#,
+        state.join("overrides.json"),
+        r#"{"streams": {"pattern": {"desired": "stopped", "bitrate_override_kbps": 1500, "overrides": {}}}}"#,
     )
-    .expect("old file");
+    .expect("saved overrides");
     let mut running = daemon(&config);
     let mut helios = agent(dir.path().join("control.sock"));
     helios
-        .shadow_where("connected, the stream stopped", |r| {
-            r["daemon"]["state"] == "connected" && r["streams"]["pattern"]["desired"] == "stopped"
+        .shadow_where("connected, the stream stopped at 1500 kbps", |r| {
+            r["daemon"]["state"] == "connected"
+                && r["streams"]["pattern"]["desired"] == "stopped"
+                && r["streams"]["pattern"]["bitrate_override_kbps"] == 1500
         })
         .await;
     assert!(
         running.started.try_recv().is_err(),
         "a stopped stream started"
     );
-    // Saved under the new name, and the old file is gone.
-    let saved = tokio::time::timeout(WAIT, async {
-        loop {
-            if let Ok(text) = std::fs::read_to_string(state.join("overrides.json")) {
-                break text;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("saved");
-    let saved: Value = serde_json::from_str(&saved).expect("json");
-    assert_eq!(saved["streams"]["pattern"]["desired"], "stopped");
-    assert!(!state.join("desired.json").exists(), "the old file stayed");
     helios.stop().await;
     running.cancel.cancel();
     let _ = running.task.await;
-}
-
-#[test]
-fn reads_overrides_from_the_old_desired_state() {
-    let dir = tempfile::tempdir().expect("directory");
-    let (file, old) = (
-        dir.path().join("overrides.json"),
-        dir.path().join("desired.json"),
-    );
-    assert_eq!(load_overrides(&file, &old), None);
-    std::fs::write(
-        &old,
-        r#"{"streams": {"a": {"state": "live", "bitrate_kbps": 3000, "profile": "hd"}}}"#,
-    )
-    .expect("old file");
-    assert_eq!(
-        load_overrides(&file, &old),
-        Some(json!({"streams": {"a": {
-            "desired": "live", "bitrate_override_kbps": 3000, "overrides": {"profile": "hd"},
-        }}}))
-    );
-    // The new file wins once it's there.
-    std::fs::write(&file, r#"{"streams": {}}"#).expect("new file");
-    assert_eq!(load_overrides(&file, &old), Some(json!({"streams": {}})));
 }

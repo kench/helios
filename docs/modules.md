@@ -26,7 +26,7 @@ Screens on the scanner's framebuffer, drawn from templates compiled into Helios:
   takes `{"idle": {"set": {"<template>": {fields}}}}` or `{"idle": {"configured": {}}}` and
   answers `{"status": ...}`; anything outside the model (helios-contract `model/device.smithy`)
   is `INVALID_MESSAGE` and changes nothing.
-- **Shadow:** reported-only. Desired state left in it from before 0.17.0 is removed.
+- **Shadow:** reported-only.
 - **Fonts:** Noto Sans (`assets/fonts`, SIL Open Font License). `bold_font` can name a font file
   on the device for bold text, for licensed fonts that mustn't be compiled in.
 - **Behaviour:** it redraws only the rows that change, and shows "Helios stopped" on shutdown.
@@ -91,10 +91,10 @@ uplinks by `srtla_send`.
   `streamid` unless the URL gives them. It runs as output `stream:<id>`, and an `srtla://`
   destination gets its own sender over the output's uplinks (or `srtla_uplinks`).
 - Writes are commands only, and the `stream` shadow is reported-only (Notion: *Helios - State
-  Management: Tenets and Practices*). Since 0.17.0 the device reads no desired state for streams,
-  and removes any left in the shadow, so AWS IoT stops sending it in a delta after every report.
-  Since 0.18.0, no module reads desired state, and Helios doesn't subscribe to
-  shadow deltas.
+  Management: Tenets and Practices*). No module reads desired state, and Helios doesn't subscribe
+  to shadow deltas. A stream's overrides are kept in `overrides.json` in the state directory.
+  0.17.0 and 0.18.0 also converted 0.16.0's `desired.json`; later releases don't, so upgrade
+  through one of them first.
 - Events: `stream.connected`, `stream.live`, `stream.disconnected` and `stream.stats`.
 - ffmpeg's arguments come only from the local profiles.
 

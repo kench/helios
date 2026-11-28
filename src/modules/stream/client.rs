@@ -1,9 +1,7 @@
 //! Helios's `stream` module (LLD 4, section 15): a client of the stream daemon
 //! (`helios-stream.service`). It forwards commands to the daemon over its control socket, and the
 //! daemon's events and shadow to MQTT. Streams themselves run in the daemon, so they keep going
-//! while Helios restarts. The `stream` shadow is reported-only: changes are commands, and desired
-//! state left from before 0.17.0 is removed, so AWS IoT stops sending it in a delta after every
-//! report.
+//! while Helios restarts. The `stream` shadow is reported-only: changes are commands.
 //!
 //! A `stream.update` with a sealed destination is opened here, where the device's secrets key
 //! is (the daemon has no access to it), and passed on as `{"url": ...}`, or as
@@ -102,7 +100,6 @@ async fn run(
     identity: Option<tokio::sync::watch::Receiver<IdentityState>>,
 ) -> Result<(), ModuleError> {
     let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
-    ctx.shadows.clear_desired(MODULE, &["streams"]);
     loop {
         let failure = match UnixStream::connect(&socket).await {
             Ok(stream) => {
