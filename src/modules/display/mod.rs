@@ -185,13 +185,13 @@ struct Display {
     retry_at: Instant,
     backoff: Backoff,
     console_bound: bool,
-    /// The idle screen, from config or desired state.
+    /// The idle screen, from config or `display.idle`.
     idle: Screen,
     /// The last `display.show`, while it lasts.
     shown: Option<Shown>,
     /// When the idle screen started showing.
     idle_since: SystemTime,
-    /// Why the screen can't be used, or the desired state was refused.
+    /// Why the screen can't be used.
     error: Option<String>,
     /// The last state reported, to report only changes.
     reported: Option<Map<String, Value>>,

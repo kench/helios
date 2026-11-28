@@ -36,7 +36,7 @@ pub const STABLE_RUN: Duration = Duration::from_secs(300);
 pub struct Deps {
     /// Command registration.
     pub router: RouterHandle,
-    /// Reported and desired state.
+    /// Reported state (shadows are reported-only).
     pub shadows: ShadowHandle,
     /// Events and the connection's status.
     pub mqtt: MqttHandle,

@@ -7,8 +7,8 @@
 //! reads everything again and reports the new snapshot, with a `net.changed` event naming what
 //! differs. It also reads everything every minute, in case a change was missed.
 //!
-//! Read-only: it changes no interface, address or route, and needs no capability. The change
-//! socket is read on its own thread, so registering it with tokio (an `unsafe` operation) isn't
+//! Reading the tables changes no interface, address or route and needs no capability (Wi-Fi
+//! changes are commands, applied by `helios wifi-apply`, [`wifi`]). The change socket is read on its own thread, so registering it with tokio (an `unsafe` operation) isn't
 //! needed.
 
 pub mod egress;
