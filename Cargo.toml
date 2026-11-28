@@ -80,6 +80,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 x509-parser = "0.18.1"
 hmac = "0.13"
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash"], optional = true }
 
 [features]
 # Device modules (HLD section 6.1), off by default so each device's build carries only the
@@ -96,7 +97,7 @@ module-net = []
 # The gps module (LLD 10): the position, from gpsd. Boards only.
 module-gps = ["tokio/io-util"]
 # The web module (LLD 13): the console, served by the board for phones on the same network.
-module-web = []
+module-web = ["dep:argon2", "hyper/server", "hyper-util/server"]
 
 [dev-dependencies]
 bytes = "1.12.1"
