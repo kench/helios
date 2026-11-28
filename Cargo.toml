@@ -95,6 +95,8 @@ module-stream = ["module-usb", "tokio/process", "tokio/io-util"]
 module-net = []
 # The gps module (LLD 10): the position, from gpsd. Boards only.
 module-gps = ["tokio/io-util"]
+# The web module (LLD 13): the console, served by the board for phones on the same network.
+module-web = []
 
 [dev-dependencies]
 bytes = "1.12.1"

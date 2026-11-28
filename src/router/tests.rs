@@ -485,3 +485,77 @@ fn a_commands_debug_leaves_out_its_arguments() {
     assert!(!shown.contains("horse"), "{shown}");
     assert!(!shown.contains("Home"), "{shown}");
 }
+
+fn local(id: &str, module: &str, name: &str, deadline: Option<SystemTime>) -> Command {
+    Command {
+        id: id.to_owned(),
+        module: module.to_owned(),
+        name: name.to_owned(),
+        args: json!({"stream_id": "pocket"}),
+        deadline,
+    }
+}
+
+#[tokio::test]
+async fn dispatches_local_commands_and_answers_the_caller_not_mqtt() {
+    let mut setup = setup(Timing {
+        default_timeout: Duration::from_millis(200),
+        ..Timing::default()
+    });
+    let mut stream = setup.router.register("stream");
+    registered(&mut setup).await;
+
+    let router = setup.router.clone();
+    let answer = tokio::spawn(async move {
+        router
+            .dispatch(local("l1", "stream", "stream.start", None))
+            .await
+    });
+    let pending = tokio::time::timeout(WAIT, stream.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.command.name, "stream.start");
+    assert_eq!(pending.command.args["stream_id"], "pocket");
+    pending.respond(Outcome::Ok(json!({"status": {"state": "live"}})));
+    assert_eq!(
+        answer.await.unwrap(),
+        Outcome::Ok(json!({"status": {"state": "live"}}))
+    );
+
+    // The router's own errors come back the same way.
+    assert!(matches!(
+        setup.router.dispatch(local("l2", "nobody", "x", None)).await,
+        Outcome::Err { code, .. } if code == codes::UNKNOWN_COMMAND
+    ));
+    let past = SystemTime::now() - Duration::from_secs(1);
+    assert!(matches!(
+        setup.router.dispatch(local("l3", "stream", "stream.stop", Some(past))).await,
+        Outcome::Err { code, .. } if code == codes::TIMEOUT
+    ));
+    // A module that doesn't answer in time.
+    let router = setup.router.clone();
+    let slow = tokio::spawn(async move {
+        router
+            .dispatch(local("l4", "stream", "stream.stop", None))
+            .await
+    });
+    let _held = tokio::time::timeout(WAIT, stream.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        slow.await.unwrap(),
+        Outcome::Err { code, .. } if code == codes::TIMEOUT
+    ));
+    assert_no_response(&mut setup).await;
+}
+
+#[tokio::test]
+async fn a_dispatch_without_a_router_says_it_has_stopped() {
+    let (router, _registrations) = RouterHandle::for_test();
+    assert!(matches!(
+        router.dispatch(local("l1", "stream", "stream.start", None)).await,
+        Outcome::Err { code, message } if code == codes::INTERNAL && message.contains("stopped")
+    ));
+}

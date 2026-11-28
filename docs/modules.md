@@ -12,6 +12,7 @@ shadow's `modules`.
 | [stream](#stream) | `module-stream` (needs `module-usb`) | LLD 4 | boards |
 | [net](#net) | `module-net` | LLD 3 | boards |
 | [gps](#gps) | `module-gps` | LLD 10 | boards |
+| [web](#web) | `module-web` | LLD 13 | boards (in progress) |
 
 ## display
 
@@ -212,3 +213,16 @@ The position, from gpsd.
 - **`device`:** names a receiver for gpsd to open through its control socket, at start and
   whenever gpsd loses it. Use it for USB serial bridges that gpsd's hotplug rules don't know.
 - **Needs:** gpsd running. The package's `gpsd.socket` drop-in opens its control socket to Helios.
+
+## web
+
+The Helios console served by the board, for phones and laptops on the same network with no
+internet (LLD 13). In progress: nothing is served yet, and it has no `[modules.web]` section.
+
+- **So far:** `modules::web::reports` reads the modules' reports into the Control API's read
+  responses exactly as the cloud does. helios-contract's report vectors
+  (`test-vectors/control-reports-v1.json`) check both sides.
+- **Hooks it will use:** `ShadowHandle::latest` (each module's latest report, sent or not) and
+  `RouterHandle::dispatch` (a command run like one from MQTT, its outcome returned to the
+  caller), so the local console reads what the cloud would and changes the device through the
+  same commands.

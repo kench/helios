@@ -513,3 +513,43 @@ async fn offers_accepted_timestamps_to_the_clock_checks() {
     assert!(sample.received >= sample.sent);
     assert!(samples.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn gives_each_shadows_latest_snapshot_sent_or_not() {
+    let setup = setup();
+    assert_eq!(
+        setup.shadows.latest("stream").await,
+        None,
+        "nothing reported yet"
+    );
+    // Disconnected, so nothing is sent: the snapshot is still the latest.
+    setup
+        .shadows
+        .report("stream", map(json!({"streams": {"a": 1}})));
+    setup
+        .shadows
+        .report("stream", map(json!({"streams": {"a": 2}})));
+    assert_eq!(
+        setup.shadows.latest("stream").await,
+        Some(map(json!({"streams": {"a": 2}})))
+    );
+    assert_eq!(setup.shadows.latest("gps").await, None);
+    setup.cancel.cancel();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        setup.shadows.latest("stream").await,
+        None,
+        "the manager stopped"
+    );
+}
+
+#[tokio::test]
+async fn a_detached_handle_gives_its_latest_reports_too() {
+    let (shadows, _reports) = ShadowHandle::detached();
+    assert_eq!(shadows.latest("net").await, None);
+    shadows.report("net", map(json!({"interfaces": {}})));
+    assert_eq!(
+        shadows.latest("net").await,
+        Some(map(json!({"interfaces": {}})))
+    );
+}

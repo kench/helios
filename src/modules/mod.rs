@@ -6,9 +6,10 @@
 //! - `stream`: video streams to SRT listeners through ffmpeg (LLD 4).
 //! - `net`: network interfaces, their link state, addresses and default routes (LLD 3).
 //! - `gps`: the position, from gpsd (LLD 10).
+//! - `web`: the console, served by the board for phones on the same network (LLD 13).
 //!
 //! Each module is behind a Cargo feature (`module-display`, `module-usb`, `module-stream`,
-//! `module-net`, `module-gps`), off by default, so a device's build
+//! `module-net`, `module-gps`, `module-web`), off by default, so a device's build
 //! carries only the modules it uses. In a build without it, the module's config section is
 //! reported as unused, like any other unknown section.
 //!
@@ -40,6 +41,8 @@ pub mod stream;
 pub mod supervisor;
 #[cfg(feature = "module-usb")]
 pub mod usb;
+#[cfg(feature = "module-web")]
+pub mod web;
 
 /// What a module's run returns.
 pub type ModuleFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ModuleError>> + Send + 'a>>;
