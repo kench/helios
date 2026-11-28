@@ -236,7 +236,7 @@ fn options(port: u16) -> Options {
         local_endpoint: Some("localhost".to_owned()),
         boot_id: Some("boot-1".to_owned()),
         timing: timing(),
-        commands: Arc::new(crate::router::topics::TopicsTransport),
+        commands: vec![Arc::new(crate::router::topics::TopicsTransport)],
     }
 }
 
@@ -327,7 +327,7 @@ async fn connects_as_the_thing_with_a_will_and_a_clean_session() {
 #[tokio::test]
 async fn subscribes_at_most_eight_filters_at_once_and_goes_online_after_the_last() {
     let running = start_with(
-        |options| options.commands = crate::mqtt::CommandTransports::default().transport(),
+        |options| options.commands = crate::mqtt::CommandTransports::default().transports(),
         |_| {},
     )
     .await;

@@ -1,7 +1,4 @@
-use std::sync::Arc;
-
 use super::*;
-use crate::router::topics::TopicsTransport;
 
 const THING: &str = "t-1";
 const REQUEST: &str = "$aws/commands/things/t-1/executions/exec-1/request/json";
@@ -193,59 +190,4 @@ fn encodes_answers_as_aws_expects() {
     assert_eq!(reason_code("!!!"), "INTERNAL");
     assert_eq!(reason_code(&"A".repeat(100)).len(), 64);
     assert_eq!(description(&"x".repeat(2000)).len(), 1024);
-}
-
-#[test]
-fn several_transports_answer_through_the_one_that_decoded() {
-    let both = Transports::new(vec![
-        Arc::new(TopicsTransport),
-        Arc::new(AwsCommandsTransport),
-    ]);
-    assert_eq!(both.subscriptions(THING).len(), 4);
-    let aws = both
-        .decode(THING, REQUEST, &request(&json!({})))
-        .unwrap()
-        .unwrap();
-    let answer = both.encode(THING, &aws, &Outcome::Ok(json!({})));
-    assert!(
-        answer.topic.starts_with("$aws/commands/"),
-        "{}",
-        answer.topic
-    );
-
-    let envelope = json!({
-        "v": 1, "id": "c1", "correlation_id": null, "ts": "2026-11-22T20:00:00.000Z",
-        "thing": THING, "module": "net", "type": "net.wifi.list", "payload": {},
-    });
-    let topics = both
-        .decode(THING, "helios/t-1/cmd/net", envelope.to_string().as_bytes())
-        .unwrap()
-        .unwrap();
-    let answer = both.encode(THING, &topics, &Outcome::Ok(json!({})));
-    assert_eq!(answer.topic, "helios/t-1/rsp/net");
-
-    // An invalid request is answered through its transport too.
-    let invalid = both.decode(THING, REQUEST, b"nope").unwrap().unwrap_err();
-    let answer = both.encode(
-        THING,
-        &invalid.partial.unwrap(),
-        &Outcome::error("INVALID_MESSAGE", "x"),
-    );
-    assert!(answer.topic.starts_with("$aws/commands/"));
-    assert!(both.decode(THING, "elsewhere", b"{}").is_none());
-    // An id it never decoded goes to the first.
-    let unknown = both.encode(THING, &command(), &Outcome::Ok(json!({})));
-    assert_eq!(unknown.topic, "helios/t-1/rsp/net");
-    // The map of unanswered commands doesn't grow without bound.
-    for n in 0..=MAX_ORIGINS {
-        let topic = format!("$aws/commands/things/t-1/executions/e{n}/request/json");
-        let _ = both.decode(THING, &topic, &request(&json!({})));
-    }
-    assert!(both.origins().len() <= MAX_ORIGINS);
-    let none = Transports::new(Vec::new());
-    assert!(
-        none.encode(THING, &command(), &Outcome::Ok(json!({})))
-            .topic
-            .is_empty()
-    );
 }

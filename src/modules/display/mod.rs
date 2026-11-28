@@ -11,7 +11,7 @@
 //! `model/device.smithy`) takes `{"idle": {"set": {"<template>": {fields}}}}` or
 //! `{"idle": {"configured": {}}}` and answers `{"status": ...}`; arguments outside the model are
 //! `INVALID_MESSAGE` and change nothing. The `display` shadow is reported-only (the page "Helios -
-//! State Management: Tenets and Practices"): desired state left from before 0.17.0 is removed.
+//! State Management: Tenets and Practices").
 
 pub mod canvas;
 pub mod fb;
@@ -185,13 +185,13 @@ struct Display {
     retry_at: Instant,
     backoff: Backoff,
     console_bound: bool,
-    /// The idle screen, from config or desired state.
+    /// The idle screen, from config or `display.idle`.
     idle: Screen,
     /// The last `display.show`, while it lasts.
     shown: Option<Shown>,
     /// When the idle screen started showing.
     idle_since: SystemTime,
-    /// Why the screen can't be used, or the desired state was refused.
+    /// Why the screen can't be used.
     error: Option<String>,
     /// The last state reported, to report only changes.
     reported: Option<Map<String, Value>>,
@@ -221,8 +221,6 @@ impl Display {
     async fn run(mut self, cancel: CancellationToken) {
         let mut commands_open = true;
         let mut mqtt_open = true;
-        // Reported-only: the idle screen is a command now.
-        self.inputs.shadows.clear_desired(MODULE, &["idle"]);
         loop {
             self.expire(Instant::now());
             if self.framebuffer.is_none() && Instant::now() >= self.retry_at {

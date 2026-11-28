@@ -675,11 +675,14 @@ fn reads_the_command_transports() {
             (topics, aws),
             "{setting}"
         );
-        let subscriptions = config.mqtt.commands.transport().subscriptions("t-1");
-        assert_eq!(
-            subscriptions.len(),
-            usize::from(topics) + 3 * usize::from(aws)
-        );
+        let subscriptions = config
+            .mqtt
+            .commands
+            .transports()
+            .iter()
+            .flat_map(|transport| transport.subscriptions("t-1"))
+            .count();
+        assert_eq!(subscriptions, usize::from(topics) + 3 * usize::from(aws));
     }
 }
 

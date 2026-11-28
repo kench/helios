@@ -111,7 +111,7 @@ ceracoder = "/usr/bin/ceracoder"   # or ceracoder (adaptive bitrate)
 gst_plugin_path = "/usr/lib/helios-gst/gstreamer-1.0"  # GST_PLUGIN_PATH for them: the Rockchip
                                    # plugin (helios-gst-rockchip-rk3588); "" for none
 control_socket = "/run/helios-stream/control.sock"  # the daemon's; Helios connects here
-state_dir = "/var/lib/helios-stream"  # the daemon saves the desired state here
+state_dir = "/var/lib/helios-stream"  # the daemon saves the streams' overrides here
 client_user = "helios"             # who may use the control socket (besides root)
 runtime_dir = "/run/helios-stream" # senders' IP files and control sockets go in <runtime_dir>/srtla
 srtla_port_base = 6000             # srtla outputs get local ports from here, in name order,
@@ -137,7 +137,7 @@ stat_url = "http://127.0.0.1:1937/stat"  # rtmp_stat, read at start and every 30
 #                                  # stream shadow (the Control API shows it); unset leaves it out
 
 [modules.stream.recording]
-# Local recordings of streams with record = true (or the desired state's record): the stream as
+# Local recordings of streams with record = true (or stream.update's record): the stream as
 # sent, no second encode, in MPEG-TS segments at <dir>/<stream>/<UTC start>-<n>.ts. To MP4:
 # ffmpeg -i seg.ts -c copy seg.mp4. A recording that fails never stops the stream.
 dir = "/var/lib/helios-stream/recordings"  # letters, digits, / . _ - only
@@ -192,8 +192,8 @@ require_mountpoint = true          # record only when dir is a mounted filesyste
 # scanner's autorun.sh does. Commands: display.show, display.clear, display.status.
 enabled = false
 framebuffer = "/dev/fb0"
-idle_template = "status"           # status, blank or test; the display shadow's desired state
-                                   # can set another, with fields
+idle_template = "status"           # status, blank or test; display.idle can set another, with
+                                   # fields, until Helios restarts
 time_zone = "America/Los_Angeles"  # IANA name for the clock; default "UTC"
 redraw_interval_s = 10             # 0 to 3600: redraws while the kernel's console is attached
 # bold_font = "/run/helios/fonts/RoobertTW-Bold.otf"  # a font file for bold text, read at start,

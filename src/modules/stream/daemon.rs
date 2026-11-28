@@ -82,8 +82,7 @@ impl Daemon {
         let (ctx, mut requests, mut reports, commands) =
             detached_context(&self.sysfs, engine_cancel.clone());
         let state_file = self.settings.state_dir.join(OVERRIDES);
-        let old_file = self.settings.state_dir.join(OLD_OVERRIDES);
-        let saved = load_overrides(&state_file, &old_file);
+        let saved = read_json(&state_file);
         if saved.is_some() {
             tracing::info!("resuming the saved overrides");
         }
@@ -195,10 +194,8 @@ impl Daemon {
                     shadow = reported;
                     let now = overrides(&shadow);
                     if now != saved {
-                        match save_overrides(&state_file, &now) {
-                            // The file before 0.17.0 goes once its state is in the new one.
-                            Ok(()) => { let _ = std::fs::remove_file(&old_file); }
-                            Err(error) => tracing::warn!(%error, file = %state_file.display(), "can't save the overrides"),
+                        if let Err(error) = save_overrides(&state_file, &now) {
+                            tracing::warn!(%error, file = %state_file.display(), "can't save the overrides");
                         }
                         saved = now;
                     }
@@ -331,8 +328,6 @@ fn peer_allowed(stream: &UnixStream, allowed: &[u32]) -> Result<(), String> {
 
 /// The overrides store, in `state_dir`.
 const OVERRIDES: &str = "overrides.json";
-/// Its name before 0.17.0, read once if the new one isn't there yet.
-const OLD_OVERRIDES: &str = "desired.json";
 
 /// The overrides in a `stream` shadow report (operator intent, never effective values): each
 /// stream's `desired` (live or stopped), `bitrate_override_kbps` (`null`: the profile's, so a
@@ -372,32 +367,7 @@ pub(crate) fn busy(shadow: &Map<String, Value>) -> bool {
         })
 }
 
-/// The saved overrides: `file`, else `old_file` (0.16.0's desired state, converted).
-pub(crate) fn load_overrides(file: &Path, old_file: &Path) -> Option<Value> {
-    if let Some(saved) = read_json(file) {
-        return Some(saved);
-    }
-    let old = read_json(old_file)?;
-    let streams: Map<String, Value> = old
-        .get("streams")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .map(|(id, desired)| {
-            let mut settings = desired.as_object().cloned().unwrap_or_default();
-            let state = settings.remove("state").unwrap_or(Value::Null);
-            let bitrate = settings.remove("bitrate_kbps").unwrap_or(Value::Null);
-            let saved = json!({
-                "desired": state,
-                "bitrate_override_kbps": bitrate,
-                "overrides": settings,
-            });
-            (id.clone(), saved)
-        })
-        .collect();
-    Some(json!({ "streams": streams }))
-}
-
+/// The saved overrides in `file`, if it's there and valid.
 fn read_json(file: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(file).ok()?;
     serde_json::from_str(&text)

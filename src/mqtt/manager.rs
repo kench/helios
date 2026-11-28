@@ -82,7 +82,7 @@ pub struct Options {
     /// Reconnect and shutdown timing.
     pub timing: Timing,
     /// The command transport, whose subscriptions each session adds (LLD 2, section 7.1).
-    pub commands: Arc<dyn CommandTransport>,
+    pub commands: Vec<Arc<dyn CommandTransport>>,
 }
 
 /// A publish that arrived on a subscribed topic.
@@ -559,7 +559,9 @@ impl Manager {
     /// What each session subscribes to: the shadows' replies and the command transport's topics.
     fn session_filters(&self, thing: &str) -> Vec<String> {
         let mut filters = topics::shadow_filters(thing);
-        filters.extend(self.options.commands.subscriptions(thing));
+        for transport in &self.options.commands {
+            filters.extend(transport.subscriptions(thing));
+        }
         filters
     }
 

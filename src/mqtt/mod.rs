@@ -45,9 +45,9 @@ impl Default for CommandTransports {
 }
 
 impl CommandTransports {
-    /// The transport these make, listening on each one chosen.
+    /// The transports chosen, in the order the router tries them.
     #[must_use]
-    pub fn transport(self) -> std::sync::Arc<dyn crate::router::CommandTransport> {
+    pub fn transports(self) -> Vec<std::sync::Arc<dyn crate::router::CommandTransport>> {
         let mut transports: Vec<std::sync::Arc<dyn crate::router::CommandTransport>> = Vec::new();
         if self.topics {
             transports.push(std::sync::Arc::new(crate::router::topics::TopicsTransport));
@@ -57,7 +57,7 @@ impl CommandTransports {
                 crate::router::aws_commands::AwsCommandsTransport,
             ));
         }
-        std::sync::Arc::new(crate::router::aws_commands::Transports::new(transports))
+        transports
     }
 }
 
