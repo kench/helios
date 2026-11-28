@@ -49,6 +49,8 @@ mod net;
 mod token;
 #[cfg(feature = "module-usb")]
 mod usb;
+#[cfg(feature = "module-web")]
+mod web;
 #[cfg(feature = "module-net")]
 mod wifi;
 
@@ -83,6 +85,10 @@ enum Command {
     /// restarts (LLD 4, section 15).
     #[cfg(feature = "module-stream")]
     StreamDaemon,
+    /// The on-device console's tools (LLD 13).
+    #[cfg(feature = "module-web")]
+    #[command(subcommand)]
+    Web(web::Command),
 }
 
 #[derive(Debug, clap::Args)]
@@ -351,6 +357,8 @@ pub fn run(args: impl IntoIterator<Item = OsString>, console: &mut dyn Console) 
         Some(Command::WifiApply) => wifi::apply(console.out()),
         #[cfg(feature = "module-stream")]
         Some(Command::StreamDaemon) => return crate::modules::stream::daemon::main(&cli.config),
+        #[cfg(feature = "module-web")]
+        Some(Command::Web(command)) => web::run(command, console),
     };
     match result {
         Ok(()) => EXIT_OK,

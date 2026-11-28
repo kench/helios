@@ -12,7 +12,7 @@ shadow's `modules`.
 | [stream](#stream) | `module-stream` (needs `module-usb`) | LLD 4 | boards |
 | [net](#net) | `module-net` | LLD 3 | boards |
 | [gps](#gps) | `module-gps` | LLD 10 | boards |
-| [web](#web) | `module-web` | LLD 13 | boards (in progress) |
+| [web](#web) | `module-web` | LLD 13 | boards |
 
 ## display
 
@@ -217,12 +217,21 @@ The position, from gpsd.
 ## web
 
 The Helios console served by the board, for phones and laptops on the same network with no
-internet (LLD 13). In progress: nothing is served yet, and it has no `[modules.web]` section.
+internet (LLD 13). It serves the helios-console package's files and a local Control API: the
+cloud's `/v1/control/...` paths and JSON, for this one device.
 
-- **So far:** `modules::web::reports` reads the modules' reports into the Control API's read
-  responses exactly as the cloud does. helios-contract's report vectors
-  (`test-vectors/control-reports-v1.json`) check both sides.
-- **Hooks it will use:** `ShadowHandle::latest` (each module's latest report, sent or not) and
-  `RouterHandle::dispatch` (a command run like one from MQTT, its outcome returned to the
-  caller), so the local console reads what the cloud would and changes the device through the
-  same commands.
+- **Sign-in:** the device password (`[modules.web] password_hash`, an Argon2id hash from
+  `helios web hash-password`; one per board, made at provisioning). Sessions are in memory (12
+  hours idle, 7 days at most); wrong passwords slow that address down (1 s doubling to a
+  minute). Writes need the console's `X-Helios-Request: 1` header from the same origin.
+- **Reads** come from the modules' latest reports (`ShadowHandle::latest`), mapped as the cloud
+  maps the shadows; helios-contract's report vectors check both.
+- **Changes** are the cloud's commands, through the router (`RouterHandle::dispatch`), so the
+  modules check and apply them the same way. They're marked `local`: only a local command may
+  carry a destination in plain text (offline there may be no key to seal it to).
+- **Where:** plain HTTP on port 8080 (`listen`); Helios's firewall lets only private and
+  link-local addresses reach it. The board's hostname is `helios-<name>`, so it's
+  `http://helios-<name>.local:8080/`; provisioning installs the Avahi service file
+  (`/usr/share/helios/avahi/helios-console.service`) for DNS-SD browsers.
+- **Audit:** every sign-in and change is logged (target `helios::audit`), never a body.
+- **Shadow `web`:** its name, address, and whether the console's files are installed.

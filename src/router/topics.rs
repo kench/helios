@@ -90,6 +90,7 @@ fn decode(thing: &str, module: &str, payload: &[u8]) -> Result<Command, InvalidC
                 name: name.to_owned(),
                 args: Value::Null,
                 deadline: None,
+                local: false,
             })
         }),
     };
@@ -145,6 +146,7 @@ fn decode(thing: &str, module: &str, payload: &[u8]) -> Result<Command, InvalidC
         name,
         args: envelope.payload,
         deadline,
+        local: false,
     })
 }
 

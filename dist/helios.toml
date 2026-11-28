@@ -97,6 +97,21 @@ enabled = false
 # device = "/dev/serial/by-id/usb-Microchip_Technology_Inc._MCP2221_USB-I2C_UART_Combo-if00"
 # control_socket = "/run/gpsd.sock"   # gpsd's (the helios package's gpsd.socket drop-in opens it to helios)
 
+[modules.web]
+# The Helios console, served by the board for phones and laptops on the same network, with no
+# internet (LLD 13): needs a build with --features module-web (the boards' package) and the
+# helios-console package for its files. Plain HTTP on port 8080; Helios's firewall lets only
+# private and link-local addresses reach it, so use it on networks you trust.
+enabled = false
+# name = "pocket"   # the board's short name (letters, digits, -); its hostname is helios-<name>,
+#                   # so the console is http://helios-<name>.local:8080/
+# The device password's Argon2id hash: `helios web hash-password` makes it (never the password
+# itself). Provisioning makes one password per board and keeps it in the provisioning record.
+# password_hash = "$argon2id$v=19$..."
+# listen = "0.0.0.0:8080"   # must match the firewall's and Avahi's port
+# console_dir = "/usr/share/helios-console"   # the helios-console package's files
+# role = "transcoder"   # transcoder or relay, as the console's device list shows it
+
 [modules.stream]
 # Video streams through ffmpeg to SRT listeners (LLD 4): directly, or bonded over several uplinks
 # by srtla_send. Needs a build with the module-stream Cargo feature. Streams run in the stream

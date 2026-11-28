@@ -116,6 +116,7 @@ fn decode(id: &str, payload: &[u8]) -> Result<Command, InvalidCommand> {
             name: "invalid".to_owned(),
             args: Value::Null,
             deadline: None,
+            local: false,
         })),
     };
     let request: Request = serde_json::from_slice(payload).map_err(|error| {
@@ -169,6 +170,7 @@ fn decode(id: &str, payload: &[u8]) -> Result<Command, InvalidCommand> {
         name: request.name,
         args,
         deadline,
+        local: false,
     })
 }
 

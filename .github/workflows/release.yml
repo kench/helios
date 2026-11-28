@@ -29,7 +29,7 @@ env:
   # libc6 dependency.
   GLIBC: "2.31"
   # The device modules the boards (relay, transcoder) use. The scanner is built separately.
-  FEATURES: module-usb,module-stream,module-net,module-gps
+  FEATURES: module-usb,module-stream,module-net,module-gps,module-web
   ZIG_VERSION: 0.14.1
   CARGO_ZIGBUILD_VERSION: 0.24.1
   CARGO_DEB_VERSION: 3.6.3

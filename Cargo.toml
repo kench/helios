@@ -24,7 +24,9 @@ token, reports its state, and runs its modules. The service is installed but not
 provision the device (config and token), then `systemctl enable --now helios`."""
 depends = "libc6 (>= 2.31), adduser, softhsm2"
 # gpsd: the gps module's source (LLD 10); Helios runs without it, and reports gpsd unavailable.
-recommends = "unattended-upgrades, gpsd"
+# avahi-daemon and libnss-mdns: the on-device console found as helios-<name>.local (LLD 13);
+# helios-console: the console's files the web module serves.
+recommends = "unattended-upgrades, gpsd, avahi-daemon, libnss-mdns, helios-console"
 # helios-rtmp.service (rtmp-ingest) runs nginx with the RTMP module, on the boards that ingest
 # RTMP; helios-firewall.service needs nft.
 suggests = "nginx, libnginx-mod-rtmp, nftables"
@@ -42,6 +44,7 @@ assets = [
     ["dist/systemd/gpsd.socket.d/helios.conf", "lib/systemd/system/gpsd.socket.d/", "644"],
     ["dist/nftables/helios.nft", "etc/helios/firewall.nft", "644"],
     ["dist/helios.toml", "usr/share/doc/helios/examples/", "644"],
+    ["dist/avahi/helios-console.service", "usr/share/helios/avahi/", "644"],
     ["dist/debian/52helios-unattended-upgrades", "etc/apt/apt.conf.d/", "644"],
     ["README.md", "usr/share/doc/helios/", "644"],
 ]
@@ -80,6 +83,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 x509-parser = "0.18.1"
 hmac = "0.13"
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash"], optional = true }
 
 [features]
 # Device modules (HLD section 6.1), off by default so each device's build carries only the
@@ -96,7 +100,7 @@ module-net = []
 # The gps module (LLD 10): the position, from gpsd. Boards only.
 module-gps = ["tokio/io-util"]
 # The web module (LLD 13): the console, served by the board for phones on the same network.
-module-web = []
+module-web = ["dep:argon2", "hyper/server", "hyper-util/server"]
 
 [dev-dependencies]
 bytes = "1.12.1"

@@ -37,7 +37,7 @@ async fn opens_a_destination_sealed_to_the_device_for_the_daemon() {
     let args = |destination: Value| json!({"stream_id": "pocket", "profile": {"set": "hevc"}, "destination": {"set": destination}});
 
     // Opened: the URL goes on, the rest as it was.
-    let opened = open_destination(Some(&watch), args(seal("pocket", URL))).await;
+    let opened = open_destination(Some(&watch), args(seal("pocket", URL)), false).await;
     assert_eq!(opened["destination"], json!({"set": {"url": URL}}));
     assert_eq!(opened["profile"], json!({"set": "hevc"}));
 
@@ -46,7 +46,7 @@ async fn opens_a_destination_sealed_to_the_device_for_the_daemon() {
         seal("other", URL),
         json!({"sealed": {"enc": "AAAA", "ct": "AAAA"}}),
     ] {
-        let opened = open_destination(Some(&watch), args(destination)).await;
+        let opened = open_destination(Some(&watch), args(destination), false).await;
         let reason = opened["destination"]["set"]["unreadable"].as_str();
         assert!(
             reason.is_some_and(|r| !r.contains("passphrase")),
@@ -55,7 +55,7 @@ async fn opens_a_destination_sealed_to_the_device_for_the_daemon() {
     }
 
     // No identity: nothing to open with.
-    let opened = open_destination(None, args(seal("pocket", URL))).await;
+    let opened = open_destination(None, args(seal("pocket", URL)), false).await;
     assert_eq!(
         opened["destination"]["set"]["unreadable"],
         "the device has no key for sealed secrets"
@@ -63,12 +63,22 @@ async fn opens_a_destination_sealed_to_the_device_for_the_daemon() {
 
     // A plain URL from the cloud: refused, never passed on.
     for plain in [json!({"url": URL}), json!({"unreadable": "nothing"})] {
-        let opened = open_destination(Some(&watch), args(plain)).await;
+        let opened = open_destination(Some(&watch), args(plain), false).await;
         assert_eq!(
             opened["destination"],
             json!({"set": {"unreadable": "a destination from the cloud must be sealed"}})
         );
     }
+
+    // From Helios's own console (a local command), a plain URL goes on as it is; anything
+    // else in it is still refused.
+    let plain = args(json!({"url": URL}));
+    assert_eq!(open_destination(None, plain.clone(), true).await, plain);
+    let odd = open_destination(None, args(json!({"url": URL, "unreadable": "x"})), true).await;
+    assert_eq!(
+        odd["destination"],
+        json!({"set": {"unreadable": "a destination from the cloud must be sealed"}})
+    );
 
     // Not a well-formed sealed value, or no destination: unchanged, for the daemon to check.
     for untouched in [
@@ -76,7 +86,7 @@ async fn opens_a_destination_sealed_to_the_device_for_the_daemon() {
         json!({"stream_id": "pocket", "bitrate": {"set": 3000}}),
     ] {
         assert_eq!(
-            open_destination(Some(&watch), untouched.clone()).await,
+            open_destination(Some(&watch), untouched.clone(), false).await,
             untouched
         );
     }

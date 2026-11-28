@@ -8,6 +8,10 @@
 # - RTMP publishing (nginx, helios-rtmp.service, port 1935) is open to private networks only: the
 #   cameras are on the travel router's LAN, which is trusted (owner, 2026-11-21), and nothing on
 #   an uplink's public side may publish.
+# - The on-device console (the web module, port 8080, LLD 13 section 5) likewise: phones on the
+#   same Wi-Fi, router or hotspot get private addresses, and link-local covers a direct cable.
+#   Nothing reaches it through an uplink's public address. The port must match
+#   [modules.web] listen.
 #
 # The counters show what was dropped: nft list counters table inet helios
 
@@ -19,6 +23,8 @@ table inet helios {
     counter srtla_outside {
     }
     counter rtmp_refused {
+    }
+    counter web_refused {
     }
 
     set rtmp_publishers4 {
@@ -39,5 +45,8 @@ table inet helios {
         tcp dport 1935 ip saddr @rtmp_publishers4 accept
         tcp dport 1935 ip6 saddr @rtmp_publishers6 accept
         tcp dport 1935 counter name rtmp_refused drop
+        tcp dport 8080 ip saddr @rtmp_publishers4 accept
+        tcp dport 8080 ip6 saddr @rtmp_publishers6 accept
+        tcp dport 8080 counter name web_refused drop
     }
 }

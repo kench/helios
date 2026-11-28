@@ -113,6 +113,9 @@ pub struct Config {
     /// The `[modules.gps]` settings, when it's enabled (LLD 10).
     #[cfg(feature = "module-gps")]
     pub gps: Option<crate::modules::gps::GpsSettings>,
+    /// The `[modules.web]` settings, when it's enabled (LLD 13).
+    #[cfg(feature = "module-web")]
+    pub web: Option<crate::modules::web::WebSettings>,
     /// Sections this version doesn't use: modules as `modules.<name>`, then top-level sections.
     pub ignored_sections: Vec<String>,
 }
@@ -162,6 +165,8 @@ struct ModulesSection {
     net: Option<crate::modules::net::NetSettings>,
     #[cfg(feature = "module-gps")]
     gps: Option<crate::modules::gps::GpsSettings>,
+    #[cfg(feature = "module-web")]
+    web: Option<crate::modules::web::WebSettings>,
     #[cfg(feature = "module-display")]
     display: Option<DisplaySection>,
     #[serde(flatten)]
@@ -378,6 +383,13 @@ impl File {
                 .modules
                 .gps
                 .map(crate::modules::gps::GpsSettings::check)
+                .transpose()?
+                .flatten(),
+            #[cfg(feature = "module-web")]
+            web: self
+                .modules
+                .web
+                .map(crate::modules::web::WebSettings::check)
                 .transpose()?
                 .flatten(),
             ignored_sections: self
