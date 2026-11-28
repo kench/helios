@@ -42,10 +42,10 @@ use crate::identity::token::TokenBackend;
 use crate::modules::display;
 use crate::modules::{Module, supervisor};
 use crate::mqtt::helios_shadow::{self, Sources};
-use crate::mqtt::manager::{Incoming, MqttHandle, MqttManager, Options as MqttOptions};
-use crate::mqtt::shadow::{ShadowHandle, ShadowManager};
+use crate::mqtt::manager::{Incoming, MqttManager, Options as MqttOptions};
+use crate::mqtt::shadow::ShadowManager;
 use crate::provision::DEFAULT_TOKEN_LABEL;
-use crate::router::{Router, RouterHandle};
+use crate::router::Router;
 use crate::{hardening, logging};
 
 /// Where the service finds things on the device. Tests point these at fakes.
@@ -140,13 +140,8 @@ impl From<StartError> for StartFailure {
 
 /// The running service.
 pub struct Service {
-    #[cfg(feature = "module-usb")]
-    usb: Option<crate::modules::usb::UsbHandle>,
     identity: IdentityHandle,
     credentials: HeliosCredentialsProvider,
-    mqtt: MqttHandle,
-    shadows: ShadowHandle,
-    router: RouterHandle,
     identity_task: JoinHandle<ManagerExit>,
     credentials_task: JoinHandle<()>,
     mqtt_task: JoinHandle<()>,
@@ -304,14 +299,12 @@ impl Service {
             enabled.push(Arc::new(module));
         }
         #[cfg(feature = "module-usb")]
-        let usb = config.usb.map(|settings| {
-            let handle = crate::modules::usb::UsbHandle::default();
+        if let Some(settings) = config.usb {
             enabled.push(Arc::new(crate::modules::usb::UsbModule::new(
                 settings,
-                handle.clone(),
+                crate::modules::usb::UsbHandle::default(),
             )));
-            handle
-        });
+        }
         #[cfg(feature = "module-gps")]
         if let Some(settings) = &config.gps {
             enabled.push(Arc::new(crate::modules::gps::GpsModule::new(settings)));
@@ -379,13 +372,8 @@ impl Service {
         );
         let routing = tokio::spawn(route(incoming, shadow_tx, commands_tx));
         Ok(Self {
-            #[cfg(feature = "module-usb")]
-            usb,
             identity,
             credentials,
-            mqtt,
-            shadows,
-            router,
             identity_task,
             credentials_task,
             mqtt_task,
@@ -403,13 +391,6 @@ impl Service {
         })
     }
 
-    /// The USB monitor's handle when enabled.
-    #[cfg(feature = "module-usb")]
-    #[must_use]
-    pub fn usb(&self) -> Option<&crate::modules::usb::UsbHandle> {
-        self.usb.as_ref()
-    }
-
     /// The device identity.
     #[must_use]
     pub fn identity(&self) -> &IdentityHandle {
@@ -420,24 +401,6 @@ impl Service {
     #[must_use]
     pub fn credentials(&self) -> &HeliosCredentialsProvider {
         &self.credentials
-    }
-
-    /// The MQTT connection.
-    #[must_use]
-    pub fn mqtt(&self) -> &MqttHandle {
-        &self.mqtt
-    }
-
-    /// The shadow manager, for modules' reported and desired state.
-    #[must_use]
-    pub fn shadows(&self) -> &ShadowHandle {
-        &self.shadows
-    }
-
-    /// The command router, for modules to register with.
-    #[must_use]
-    pub fn router(&self) -> &RouterHandle {
-        &self.router
     }
 
     /// Runs until `shutdown` completes or the identity manager stops, then stops everything
