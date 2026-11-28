@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -61,6 +61,10 @@ enum Request {
         shadow: String,
         reported: Map<String, Value>,
     },
+    Latest {
+        shadow: String,
+        reply: oneshot::Sender<Option<Map<String, Value>>>,
+    },
 }
 
 impl ShadowHandle {
@@ -71,6 +75,20 @@ impl ShadowHandle {
             shadow: shadow.to_owned(),
             reported,
         });
+    }
+
+    /// `shadow`'s latest snapshot as its module reported it, whether or not it has reached AWS
+    /// IoT yet; `None` if the module hasn't reported (or the manager has stopped). For the web
+    /// module's local console (LLD 13), which shows what the cloud would.
+    pub async fn latest(&self, shadow: &str) -> Option<Map<String, Value>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::Latest {
+                shadow: shadow.to_owned(),
+                reply,
+            })
+            .ok()?;
+        answer.await.ok().flatten()
     }
 }
 
@@ -221,6 +239,14 @@ impl Manager {
 
     fn request(&mut self, request: Request) {
         match request {
+            Request::Latest { shadow, reply } => {
+                let latest = self
+                    .shadows
+                    .get(&shadow)
+                    .filter(|entry| !entry.reported.is_empty())
+                    .map(|entry| entry.reported.clone());
+                let _ = reply.send(latest);
+            }
             Request::Report { shadow, reported } => {
                 let entry = self.shadows.entry(shadow.clone()).or_default();
                 let first = entry.reported.is_empty() && entry.last_sent.is_none();
@@ -384,8 +410,17 @@ impl ShadowHandle {
         let (requests, mut incoming) = mpsc::unbounded_channel();
         let (reports_tx, reports) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Some(Request::Report { shadow, reported }) = incoming.recv().await {
-                let _ = reports_tx.send((shadow, reported));
+            let mut latest: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+            while let Some(request) = incoming.recv().await {
+                match request {
+                    Request::Report { shadow, reported } => {
+                        latest.insert(shadow.clone(), reported.clone());
+                        let _ = reports_tx.send((shadow, reported));
+                    }
+                    Request::Latest { shadow, reply } => {
+                        let _ = reply.send(latest.get(&shadow).cloned());
+                    }
+                }
             }
         });
         (Self { requests }, reports)

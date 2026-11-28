@@ -207,6 +207,8 @@ impl PendingCommand {
 #[derive(Debug, Clone)]
 pub struct RouterHandle {
     registrations: mpsc::UnboundedSender<(String, mpsc::Sender<PendingCommand>)>,
+    /// Commands from inside Helios (the web module's local console), answered to the caller.
+    local: mpsc::UnboundedSender<(Command, oneshot::Sender<Outcome>)>,
 }
 
 impl RouterHandle {
@@ -217,7 +219,15 @@ impl RouterHandle {
         mpsc::UnboundedReceiver<(String, mpsc::Sender<PendingCommand>)>,
     ) {
         let (registrations, received) = mpsc::unbounded_channel();
-        (Self { registrations }, received)
+        // No router behind it: a dispatch answers that the router has stopped.
+        let (local, _) = mpsc::unbounded_channel();
+        (
+            Self {
+                registrations,
+                local,
+            },
+            received,
+        )
     }
 
     /// Registers `module`: its commands arrive on the returned channel.
@@ -226,6 +236,44 @@ impl RouterHandle {
         let (sender, receiver) = mpsc::channel(MODULE_QUEUE);
         let _ = self.registrations.send((module.to_owned(), sender));
         receiver
+    }
+
+    /// Runs `command` as if it had come over MQTT (the same deadline, module and timeout
+    /// checks), and returns its outcome instead of publishing it. For the web module's local
+    /// console (LLD 13), whose writes are the same commands the cloud sends.
+    pub async fn dispatch(&self, command: Command) -> Outcome {
+        let (reply, answer) = oneshot::channel();
+        if self.local.send((command, reply)).is_err() {
+            return Outcome::error(codes::INTERNAL, "the router has stopped");
+        }
+        answer
+            .await
+            .unwrap_or_else(|_| Outcome::error(codes::INTERNAL, "the router dropped the command"))
+    }
+}
+
+/// Where a command's outcome goes.
+enum Reply {
+    /// Published on the transport that decoded it.
+    Mqtt {
+        transport: Arc<dyn CommandTransport>,
+        thing: String,
+    },
+    /// Back to whoever dispatched it.
+    Local(oneshot::Sender<Outcome>),
+}
+
+impl Reply {
+    fn send(self, mqtt: &MqttHandle, command: &Command, outcome: Outcome) {
+        match self {
+            Self::Mqtt { transport, thing } => {
+                let publish = transport.encode(&thing, command, &outcome);
+                mqtt.publish_now(publish.topic, publish.payload);
+            }
+            Self::Local(reply) => {
+                let _ = reply.send(outcome);
+            }
+        }
     }
 }
 
@@ -249,7 +297,9 @@ impl Router {
         cancel: CancellationToken,
     ) -> (RouterHandle, JoinHandle<()>) {
         let (registrations_tx, registrations) = mpsc::unbounded_channel();
+        let (local_tx, local) = mpsc::unbounded_channel();
         let router = Running {
+            local,
             mqtt,
             transports,
             incoming,
@@ -262,6 +312,7 @@ impl Router {
         (
             RouterHandle {
                 registrations: registrations_tx,
+                local: local_tx,
             },
             tokio::spawn(router.run()),
         )
@@ -273,6 +324,7 @@ struct Running {
     transports: Vec<Arc<dyn CommandTransport>>,
     incoming: mpsc::Receiver<Incoming>,
     registrations: mpsc::UnboundedReceiver<(String, mpsc::Sender<PendingCommand>)>,
+    local: mpsc::UnboundedReceiver<(Command, oneshot::Sender<Outcome>)>,
     timing: Timing,
     cancel: CancellationToken,
     modules: HashMap<String, mpsc::Sender<PendingCommand>>,
@@ -289,6 +341,9 @@ impl Running {
                     self.modules.insert(module, sender);
                 }
                 Some(message) = self.incoming.recv() => self.received(&message),
+                Some((command, reply)) = self.local.recv() => {
+                    self.run_command(command, Reply::Local(reply));
+                }
                 else => return,
             }
         }
@@ -324,6 +379,12 @@ impl Running {
             tracing::debug!(id = %command.id, "repeated command dropped");
             return;
         }
+        self.run_command(command, Reply::Mqtt { transport, thing });
+    }
+
+    /// Hands `command` to its module and sends its outcome to `reply`: at once if it can't run,
+    /// else when the module answers or the time runs out.
+    fn run_command(&mut self, command: Command, reply: Reply) {
         // A command that arrives after its deadline isn't run: its sender has stopped waiting
         // and reported a failure, so running it now (a Wi-Fi network saved, a stream started)
         // would contradict that.
@@ -332,36 +393,33 @@ impl Running {
             .is_some_and(|deadline| deadline <= SystemTime::now())
         {
             tracing::warn!(id = %command.id, module = %command.module, name = %command.name, "command arrived after its deadline");
-            self.respond(
-                &*transport,
-                &thing,
+            reply.send(
+                &self.mqtt,
                 &command,
-                &Outcome::error(codes::TIMEOUT, "the command arrived after its deadline"),
+                Outcome::error(codes::TIMEOUT, "the command arrived after its deadline"),
             );
             return;
         }
         let Some(module) = self.modules.get(&command.module) else {
             let message = format!("no module {:?}", command.module);
-            self.respond(
-                &*transport,
-                &thing,
+            reply.send(
+                &self.mqtt,
                 &command,
-                &Outcome::error(codes::UNKNOWN_COMMAND, message),
+                Outcome::error(codes::UNKNOWN_COMMAND, message),
             );
             return;
         };
-        let (reply, answer) = oneshot::channel();
+        let (module_reply, answer) = oneshot::channel();
         let pending = PendingCommand {
             command: command.clone(),
-            reply,
+            reply: module_reply,
         };
         if module.try_send(pending).is_err() {
             let message = format!("module {:?} is busy or stopped", command.module);
-            self.respond(
-                &*transport,
-                &thing,
+            reply.send(
+                &self.mqtt,
                 &command,
-                &Outcome::error(codes::MODULE_UNAVAILABLE, message),
+                Outcome::error(codes::MODULE_UNAVAILABLE, message),
             );
             return;
         }
@@ -381,8 +439,7 @@ impl Running {
                 Ok(Err(_)) => Outcome::error(codes::INTERNAL, "the module dropped the command"),
                 Err(_) => Outcome::error(codes::TIMEOUT, "the command didn't finish in time"),
             };
-            let publish = transport.encode(&thing, &command, &outcome);
-            mqtt.publish_now(publish.topic, publish.payload);
+            reply.send(&mqtt, &command, outcome);
         });
     }
 
