@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 /// What the module asks for after connecting: JSON reports from every receiver.
 pub(crate) const WATCH: &str = "?WATCH={\"enable\":true,\"json\":true}\n";
+/// Asks gpsd for every receiver it has; it answers with a `DEVICES` line.
+pub(crate) const DEVICES: &str = "?DEVICES;\n";
 
 /// A receiver gpsd has open.
 #[derive(Debug, Clone, PartialEq, Deserialize)]

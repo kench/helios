@@ -237,34 +237,61 @@ async fn session(
     let usb_port = move |path: &str| receiver_usb_port(&sysfs, Path::new(path));
     let mut lines = BufReader::new(read);
     let mut line = String::new();
-    // gpsd answers an add for a receiver it already has with an error, so the module first lets
-    // gpsd list its receivers (DEVICES comes right after the WATCH), then adds it only if missing.
+    // gpsd answers an add for a receiver it already has with an error, so the module adds the
+    // configured receiver only when gpsd's own list doesn't have it. Each check asks gpsd for
+    // that list (`?DEVICES;`) and decides on its answer: gpsd doesn't always say when it loses a
+    // receiver (an unplugged USB bridge, seen on the Orange Pi on 2026-11-27, left it with none
+    // and no DEVICE message), so what it said earlier can be stale. If gpsd doesn't answer by
+    // the next check, that check goes on what it said last.
     let mut readd_at = Instant::now() + FIRST_CHECK.min(readd);
+    let mut asked = false;
     loop {
         line.clear();
         tokio::select! {
             () = ctx.cancel.cancelled() => return true,
             () = tokio::time::sleep_until(readd_at), if device.is_some() => {
                 readd_at = Instant::now() + readd;
-                if let Some((path, socket)) = device {
-                    let added = if reporter.state.has_receiver(path) {
-                        Ok(())
-                    } else {
-                        add_device(socket, path).await
-                    };
-                    reporter.state.set_device(path, added);
-                    reporter.publish(ctx);
+                if asked {
+                    ensure_device(ctx, reporter, device).await;
                 }
+                if write.write_all(gpsd::DEVICES.as_bytes()).await.is_err() {
+                    return false;
+                }
+                asked = true;
             }
             read = read_line(&mut lines, &mut line) => {
                 if !read {
                     return false;
                 }
-                reporter.state.apply(gpsd::parse(&line), SystemTime::now(), &usb_port);
+                let message = gpsd::parse(&line);
+                let listed = matches!(message, gpsd::Message::Devices(_));
+                reporter.state.apply(message, SystemTime::now(), &usb_port);
                 reporter.publish(ctx);
+                if listed && asked {
+                    asked = false;
+                    ensure_device(ctx, reporter, device).await;
+                }
             }
             () = sleep_until(reporter.schedule.next()) => reporter.publish(ctx),
         }
+    }
+}
+
+/// Adds the configured receiver if gpsd's list (as last heard) doesn't have it, and reports how
+/// that went.
+async fn ensure_device(
+    ctx: &ModuleContext,
+    reporter: &mut Reporter,
+    device: Option<&(String, std::path::PathBuf)>,
+) {
+    if let Some((path, socket)) = device {
+        let added = if reporter.state.has_receiver(path) {
+            Ok(())
+        } else {
+            add_device(socket, path).await
+        };
+        reporter.state.set_device(path, added);
+        reporter.publish(ctx);
     }
 }
 

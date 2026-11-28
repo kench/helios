@@ -622,3 +622,68 @@ async fn a_receiver_gpsd_already_has_is_not_added_again() {
     cancel.cancel();
     assert_eq!(running.await.unwrap(), Ok(()));
 }
+
+/// What happened on the Orange Pi on 2026-11-27: the receiver's USB bridge went away and came
+/// back, and gpsd dropped it without a DEVICE message saying so. The module asks gpsd for its
+/// receivers at each check, so it sees the list is empty and adds the receiver again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adds_its_receiver_again_when_gpsd_drops_it_without_saying() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, mut added) = control_socket(dir.path(), "OK\n").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let module = GpsModule {
+        address: listener.local_addr().unwrap(),
+        backoff: (Duration::from_millis(10), Duration::from_millis(20)),
+        device: Some((PATH.to_owned(), socket)),
+        readd: Duration::from_millis(100),
+    };
+    let (ctx, _reports, _requests) = context();
+    let cancel = ctx.cancel.clone();
+    let running = tokio::spawn(async move { module.run(ctx).await });
+
+    // A gpsd that has the receiver, answers `?DEVICES;` with its list, and, once told to, has
+    // none: no DEVICE message, only an empty list when asked.
+    let (stream, _) = listener.accept().await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let (lose, mut lost) = tokio::sync::oneshot::channel::<()>();
+    let (asked_tx, mut asked) = mpsc::unbounded_channel();
+    let gpsd = tokio::spawn(async move {
+        write
+            .write_all(format!("{DEVICES}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(read).lines();
+        let mut has_it = true;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if lost.try_recv().is_ok() {
+                has_it = false;
+            }
+            if line.trim() == "?DEVICES;" {
+                let _ = asked_tx.send(());
+                let answer = if has_it {
+                    format!("{DEVICES}\n")
+                } else {
+                    "{\"class\":\"DEVICES\",\"devices\":[]}\n".to_owned()
+                };
+                write.write_all(answer.as_bytes()).await.unwrap();
+            }
+        }
+    });
+
+    // It has the receiver: the module asks, and doesn't add it.
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(5), asked.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(added.try_recv().is_err(), "gpsd has it");
+
+    // gpsd loses it silently: the next answer is empty, and the module adds it.
+    lose.send(()).unwrap();
+    let again = tokio::time::timeout(Duration::from_secs(5), added.recv()).await;
+    assert_eq!(again.unwrap().unwrap(), format!("+{PATH}\n"));
+    cancel.cancel();
+    assert_eq!(running.await.unwrap(), Ok(()));
+    gpsd.abort();
+}
